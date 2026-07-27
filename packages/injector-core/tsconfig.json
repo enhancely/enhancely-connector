@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    // The core is runtime-agnostic and codes against WHATWG fetch globals
+    // (fetch, Response, RequestInit, AbortSignal, URL) shared by Cloudflare
+    // Workers, Node >= 18 and Lambda@Edge. "DOM" is the lib that declares
+    // them; adapters override with their platform types (workers-types, node).
+    // Kept here, NOT in tsconfig.base.json, so it cannot conflict with
+    // @cloudflare/workers-types in adapter-cloudflare.
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src"]
+}

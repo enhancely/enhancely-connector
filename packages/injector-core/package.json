@@ -1,0 +1,24 @@
+{
+  "name": "@enhancely/injector-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared core for all Enhancely connector adapters: fetch, cache, ETag revalidation, HTML injection (fail-open)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.0"
+  }
+}
