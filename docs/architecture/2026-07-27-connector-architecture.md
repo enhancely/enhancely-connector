@@ -13,7 +13,7 @@ This repository adds the missing **delivery layer**: a connector that sits in th
 
 These are contract facts, not choices. Implement against them; do not re-derive.
 
-- **Read endpoint:** `GET {ENHANCELY_BASE}/api/v1/jsonld/{segment}` where `segment` is the URL-encoded **raw page URL**. We always send the URL, never a locally computed hash — the server normalizes and hashes authoritatively.
+- **Read endpoint:** `GET {ENHANCELY_BASE}/api/v1/jsonld/{segment}` where `segment` is the URL-encoded page URL. The connector sends the query-stripped `normalizeLite(url)` (never a locally computed hash); the server normalizes and hashes authoritatively (and would accept the raw URL identically).
 - **`ENHANCELY_BASE`:** default `https://app.enhancely.ai` — TODO: confirm.
 - **Auth required:** `Authorization: Bearer <sk-… | sk-org-…>`. The key must never reach the browser.
 - **`Accept: application/ld+json`** — the server performs an **exact string match** on this header. The response is the raw, already script-safe-escaped JSON-LD string (`<` pre-escaped as a unicode escape). It goes verbatim into `<script type="application/ld+json">…</script>`; the connector must never parse, re-serialize, or re-escape it.
@@ -39,7 +39,7 @@ Build the core to production quality with one reference adapter (Cloudflare Work
 
 ### 3.4 URL, not hash — correctness principle
 
-The connector always sends the raw URL; the server owns normalization and hashing. The mirrored `normalizeLite` (4 rules, §2) is used **only** for local cache keys. Consequence: **local drift costs only cache efficiency, never correctness.** If the server's normalization evolves, the worst case is a redundant cache entry or an extra revalidation — never a wrong or missing injection.
+The connector sends the query-stripped `normalizeLite(url)` (4 rules, §2) — the same value it caches under — never a locally computed hash; the server still owns hashing. Stripping the query at the edge keeps tokens/PII off the wire and matches the server (which strips the query before hashing anyway), so the resolved record is identical. **Correctness now depends on `normalizeLite` staying byte-for-byte identical to the server's `normalizeUrl`**: since the connector sends the already-normalized URL, the server cannot recover the original, so a divergence would serve the wrong record rather than merely cost a cache entry. The two are the exact same code today (verified 2026-07-27); they must be kept in lockstep.
 
 ### 3.5 Fail-open everywhere
 
