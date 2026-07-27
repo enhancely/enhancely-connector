@@ -60,3 +60,26 @@ The API key is a secret — it must never be exposed client-side or committed. `
 
 - [`CLAUDE.md`](CLAUDE.md) — commands, rules, and the Enhancely API contract.
 - [`docs/architecture/2026-07-27-connector-architecture.md`](docs/architecture/2026-07-27-connector-architecture.md) — full architecture writeup and binding decisions.
+
+## Consuming releases (for integrators)
+
+Every tag `vX.Y.Z` publishes a [GitHub Release](https://github.com/enhancely/enhancely-connector/releases) with versioned, checksummed artifacts:
+
+| Asset                    | Purpose                                                                                                                                                        |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lambda-edge-index.js`   | Self-contained Lambda@Edge bundle (CommonJS, Node 20). Vendor it next to your Terraform and zip it together with your deploy-specific `connector-config.json`. |
+| `lambda-edge-bundle.zip` | The same bundle pre-zipped (no config inside).                                                                                                                 |
+| `SHA256SUMS`             | Checksums for both assets — verify after download.                                                                                                             |
+
+Recommended vendoring flow (Terraform, as used in the KWS pilot):
+
+```bash
+VERSION=v0.1.0
+curl -fsSLO "https://github.com/enhancely/enhancely-connector/releases/download/${VERSION}/lambda-edge-index.js"
+curl -fsSL  "https://github.com/enhancely/enhancely-connector/releases/download/${VERSION}/SHA256SUMS" | sha256sum -c --ignore-missing
+# commit index.js into your infra repo; note ${VERSION} in the commit message
+```
+
+Terraform picks up the new file via `source_code_hash`, publishes a new Lambda
+version and rolls the CloudFront association automatically. Updating the
+connector is therefore: download new version -> verify checksum -> commit -> MR.

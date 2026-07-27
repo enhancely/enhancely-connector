@@ -1,0 +1,63 @@
+name: release
+
+# Cut a versioned release from a tag: build, test, package the Lambda@Edge
+# bundle and attach it (plus checksums) as release assets. Integrators (e.g.
+# KWS) vendor the artifact by version + SHA256 — see README "Consuming
+# releases".
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Quality gate
+        run: |
+          pnpm -r typecheck
+          pnpm -r build
+          pnpm -r test
+          pnpm lint
+
+      - name: Package Lambda@Edge bundle
+        run: |
+          pnpm --filter @enhancely/adapter-lambda-edge package
+          mkdir -p release-assets
+          # index.js: the self-contained bundle integrators vendor directly.
+          cp packages/adapter-lambda-edge/dist/index.js release-assets/lambda-edge-index.js
+          # lambda.zip without any connector-config.json (config is deploy-specific).
+          cd packages/adapter-lambda-edge/dist && rm -f release.zip && zip -q -X release.zip index.js && cd -
+          cp packages/adapter-lambda-edge/dist/release.zip release-assets/lambda-edge-bundle.zip
+
+      - name: Checksums
+        run: |
+          cd release-assets
+          sha256sum lambda-edge-index.js lambda-edge-bundle.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            release-assets/lambda-edge-index.js \
+            release-assets/lambda-edge-bundle.zip \
+            release-assets/SHA256SUMS
