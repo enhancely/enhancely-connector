@@ -45,6 +45,13 @@ jobs:
           cd packages/adapter-lambda-edge/dist && rm -f release.zip && zip -q -X release.zip index.js && cd -
           cp packages/adapter-lambda-edge/dist/release.zip release-assets/lambda-edge-bundle.zip
 
+      - name: Verify Terraform module bundle is in sync
+        run: |
+          if ! diff -q packages/adapter-lambda-edge/dist/index.js infra/modules/lambda-edge-injector/dist/index.js; then
+            echo "::error::infra/modules/lambda-edge-injector/dist/index.js is stale — run 'pnpm sync:module' and commit before tagging."
+            exit 1
+          fi
+
       - name: Checksums
         run: |
           cd release-assets

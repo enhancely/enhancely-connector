@@ -13,7 +13,8 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "sync:module": "pnpm --filter @enhancely/adapter-lambda-edge package && cp packages/adapter-lambda-edge/dist/index.js infra/modules/lambda-edge-injector/dist/index.js"
   },
   "devDependencies": {
     "@eslint/js": "^9.18.0",
