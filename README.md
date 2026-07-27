@@ -1,1 +1,62 @@
 # enhancely-connector
+
+Edge/server-side connector that injects Enhancely JSON-LD into customer HTML responses — the delivery layer for [Enhancely](https://enhancely.ai), comparable to how prerender.io or redirection.io sit in front of a site.
+
+On every HTML page view, the connector asks the Enhancely API for the page's JSON-LD and injects it as
+
+```html
+<script type="application/ld+json">
+  …
+</script>
+```
+
+immediately before `</head>`. If anything goes wrong — timeout, missing record, rate limit, non-HTML response, no `</head>` — the connector **fails open** and serves the original HTML untouched. The customer's site is never at risk. After an API error or `429`, the connector additionally remembers a short backoff (`Retry-After`, capped at 60 s; 10 s for plain errors) so page views don't repeatedly re-hit — or wait out the timeout of — a rate-limited or down API.
+
+## Packages
+
+| Package                                                           | Status                                                                                                                 |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `packages/injector-core` (`@enhancely/injector-core`)             | **Implemented + tested.** Shared core: API client, cache + ETag revalidation, HTML injection, fail-open orchestration. |
+| `packages/adapter-cloudflare` (`@enhancely/adapter-cloudflare`)   | **Reference adapter.** Cloudflare Worker wrapping the core.                                                            |
+| `packages/adapter-lambda-edge` (`@enhancely/adapter-lambda-edge`) | **Stub.** CloudFront Lambda@Edge (origin-response) adapter.                                                            |
+| `packages/adapter-sidecar` (`@enhancely/adapter-sidecar`)         | **Functional skeleton.** Node HTTP reverse proxy for nginx/apache setups.                                              |
+| `packages/adapter-sidecar-go`                                     | **Reserved.** Planned Go single-binary distribution of the sidecar.                                                    |
+
+All adapters are thin wrappers — connector logic lives exclusively in `injector-core`.
+
+## Quickstart
+
+Requires Node 22.22.0 (`.nvmrc`) and pnpm (pinned via `packageManager` in `package.json`).
+
+```bash
+pnpm install
+pnpm -r build
+pnpm -r test
+```
+
+Run the Cloudflare reference adapter locally:
+
+```bash
+# packages/adapter-cloudflare/.dev.vars
+ENHANCELY_API_KEY=sk-…
+```
+
+```bash
+pnpm --filter @enhancely/adapter-cloudflare dev   # wrangler dev
+```
+
+The API key is a secret — it must never be exposed client-side or committed. `.dev.vars` is gitignored.
+
+## Configuration
+
+| Setting             | Default                    | Notes                                                                   |
+| ------------------- | -------------------------- | ----------------------------------------------------------------------- |
+| `ENHANCELY_API_KEY` | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.      |
+| `ENHANCELY_BASE`    | `https://app.enhancely.ai` | **TODO: confirm** final production API base URL.                        |
+| `timeoutMs`         | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call.              |
+| `cacheTtlMs`        | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry. |
+
+## Documentation
+
+- [`CLAUDE.md`](CLAUDE.md) — commands, rules, and the Enhancely API contract.
+- [`docs/architecture/2026-07-27-connector-architecture.md`](docs/architecture/2026-07-27-connector-architecture.md) — full architecture writeup and binding decisions.
