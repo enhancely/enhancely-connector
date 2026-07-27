@@ -1,0 +1,34 @@
+# Example: Enhancely connector deployed in front of www.example.com
+#
+# Prereqs (one-time):
+#   wrangler login
+#   wrangler kv namespace create JSONLD_CACHE     # paste the id below
+#   wrangler secret put ENHANCELY_API_KEY         # sk-… / sk-org-…; never in this file
+#
+# Deploy from packages/adapter-cloudflare with this config:
+#   wrangler deploy -c ../../examples/cloudflare/wrangler.toml
+# (or copy this file over packages/adapter-cloudflare/wrangler.toml)
+
+name = "enhancely-connector"
+# Path is relative to this file — points at the adapter source; wrangler bundles it.
+main = "../../packages/adapter-cloudflare/src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+# Optional overrides — the defaults below are built into the connector.
+ENHANCELY_BASE = "https://app.enhancely.ai" # TODO: confirm final base URL
+ENHANCELY_TIMEOUT_MS = "800"                # per-call AbortSignal timeout
+ENHANCELY_CACHE_TTL_MS = "300000"           # 5 min freshness; ETag revalidation after
+
+# Distributed JSON-LD cache. Strongly recommended: the Enhancely API is
+# Cache-Control: no-store, so this KV (plus ETag revalidation) is what keeps
+# per-page-view latency and API load down across all edge locations.
+[[kv_namespaces]]
+binding = "JSONLD_CACHE"
+id = "0000000000000000000000000000000000" # ← replace with your namespace id
+
+# Run the worker on every request of the customer site. The worker passes the
+# request through to the origin and only ever touches 2xx text/html responses.
+[[routes]]
+pattern = "www.example.com/*"
+zone_name = "example.com"

@@ -1,0 +1,30 @@
+# Enhancely connector — Cloudflare Worker (template).
+# Copy/adjust per deployment; a filled-in example lives at examples/cloudflare/wrangler.toml.
+# wrangler bundles src/index.ts itself — no separate build step needed.
+
+name = "enhancely-connector"
+main = "src/index.ts"
+# Recent, wrangler-3-supported compatibility date; bump when upgrading wrangler.
+compatibility_date = "2025-01-01"
+
+# --- Secrets (NEVER put the API key in this file) ---------------------------
+#   wrangler secret put ENHANCELY_API_KEY
+# For local dev, put it in .dev.vars (gitignored) instead.
+
+# --- Optional plain-text vars ------------------------------------------------
+# [vars]
+# ENHANCELY_BASE = "https://app.enhancely.ai"   # default; TODO: confirm final base URL
+# ENHANCELY_TIMEOUT_MS = "800"
+# ENHANCELY_CACHE_TTL_MS = "300000"
+
+# --- Distributed JSON-LD cache (recommended for production) ------------------
+# Without this binding the worker falls back to a per-isolate memory cache.
+#   wrangler kv namespace create JSONLD_CACHE
+# [[kv_namespaces]]
+# binding = "JSONLD_CACHE"
+# id = "<paste namespace id from the create command>"
+
+# --- Route: run the worker in front of the customer site ---------------------
+# [[routes]]
+# pattern = "www.example.com/*"
+# zone_name = "example.com"
