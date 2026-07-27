@@ -1,5 +1,10 @@
 node_modules/
 dist/
+# The Terraform module ships its bundle IN the repo (consumed via git source
+# at a tag) — re-include exactly that one artifact:
+!infra/modules/lambda-edge-injector/dist/
+infra/modules/lambda-edge-injector/dist/*
+!infra/modules/lambda-edge-injector/dist/index.js
 *.tsbuildinfo
 .wrangler/
 .dev.vars
