@@ -11,8 +11,9 @@ as the last child of `<head>`:
 </script>
 ```
 
-All connector logic (URL normalization for cache keys, API client, caching,
-ETag revalidation, timeouts, fail-open orchestration) lives in
+All connector logic (URL normalization for the cache key and the query-stripped
+lookup URL, API client, caching, ETag revalidation, timeouts, fail-open
+orchestration) lives in
 [`@enhancely/injector-core`](../injector-core). This adapter only translates
 Workers primitives: `fetch` pass-through, env/bindings → config, KV →
 `CacheBackend`, and `HTMLRewriter` for the injection itself.

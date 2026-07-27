@@ -1,22 +1,24 @@
 /**
- * Local mirror of the server-side URL normalization — used ONLY for cache
- * keys, NEVER for the URL we send to Enhancely (the API always receives the
- * raw page URL; the server normalizes and hashes authoritatively). Drift here
- * can therefore never produce wrong content, only a cache miss.
+ * Local mirror of the server-side URL normalization. It serves BOTH the local
+ * cache key AND the URL the connector sends to Enhancely (query strings, which
+ * carry tokens/PII, are stripped here so they never leave the edge; see
+ * client.ts). It is NOT a hash — the server still hashes authoritatively.
  *
- * The four rules (keep in sync with the server, in this order):
+ * The four rules — MUST stay byte-for-byte identical to the server's
+ * `normalizeUrl` (amplify/functions/shared/url-hash.ts), in this order:
  *   1. force https:
  *   2. strip query string
  *   3. strip fragment
  *   4. strip a single trailing slash
  *
- * Note on `new URL()` side effects (external review 2026-07-27, refuted):
- * URL parsing additionally lowercases the hostname, drops default ports and
- * collapses dot-segments (`/a/../b` → `/b`). That is fine here BECAUSE the
- * server's normalizeUrl uses the exact same `new URL()` parsing before
- * hashing — two raw URLs that collapse to one cache key necessarily collapse
- * to one server-side hash as well, so a shared key can never serve the wrong
- * record's JSON-LD.
+ * SYNC REQUIREMENT (load-bearing): because the connector now sends this
+ * normalized URL rather than the raw one, the server can no longer recover the
+ * original — so any divergence between this function and the server's
+ * normalizeUrl would become a CORRECTNESS bug (wrong record served), not just a
+ * cache miss. Today the two are the exact same code (verified 2026-07-27:
+ * identical `new URL()` handling, same trailing-slash strip), so they agree on
+ * every input including `new URL()` side effects (host lowercasing, default
+ * ports, dot-segment collapse like `/a/../b` → `/b`). Keep them in lockstep.
  */
 export function normalizeLite(url: string): string {
   try {

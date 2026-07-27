@@ -34,16 +34,16 @@ Node version: 22.22.0 (see `.nvmrc`). Package manager: pnpm (pinned via `package
 ## Non-negotiable rules
 
 1. **API key never client-side.** `sk-…` / `sk-org-…` keys stay on the edge/server. Nothing that could leak the key may reach the browser.
-2. **Always send the URL to Enhancely — never a locally computed hash.** The server normalizes and hashes authoritatively.
+2. **Send a URL to Enhancely, never a locally computed hash.** Specifically the query-stripped `normalizeLite(url)` (= the cache key): the server strips the query anyway so the resolved record is identical, but query strings (tokens/PII) never leave the edge. The server still hashes authoritatively.
 3. **Fail-open everywhere.** Any error, timeout, missing `</head>`, non-HTML, or non-2xx origin response → serve the original HTML untouched. Every Enhancely call uses `AbortSignal.timeout` (default 800 ms).
 4. **Own cache + ETag revalidation is mandatory.** The API responds `Cache-Control: no-store`; the connector brings its own cache and revalidates with `If-None-Match` → 304.
 5. **Inject only into `text/html` responses with 2xx status.** Everything else passes through untouched.
-6. **`normalizeLite` (4 rules: force https, strip query, strip fragment, strip single trailing slash) is for cache keys ONLY.** The server stays authoritative for normalization — local drift costs cache efficiency, never correctness.
+6. **`normalizeLite` (4 rules: force https, strip query, strip fragment, strip single trailing slash) is both the cache key AND the URL sent to Enhancely.** It MUST stay byte-for-byte identical to the server's `normalizeUrl` — since the connector sends the normalized URL, a divergence would now serve the wrong record (a correctness bug), not merely a cache miss. Today they are the exact same code; keep them in lockstep.
 7. **New adapters must NOT duplicate core logic.** Anything shareable goes into `injector-core`.
 
 ## Enhancely API contract
 
-- `GET {ENHANCELY_BASE}/api/v1/jsonld/{segment}` — `segment` is the URL-encoded **raw page URL**.
+- `GET {ENHANCELY_BASE}/api/v1/jsonld/{segment}` — `segment` is the URL-encoded page URL (the connector sends the query-stripped `normalizeLite(url)`; the server accepts a raw URL too and normalizes+hashes it authoritatively).
 - `ENHANCELY_BASE` default: `https://app.enhancely.ai` — **TODO: confirm** with the Enhancely team.
 - Auth required: `Authorization: Bearer <sk-… | sk-org-…>`.
 - `Accept: application/ld+json` — the server does an **EXACT string match** on this header. Response body is the raw, already script-safe-escaped JSON-LD string (`<` pre-escaped as a unicode escape). It goes **verbatim** into `<script type="application/ld+json">…</script>` — never re-serialize or re-escape it.
