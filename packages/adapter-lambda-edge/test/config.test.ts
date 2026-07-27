@@ -186,6 +186,35 @@ describe('resolveAdapterConfig — no key resolvable', () => {
   });
 });
 
+describe('resolveAdapterConfig — placeholder / non-sk- key guard', () => {
+  it('a baked apiKey that is not an sk- key (SSM placeholder REPLACE_ME) → null (pass-through)', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    __setBakedConfigForTests({ apiKey: 'REPLACE_ME' });
+
+    expect(await resolveAdapterConfig()).toBeNull();
+    // The guard fires BEFORE any SSM contact (the key was baked).
+    expect(ssm.send).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('not configured'));
+  });
+
+  it('an SSM value that is not an sk- key (REPLACE_ME) → null (pass-through)', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    ssm.send.mockResolvedValue({ Parameter: { Value: 'REPLACE_ME' } });
+    __setBakedConfigForTests(null); // no baked key → SSM supplies the placeholder
+
+    expect(await resolveAdapterConfig()).toBeNull();
+    expect(ssm.send).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledTimes(1);
+  });
+
+  it('an sk-org- key passes the guard', async () => {
+    __setBakedConfigForTests({ apiKey: 'sk-org-real' });
+    const config = await resolveAdapterConfig();
+    expect(config?.apiKey).toBe('sk-org-real');
+  });
+});
+
 /**
  * The REAL file-read path (no `__setBakedConfigForTests` seam): a
  * connector-config.json written to disk and located via LAMBDA_TASK_ROOT —

@@ -9,9 +9,21 @@
  * JavaScript and swallow the JSON-LD).
  */
 
-/** Wrap the raw (pre-escaped) JSON-LD string in its script tag. */
+/**
+ * Wrap the raw JSON-LD string in its script tag.
+ *
+ * The Enhancely API already returns the body script-safe (every `<` sent as
+ * the JSON unicode escape `<`), so in the happy path there is nothing to
+ * escape. We nonetheless re-escape any literal `<` defensively — the connector
+ * must not rely SOLELY on an upstream (a third-party, possibly staging,
+ * endpoint) having done it: a response containing `</script><script>…` would
+ * otherwise become arbitrary JavaScript in the customer's origin. The escape
+ * is idempotent (no literal `<` in the happy path → no-op) and byte-preserving
+ * for valid content, and mirrors the server's own `escapeJsonForScriptEmbedding`.
+ */
 export function buildScriptTag(jsonldRaw: string): string {
-  return `<script type="application/ld+json">${jsonldRaw}</script>`;
+  const safe = jsonldRaw.replace(/</g, '\\u003c');
+  return `<script type="application/ld+json">${safe}</script>`;
 }
 
 /**

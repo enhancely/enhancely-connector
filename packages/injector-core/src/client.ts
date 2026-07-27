@@ -4,9 +4,11 @@ import type { InjectorConfig, JsonLdFetchResult } from './types.js';
  * One conditional GET against `GET {base}/api/v1/jsonld/{url}`.
  *
  * Contract notes (verified against the Enhancely main repo):
- * - We always send the RAW page URL — never a locally computed hash and never
- *   a locally normalized variant (normalizeLite is for cache keys only). The
- *   server normalizes + hashes authoritatively.
+ * - We send a URL, never a locally computed hash — the server normalizes and
+ *   hashes authoritatively. The caller passes the query-stripped URL
+ *   (`normalizeLite`, = the cache key): the server strips the query anyway, so
+ *   the resolved record is identical, but query strings (tokens/PII) never
+ *   leave the edge and the looked-up URL matches the cached one.
  * - `Accept: application/ld+json` must be the EXACT header value (the server
  *   does an exact string match, no q-values) — it selects the raw, already
  *   script-safe-escaped JSON-LD string (`<` is pre-escaped as the unicode

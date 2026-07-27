@@ -76,10 +76,12 @@ describe('getJsonLdSnippet', () => {
     expect(entry?.storedAt).toBeGreaterThanOrEqual(before);
   });
 
-  it('sends the RAW page URL to the API while caching under the normalized key', async () => {
+  it('sends the QUERY-STRIPPED (normalized) URL to the API and caches under that same key', async () => {
     const cache = new MemoryCache();
-    // Query string, http scheme and trailing slash must all reach the API
-    // untouched — normalizeLite is for the local cache key ONLY.
+    // The query string must be stripped BEFORE the URL leaves the edge: the
+    // server normalizes identically, so the resolved record is byte-for-byte
+    // the same, but tokens/search terms/PII in the querystring never reach the
+    // third-party API. The URL sent === the cache key === normalizeLite(raw).
     const rawUrl = 'http://example.com/pricing/?utm_source=x&b=2';
     const fetchImpl = vi.fn<Fetcher>(() =>
       Promise.resolve(new Response(RAW_JSONLD, { status: 200, headers: { ETag: '"v1"' } }))
@@ -88,15 +90,71 @@ describe('getJsonLdSnippet', () => {
 
     expect(await getJsonLdSnippet(rawUrl, cache, config)).toBe(SNIPPET);
 
-    const requestedUrl = fetchImpl.mock.calls[0]?.[0];
-    expect(requestedUrl).toBe(
-      `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(rawUrl)}`
-    );
-
-    // …while the cache key is the lite-normalized URL.
     const key = normalizeLite(rawUrl);
     expect(key).toBe('https://example.com/pricing');
+
+    // The API endpoint carries the query-stripped URL (= the cache key), NOT
+    // the raw request URL — no querystring leaves the edge.
+    const requestedUrl = fetchImpl.mock.calls[0]?.[0];
+    expect(requestedUrl).toBe(`${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(key)}`);
+    expect(requestedUrl).not.toContain('utm_source');
+    expect(requestedUrl).not.toContain(encodeURIComponent('?'));
+
+    // …and the entry is cached under that same normalized key.
     expect(await cache.get(key)).toMatchObject({ jsonldRaw: RAW_JSONLD, etag: '"v1"' });
+  });
+
+  it('shares one cache entry (and one Enhancely call) across different querystrings', async () => {
+    const cache = new MemoryCache();
+    const fetchImpl = vi.fn<Fetcher>(() =>
+      Promise.resolve(new Response(RAW_JSONLD, { status: 200, headers: { ETag: '"v1"' } }))
+    );
+    const config = makeConfig(fetchImpl);
+
+    // `?a=1` populates the cache under the normalized key…
+    expect(await getJsonLdSnippet('https://example.com/page?a=1', cache, config)).toBe(SNIPPET);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    // …and `?a=2` is the SAME page server-side, so it hits that entry — no
+    // second Enhancely call — precisely because both look up normalizeLite(url).
+    expect(await getJsonLdSnippet('https://example.com/page?a=2', cache, config)).toBe(SNIPPET);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    // Both querystrings resolve to a single cache entry under the stripped key.
+    const key = normalizeLite('https://example.com/page?a=1');
+    expect(key).toBe('https://example.com/page');
+    expect(await cache.get(key)).toMatchObject({ jsonldRaw: RAW_JSONLD });
+  });
+
+  it('auto-registration (404) POSTs the QUERY-STRIPPED URL, not the raw request URL', async () => {
+    const cache = new MemoryCache();
+    const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+    const fetchImpl = vi.fn<Fetcher>((url, init) => {
+      calls.push({ url, method: init.method, body: init.body });
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+    const config = defineConfig({
+      apiKey: 'sk-test-key',
+      autoRegister: true,
+      fetchImpl,
+      cacheTtlMs: TTL_MS,
+    });
+
+    const rawUrl = 'https://example.com/pricing?token=secret&b=2';
+    expect(await getJsonLdSnippet(rawUrl, cache, config)).toBeNull();
+
+    const key = normalizeLite(rawUrl);
+    expect(key).toBe('https://example.com/pricing');
+
+    // GET carried the stripped URL…
+    const get = calls.find((c) => c.method !== 'POST');
+    expect(get?.url).toBe(`${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(key)}`);
+
+    // …and the registration POST body carried the stripped URL too (no token).
+    const post = calls.find((c) => c.method === 'POST');
+    expect(post?.url).toBe(`${config.enhancelyBase}/api/v1/jsonld`);
+    expect(JSON.parse(String(post?.body))).toEqual({ url: key });
+    expect(String(post?.body)).not.toContain('token');
   });
 
   it('stores fresh data on 200 and serves the snippet', async () => {

@@ -178,9 +178,11 @@ describe('handler — happy path', () => {
     expect(lastHostHeader).toBe('www.example.com');
     expect(lastPath).toBe('/page?a=1');
 
-    // Enhancely got the RAW public page URL, encoded, with auth.
+    // Enhancely got the QUERY-STRIPPED public page URL, encoded, with auth —
+    // the querystring never leaves the edge (server normalizes identically).
     const [endpoint, init] = enhancelyFetch.mock.calls[0] ?? [];
-    expect(endpoint).toContain(encodeURIComponent('https://www.example.com/page?a=1'));
+    expect(endpoint).toContain(encodeURIComponent('https://www.example.com/page'));
+    expect(endpoint).not.toContain('a%3D1'); // no `a=1` querystring in the URL
     expect(new Headers(init?.headers).get('authorization')).toBe('Bearer sk-test');
 
     // Stale Content-Length removed → CloudFront recomputes it from the body.
@@ -360,20 +362,26 @@ describe('handler — gating pass-through (original response, no origin contact)
 });
 
 describe('handler — generated-response size boundary (502 territory, must fail open)', () => {
-  it('fetched HTML far above the origin-fetch cap → untouched response', async () => {
+  it('fetched HTML far above the origin-fetch cap → truncated, untouched response', async () => {
     const event = eventFor('/big');
     const result = await invoke(event);
 
+    // Enhancely is asked FIRST (has a snippet), but the re-fetched body is far
+    // over the origin-fetch cap → truncated → original response, no body.
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(result?.body).toBeUndefined();
   });
 
-  it('fetched HTML of exactly MAX_ORIGIN_BODY_BYTES + 1 → truncated, untouched, no Enhancely call', async () => {
+  it('fetched HTML of exactly MAX_ORIGIN_BODY_BYTES + 1 → truncated, untouched (Enhancely called first)', async () => {
     const event = eventFor('/sized', { querystring: `n=${MAX_ORIGIN_BODY_BYTES + 1}` });
     const result = await invoke(event);
 
+    // Reorder: the snippet is fetched before the origin re-fetch, so Enhancely
+    // IS called; the one-byte-over body then truncates → untouched original.
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled(); // truncation path, pre-core
+    expect(result?.body).toBeUndefined();
   });
 
   it('normal headers: body at the origin-fetch cap fits the header-aware budget → injected', async () => {
@@ -458,12 +466,17 @@ describe('handler — fail-open on the re-fetch path', () => {
     expect(consoleError).toHaveBeenCalled(); // loud fail-open
   });
 
+  // Reorder note: Enhancely is now called FIRST and returns a 200 snippet (the
+  // default mock), so the origin re-fetch IS reached in each case below — and
+  // it is the BAD origin answer that drives the fail-open to the untouched
+  // original response.
   it('re-fetch answers with a redirect → untouched response', async () => {
     const event = eventFor('/redirect');
     const result = await invoke(event);
 
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1); // snippet fetched → re-fetch reached
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(result?.body).toBeUndefined();
   });
 
   it('re-fetch declares a non-UTF-8 charset → untouched response', async () => {
@@ -471,8 +484,9 @@ describe('handler — fail-open on the re-fetch path', () => {
     const event = eventFor('/latin1');
     const result = await invoke(event);
 
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(result?.body).toBeUndefined();
   });
 
   it('no charset parameter but non-UTF-8 BYTES (lossy decode) → untouched response', async () => {
@@ -483,16 +497,18 @@ describe('handler — fail-open on the re-fetch path', () => {
     });
     const result = await invoke(event);
 
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(result?.body).toBeUndefined();
   });
 
   it('re-fetch answers with Set-Cookie → untouched response', async () => {
     const event = eventFor('/cookie-setter');
     const result = await invoke(event);
 
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(result?.body).toBeUndefined();
   });
 
   it('origin re-fetch timeout (AbortSignal.timeout) → untouched response', async () => {
@@ -502,8 +518,8 @@ describe('handler — fail-open on the re-fetch path', () => {
     const event = eventFor('/slow');
     const result = await invoke(event);
 
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled();
     expect(consoleError).toHaveBeenCalled(); // loud fail-open
   });
 
@@ -511,8 +527,9 @@ describe('handler — fail-open on the re-fetch path', () => {
     const event = eventFor('/gzipped');
     const result = await invoke(event);
 
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(result).toBe(event.Records[0]?.cf.response);
-    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(result?.body).toBeUndefined();
   });
 
   it('Enhancely has no record (404) → untouched response, no generated body', async () => {
@@ -531,6 +548,59 @@ describe('handler — fail-open on the re-fetch path', () => {
 
     expect(result).toBe(event.Records[0]?.cf.response);
     expect(result?.body).toBeUndefined();
+  });
+});
+
+describe('handler — Enhancely-first reorder (no snippet ⇒ no origin re-fetch)', () => {
+  it('404 from Enhancely (no snippet) → ZERO origin re-fetch, untouched response', async () => {
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const event = eventFor('/page');
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(originHits).toBe(0); // the origin is NOT re-fetched when there is nothing to inject
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('rate-limited (429) from Enhancely → ZERO origin re-fetch, untouched response', async () => {
+    enhancelyFetch.mockResolvedValueOnce(
+      new Response(null, { status: 429, headers: { 'retry-after': '30' } })
+    );
+    const event = eventFor('/page');
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(originHits).toBe(0);
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('a successful snippet → re-fetches the origin EXACTLY once and injects', async () => {
+    // Default mock returns a 200 snippet.
+    const event = eventFor('/page');
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(originHits).toBe(1);
+    expect(result?.body).toContain(SNIPPET);
+  });
+});
+
+describe('handler — placeholder key guard (no re-fetch when key not configured)', () => {
+  it('a baked REPLACE_ME key → config null → untouched response, no origin re-fetch', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    // Overwrite the beforeEach sk-test key with the SSM placeholder value.
+    __setBakedConfigForTests({ apiKey: 'REPLACE_ME' });
+
+    const event = eventFor('/page');
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(originHits).toBe(0); // never pays the doubled origin load
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalled(); // loud "not configured"
   });
 });
 

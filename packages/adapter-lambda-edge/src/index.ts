@@ -32,7 +32,7 @@ import type {
   CloudFrontResponseHandler,
   CloudFrontResultResponse,
 } from 'aws-lambda';
-import { handleHtml, MemoryCache } from '@enhancely/injector-core';
+import { getJsonLdSnippet, injectIntoHead, MemoryCache } from '@enhancely/injector-core';
 import { getOriginTimeoutMs, resolveAdapterConfig } from './config.js';
 import { fetchOriginHtml } from './origin-fetch.js';
 
@@ -331,6 +331,15 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
     const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
 
+    // Ask Enhancely FIRST — this needs no page body (cache + ETag + API call
+    // only). Only when there is actually something to inject do we pay the
+    // origin re-fetch below. Pages with no JSON-LD yet (unregistered, 404,
+    // rate-limited, upstream error) therefore never double the origin load —
+    // during an early pilot that is the large majority of requests, and it also
+    // means a not-yet-configured key (no snippet) costs zero extra origin hits.
+    const snippet = await getJsonLdSnippet(pageUrl, cache, config);
+    if (snippet === null) return response;
+
     // Re-fetch the page: origin-response events do not expose the body.
     const origin = await fetchOriginHtml(
       originUrl,
@@ -364,16 +373,12 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // CACHE the mojibake. Prove the decode was lossless before doing anything
     // with it; otherwise pass through byte-identical.
     if (!Buffer.from(originalHtml, 'utf8').equals(origin.body)) return response;
-    // Core orchestration: cache + ETag revalidation + Enhancely fetch +
-    // injection; fail-open by contract (returns the input HTML unchanged).
-    const injected = await handleHtml(
-      { html: originalHtml, url: pageUrl, contentType: origin.contentType, status: origin.status },
-      cache,
-      config
-    );
+    // We already hold the snippet — inject it directly. injectIntoHead returns
+    // the HTML unchanged when there is no </head>, preserving fail-open.
+    const injected = injectIntoHead(originalHtml, snippet);
 
-    // Nothing injected → return the untouched response; CloudFront serves the
-    // origin's own (byte-identical) body without us generating one.
+    // Nothing injected (no </head>) → return the untouched response; CloudFront
+    // serves the origin's own (byte-identical) body without us generating one.
     if (injected === originalHtml) return response;
 
     const headers: CloudFrontHeaders = { ...response.headers };

@@ -194,7 +194,8 @@ async function registerJsonLd(config, pageUrl) {
 
 // ../injector-core/dist/inject.js
 function buildScriptTag(jsonldRaw) {
-  return `<script type="application/ld+json">${jsonldRaw}</script>`;
+  const safe = jsonldRaw.replace(/</g, "\\u003c");
+  return `<script type="application/ld+json">${safe}</script>`;
 }
 var RAW_TEXT_ELEMENTS = ["script", "style", "title", "textarea", "noscript"];
 var SCAN_TOKEN = new RegExp(["<!--", "-->", ...RAW_TEXT_ELEMENTS.flatMap((t) => [`<${t}\\b`, `</${t}\\s*>`]), "</head\\s*>"].join("|").replace(/[/]/g, "\\/"), "gi");
@@ -232,11 +233,6 @@ function injectIntoHead(html, snippet) {
 function snippetFromEntry(entry) {
   return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw) : null;
 }
-function isHtmlMediaType(contentType) {
-  if (contentType === null)
-    return false;
-  return contentType.split(";", 1)[0]?.trim().toLowerCase() === "text/html";
-}
 var DEFAULT_RETRY_BACKOFF_MS = 1e4;
 var MAX_RETRY_BACKOFF_MS = 6e4;
 async function getJsonLdSnippet(url, cache2, config) {
@@ -249,7 +245,7 @@ async function getJsonLdSnippet(url, cache2, config) {
     if (cached?.retryNotBefore !== void 0 && Date.now() < cached.retryNotBefore) {
       return snippetFromEntry(cached);
     }
-    const result = await fetchJsonLd(config, url, cached?.etag);
+    const result = await fetchJsonLd(config, key, cached?.etag);
     switch (result.status) {
       case "ok": {
         await cache2.set(key, {
@@ -271,7 +267,7 @@ async function getJsonLdSnippet(url, cache2, config) {
       }
       case "not-found": {
         if (config.autoRegister) {
-          await registerJsonLd(config, url);
+          await registerJsonLd(config, key);
         }
         await cache2.set(key, { jsonldRaw: null, etag: null, storedAt: Date.now() });
         return null;
@@ -300,22 +296,6 @@ async function getJsonLdSnippet(url, cache2, config) {
     }
   } catch {
     return null;
-  }
-}
-async function handleHtml(ctx, cache2, config) {
-  try {
-    if (ctx.status < 200 || ctx.status > 299)
-      return ctx.html;
-    if (!isHtmlMediaType(ctx.contentType))
-      return ctx.html;
-    if (config.apiKey === "")
-      return ctx.html;
-    const snippet = await getJsonLdSnippet(ctx.url, cache2, config);
-    if (snippet === null)
-      return ctx.html;
-    return injectIntoHead(ctx.html, snippet);
-  } catch {
-    return ctx.html;
   }
 }
 
@@ -409,6 +389,12 @@ async function resolveOnce() {
     if (apiKey === void 0) {
       console.error(
         "[enhancely-lambda-edge] NO API KEY: neither a baked connector-config.json apiKey nor a non-empty SSM parameter was found \u2014 every response passes through UNINJECTED until this execution environment is recycled"
+      );
+      return null;
+    }
+    if (!apiKey.startsWith("sk-")) {
+      console.error(
+        `[enhancely-lambda-edge] API KEY not configured (value does not look like an Enhancely key) \u2014 passing every response through UNINJECTED. Set the real key in SSM.`
       );
       return null;
     }
@@ -623,6 +609,8 @@ var handler = async (event) => {
     if (originHost === "") return response;
     const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
     const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
+    const snippet = await getJsonLdSnippet(pageUrl, cache, config);
+    if (snippet === null) return response;
     const origin = await fetchOriginHtml(
       originUrl,
       originHost,
@@ -645,11 +633,7 @@ var handler = async (event) => {
     }
     const originalHtml = origin.body.toString("utf8");
     if (!Buffer.from(originalHtml, "utf8").equals(origin.body)) return response;
-    const injected = await handleHtml(
-      { html: originalHtml, url: pageUrl, contentType: origin.contentType, status: origin.status },
-      cache,
-      config
-    );
+    const injected = injectIntoHead(originalHtml, snippet);
     if (injected === originalHtml) return response;
     const headers = { ...response.headers };
     delete headers["content-length"];

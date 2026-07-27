@@ -217,6 +217,20 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
       return null;
     }
 
+    // Guard against an unconfigured/placeholder key. Every Enhancely key is
+    // `sk-…` (project) or `sk-org-…`; anything else (e.g. the SSM SecureString
+    // placeholder `REPLACE_ME` before the real value is set) means the pilot is
+    // not wired up yet. Return null → the handler passes through WITHOUT the
+    // expensive origin re-fetch, so we do not pay doubled origin load from the
+    // moment the stack applies until the key is actually installed.
+    if (!apiKey.startsWith('sk-')) {
+      console.error(
+        `[enhancely-lambda-edge] API KEY not configured (value does not look like an Enhancely ` +
+          `key) — passing every response through UNINJECTED. Set the real key in SSM.`
+      );
+      return null;
+    }
+
     return defineConfig({
       apiKey,
       ...(baked?.enhancelyBase !== undefined && { enhancelyBase: baked.enhancelyBase }),
