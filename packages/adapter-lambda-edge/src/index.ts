@@ -6,8 +6,9 @@
  * So for eligible responses (GET, status 200, text/html, no Content-Encoding,
  * UTF-8-compatible charset, no Set-Cookie, no private/no-store Cache-Control)
  * this handler RE-FETCHES the page directly from the custom origin (same
- * URI + querystring, incoming Host header so vhosts resolve, forwarded
- * Cookie/Authorization/Accept-Language so the origin serves the same
+ * URI + querystring, incoming Host header so vhosts resolve, ALL request
+ * headers CloudFront sent to the origin forwarded — except Host,
+ * Accept-Encoding and hop-by-hop headers — so the origin serves the same
  * representation, `Accept-Encoding: identity`), runs the core's `handleHtml`
  * over the fetched HTML, and replaces the response body with the injected
  * result. CloudFront then caches the injected page, so the extra origin
@@ -17,8 +18,9 @@
  * Fail-open invariant: the whole handler is wrapped in try/catch and ALWAYS
  * returns the original response on any failure — config unresolvable, origin
  * re-fetch error/timeout/non-200, body over the generated-response quota
- * (1 MB INCLUDING headers; see MAX_BODY_BYTES), unexpected charset/encoding,
- * lossy UTF-8 decode, core errors.
+ * (1 MB INCLUDING headers; see MAX_ORIGIN_BODY_BYTES and
+ * serializedHeaderBytes), unexpected charset/encoding, lossy UTF-8 decode,
+ * core errors.
  *
  * All connector logic (Enhancely API client, cache + ETag revalidation,
  * injection, fail-open orchestration) lives in @enhancely/injector-core; this
@@ -55,21 +57,33 @@ export type { OriginFetchResult } from './origin-fetch.js';
 export const MAX_GENERATED_RESPONSE_BYTES = 1_048_576;
 
 /**
- * Headroom reserved for the serialized response headers (status line, header
- * names/values, per-header overhead). The origin's full header set is spread
- * into the generated response, so the body alone must stay this far under the
- * 1 MB quota. 16 KB comfortably covers real-world header sets (typically well
- * under 8 KB) while giving up under 1.6 % of the usable body budget.
+ * CloudFront's own hard cap on the total response header size: 32,768 bytes.
+ * Header sets a fixed small allowance would not cover ARE possible — so the
+ * body budget must be computed from the ACTUAL headers being returned (see
+ * serializedHeaderBytes), not from an optimistic constant.
  */
-export const HEADER_ALLOWANCE_BYTES = 16_384;
+export const MAX_RESPONSE_HEADER_BYTES = 32_768;
 
 /**
- * Effective cap for a generated BODY: the 1 MB headers-and-body quota minus
- * the header allowance. Fetched HTML above this — and injected HTML pushed
- * above it — passes through untouched (fail-open) instead of producing an
- * over-quota generated response (viewer-facing 502).
+ * Safety margin subtracted from the generated-response budget on top of the
+ * measured header bytes — absorbs serialization details this adapter cannot
+ * see (exact status-line text, header framing CloudFront adds). Exceeding the
+ * 1 MB quota is a viewer-facing 502, so err on the side of passing through.
  */
-export const MAX_BODY_BYTES = MAX_GENERATED_RESPONSE_BYTES - HEADER_ALLOWANCE_BYTES;
+export const GENERATED_RESPONSE_SAFETY_MARGIN_BYTES = 1_024;
+
+/**
+ * Conservative cap for the origin re-fetch download: the 1 MB headers-and-body
+ * quota minus the WORST-CASE header size CloudFront permits (32 KB) minus the
+ * safety margin — i.e. "1 MB − 33 KB". A deliberate constant, not the measured
+ * per-response header size: the download bound must be known BEFORE the final
+ * response headers exist (the fetch streams first), and any body above this
+ * cap could never be returned even under maximal headers, so aborting the
+ * download early wastes nothing. The precise, per-response budget check
+ * happens later against serializedHeaderBytes of the actual headers.
+ */
+export const MAX_ORIGIN_BODY_BYTES =
+  MAX_GENERATED_RESPONSE_BYTES - MAX_RESPONSE_HEADER_BYTES - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
 
 /* ------------------------------------------------------------------------ */
 /* Pure helpers (exported for tests)                                          */
@@ -81,6 +95,28 @@ export const MAX_BODY_BYTES = MAX_GENERATED_RESPONSE_BYTES - HEADER_ALLOWANCE_BY
  * supported; such pages pass through byte-identical and uninjected).
  */
 const UTF8_COMPATIBLE_CHARSETS = new Set(['utf-8', 'utf8', 'us-ascii', 'ascii']);
+
+/**
+ * Bytes reserved for the response status line and framing overhead on top of
+ * the per-header bytes in serializedHeaderBytes.
+ */
+const RESPONSE_STATUS_LINE_OVERHEAD_BYTES = 64;
+
+/**
+ * Serialized size of a CloudFront header map as it will count against the
+ * 1 MB generated-response quota: per header value, name + value + 4 bytes
+ * (": " separator + CRLF), plus a 64-byte status-line/framing margin.
+ * CloudFront header names/values are ASCII, so string length == byte length.
+ */
+export function serializedHeaderBytes(headers: CloudFrontHeaders): number {
+  let total = RESPONSE_STATUS_LINE_OVERHEAD_BYTES;
+  for (const [name, entries] of Object.entries(headers)) {
+    for (const entry of entries) {
+      total += (entry.key ?? name).length + entry.value.length + 4;
+    }
+  }
+  return total;
+}
 
 /** Lower-cased `charset` parameter of a Content-Type header value, or null. */
 export function charsetOf(contentType: string): string | null {
@@ -116,8 +152,8 @@ const PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i
  *
  * Set-Cookie / private / no-store mark a per-request representation (session
  * being established, personalized body). Even though the re-fetch forwards
- * Cookie/Authorization/Accept-Language, a page that is stamping NEW state
- * into the viewer cannot be re-fetched faithfully — pass it through.
+ * the full request header set, a page that is stamping NEW state into the
+ * viewer cannot be re-fetched faithfully — pass it through.
  */
 export function shouldAttempt(input: AttemptInput): boolean {
   if (input.method !== 'GET') return false;
@@ -188,22 +224,47 @@ function headerValue(headers: CloudFrontHeaders, name: string): string | null {
 }
 
 /**
- * Representation-selecting request headers forwarded on the origin re-fetch,
- * so the origin answers with the SAME variant of the page it already served
- * (logged-in vs anonymous, Accept-Language negotiation, …) instead of the
- * cookie-less default.
+ * Request headers NEVER forwarded on the origin re-fetch:
+ * - `host` — set explicitly by the caller (vhost resolution),
+ * - `accept-encoding` — forced to `identity` (injection needs raw bytes),
+ * - the hop-by-hop headers (RFC 9110 §7.6.1) — connection-level, never
+ *   meaningful to replay end-to-end.
  */
-const FORWARDED_REQUEST_HEADERS = ['cookie', 'authorization', 'accept-language'] as const;
+const NON_FORWARDED_REQUEST_HEADERS = new Set([
+  'host',
+  'accept-encoding',
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
 
-/** Extract the forwarded headers from the origin request's header map. */
+/**
+ * ALL headers to forward on the origin re-fetch, extracted from the
+ * origin-response event's request.headers — which is exactly the header set
+ * CloudFront sent to the origin, already filtered by the origin request
+ * policy. Forwarding the full set (User-Agent, Accept, CloudFront-Is-*-Viewer
+ * device headers, CloudFront geo headers, …) means the origin answers with
+ * the SAME representation it already served, whatever it varies on — a
+ * partial forward list would silently fetch a different variant. Only Host,
+ * Accept-Encoding and hop-by-hop headers are excluded (see
+ * NON_FORWARDED_REQUEST_HEADERS).
+ */
 export function forwardedHeaders(headers: CloudFrontHeaders): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const name of FORWARDED_REQUEST_HEADERS) {
-    const entries = headers[name];
-    if (entries === undefined || entries.length === 0) continue;
+  for (const [name, entries] of Object.entries(headers)) {
+    // CloudFront keys the map with lowercase names already; normalize anyway
+    // so the exclusion set can never be dodged by casing.
+    const key = name.toLowerCase();
+    if (NON_FORWARDED_REQUEST_HEADERS.has(key)) continue;
+    if (entries.length === 0) continue;
     // CloudFront may split repeated headers into multiple entries; cookies
     // recombine with "; " (RFC 6265), everything else with ", " (RFC 9110).
-    out[name] = entries.map((entry) => entry.value).join(name === 'cookie' ? '; ' : ', ');
+    out[key] = entries.map((entry) => entry.value).join(key === 'cookie' ? '; ' : ', ');
   }
   return out;
 }
@@ -275,10 +336,11 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       originUrl,
       originHost,
       getOriginTimeoutMs(),
-      MAX_BODY_BYTES,
+      MAX_ORIGIN_BODY_BYTES,
       forwardedHeaders(request.headers)
     );
-    // Over the generated-body cap — a body that large can never be returned.
+    // Over the conservative fetch cap — a body that large can never be
+    // returned, not even under the most favorable header set.
     if (origin.truncated) return response;
     if (
       !shouldAttempt({
@@ -314,11 +376,6 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // origin's own (byte-identical) body without us generating one.
     if (injected === originalHtml) return response;
 
-    // The injected page must itself fit the generated-response quota (which
-    // includes the headers — hence the allowance baked into MAX_BODY_BYTES);
-    // an over-quota generated response is a viewer-facing 502, not fail-open.
-    if (Buffer.byteLength(injected, 'utf8') > MAX_BODY_BYTES) return response;
-
     const headers: CloudFrontHeaders = { ...response.headers };
     // The origin's Content-Length describes the ORIGINAL body and is wrong for
     // the replaced one. Per the Lambda@Edge body-replacement rules CloudFront
@@ -333,6 +390,25 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // the injected version). Drop them so caches treat the body as new.
     delete headers['etag'];
     delete headers['last-modified'];
+    // Integrity digests describe the ORIGINAL bytes too — a Content-MD5 /
+    // Digest / Content-Digest / Repr-Digest computed over the uninjected body
+    // would make any verifying client reject the replaced one as corrupted.
+    delete headers['content-md5'];
+    delete headers['digest'];
+    delete headers['content-digest'];
+    delete headers['repr-digest'];
+
+    // The injected page must fit the 1 MB generated-response quota, which
+    // counts headers AND body together. Budget the body against the ACTUAL
+    // serialized size of the headers being returned (CloudFront permits up to
+    // 32 KB of headers — a fixed optimistic allowance is no guarantee), plus
+    // a safety margin. An over-quota generated response is a viewer-facing
+    // 502, not fail-open — so when in doubt, pass through.
+    const bodyBudgetBytes =
+      MAX_GENERATED_RESPONSE_BYTES -
+      serializedHeaderBytes(headers) -
+      GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
+    if (Buffer.byteLength(injected, 'utf8') > bodyBudgetBytes) return response;
 
     const result: CloudFrontResultResponse = {
       ...response,

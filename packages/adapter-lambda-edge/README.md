@@ -21,8 +21,9 @@ viewer ──> CloudFront ──(cache miss)──> origin
                 │       no Set-Cookie + no private/no-store Cache-Control
                 │    2. resolve config (baked file or SSM, memoized)
                 │    3. RE-FETCH the page from the custom origin
-                │       (same URI+query, incoming Host header, forwarded
-                │        Cookie/Authorization/Accept-Language,
+                │       (same URI+query, incoming Host header, ALL other
+                │        origin-request headers forwarded — except
+                │        Accept-Encoding and hop-by-hop headers —
                 │        Accept-Encoding: identity)
                 │    4. handleHtml() from injector-core:
                 │       cache → ETag revalidation → Enhancely API → inject
@@ -37,12 +38,18 @@ origin-response triggers — CloudFront only exposes status and headers. The
 only way to inject into the HTML is to fetch the page again, straight from
 the origin (`request.origin.custom` carries domain, port, protocol and origin
 path; the incoming `Host` header is forwarded so name-based vhosts resolve).
-The re-fetch also forwards the origin request's `Cookie`, `Authorization` and
-`Accept-Language` headers, so the origin answers with the **same
-representation** it already served (logged-in vs anonymous, negotiated
-language). Responses that stamp NEW per-request state — `Set-Cookie`, or
-`Cache-Control: private`/`no-store` — cannot be re-fetched faithfully and
-pass through untouched.
+The re-fetch also forwards **all** of the origin request's headers — exactly
+the set CloudFront sent to the origin, already filtered by the origin request
+policy — so the origin answers with the **same representation** it already
+served, whatever it varies on (`User-Agent` device detection, `Accept`
+negotiation, `Cookie`, `Authorization`, `Accept-Language`, CloudFront
+geo/device headers, …). Only three things are excluded: `Host` (set
+explicitly, as above), `Accept-Encoding` (forced to `identity` — injection
+needs raw bytes) and the hop-by-hop headers (`Connection`, `Keep-Alive`,
+`Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`,
+`Transfer-Encoding`, `Upgrade`). Responses that stamp NEW per-request state —
+`Set-Cookie`, or `Cache-Control: private`/`no-store` — cannot be re-fetched
+faithfully and pass through untouched.
 
 **What that costs:** one extra origin roundtrip per CloudFront **cache miss**
 (origin-response does not fire on cache hits, and CloudFront caches the
@@ -107,10 +114,21 @@ to the browser (non-negotiable rule #1 of this repo).
 
 - **1 MB generated response — headers AND body together** — for
   origin-response triggers; exceeding it makes CloudFront answer the viewer
-  with a **502**, not the original page. The adapter therefore reserves a
-  16 KB header allowance and caps the body at `1 MB − 16 KB` (1,032,192
-  bytes): fetched HTML above that cap — or injected HTML pushed above it —
-  passes through untouched.
+  with a **502**, not the original page. The adapter accounts for the quota
+  in two stages:
+  1. The origin **download** is capped at a conservative `1 MB − 33 KB`
+     (1,014,784 bytes = 1 MB minus CloudFront's 32,768-byte header maximum
+     minus a 1 KB safety margin). This bound must exist _before_ the final
+     response headers are known (the fetch streams first), and a body above
+     it could never be returned even under maximal headers — bigger pages
+     pass through untouched (fail-open).
+  2. Before returning an injected body, the **actual** serialized size of the
+     response headers being returned is measured (`serializedHeaderBytes`:
+     name + value + 4 bytes per header, plus a 64-byte status-line margin)
+     and the body must fit `1 MB − actual header bytes − 1 KB safety margin`.
+     A fixed allowance would not be a guarantee — CloudFront permits up to
+     32 KB of headers. Injected HTML over the real budget passes through
+     untouched.
 - **No environment variables** (hence the two key sources above).
 - **No streaming**: the page is buffered, injected, returned in one piece.
 - **Compressed origin answers pass through**: the re-fetch asks for
@@ -132,6 +150,10 @@ to the browser (non-negotiable rule #1 of this repo).
   body itself. `ETag` and `Last-Modified` are deleted too: they are
   validators for the **uninjected** body, and keeping them would let clients
   revalidate an old copy into a 304 and never receive the injected version.
+  The integrity digests `Content-MD5`, `Digest`, `Content-Digest` and
+  `Repr-Digest` are deleted for the same reason — they were computed over
+  the original bytes and would make verifying clients reject the injected
+  body as corrupted.
 - Best results when the origin request policy **forwards the viewer `Host`
   header** — it is used both for the re-fetch vhost and for the page URL sent
   to Enhancely. Without it, the origin domain is used instead.
@@ -248,14 +270,15 @@ pnpm --filter @enhancely/adapter-lambda-edge typecheck
 ```
 
 The suite runs the handler against a real local `node:http` origin (verifying
-the Host-header-carrying re-fetch and the Cookie/Authorization/
-Accept-Language forwarding), mocks the Enhancely API through the core's
-`fetchImpl` seam, and mocks `@aws-sdk/client-ssm` to verify key resolution
-order, memoization (one `GetParameter` for concurrent cold-start
-invocations), the bounded-SSM-timeout fallback, and the real
+the Host-header-carrying re-fetch and the full request-header forwarding —
+including `User-Agent` and CloudFront device headers, with `Accept-Encoding`
+pinned to `identity` and hop-by-hop headers dropped), mocks the Enhancely API
+through the core's `fetchImpl` seam, and mocks `@aws-sdk/client-ssm` to
+verify key resolution order, memoization (one `GetParameter` for concurrent
+cold-start invocations), the bounded-SSM-timeout fallback, and the real
 `connector-config.json` file read (valid, unparsable, junk-typed). Fail-open
-coverage includes the exact generated-size boundary (body at the cap, one
-byte over, injection pushing it over), origin connection errors and
-re-fetch timeouts, redirects, charset/encoding/lossy-decode gates,
-Set-Cookie / private / no-store gates, Enhancely 404s and network errors,
-and the missing-key pass-through.
+coverage includes the exact generated-size boundaries (origin-fetch cap, the
+header-aware body budget with ~30–32 KB header sets, injection pushing one
+byte over), origin connection errors and re-fetch timeouts, redirects,
+charset/encoding/lossy-decode gates, Set-Cookie / private / no-store gates,
+Enhancely 404s and network errors, and the missing-key pass-through.

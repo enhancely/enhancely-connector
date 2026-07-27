@@ -37,6 +37,16 @@ function snippetFromEntry(entry: CacheEntry): string | null {
   return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw) : null;
 }
 
+/**
+ * True only for the EXACT `text/html` media type (parameters stripped).
+ * A prefix check would wrongly match e.g. `text/htmlx` (repo rule 5).
+ * Shared with the adapters so the gate logic has one source of truth.
+ */
+export function isHtmlMediaType(contentType: string | null): boolean {
+  if (contentType === null) return false;
+  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'text/html';
+}
+
 /** Backoff after an upstream error/timeout (or a 429 without Retry-After). */
 const DEFAULT_RETRY_BACKOFF_MS = 10_000;
 /** Upper bound for honoring 429 Retry-After (keeps memos short-lived). */
@@ -127,7 +137,17 @@ export async function getJsonLdSnippet(
           retryNotBefore: Date.now() + backoffMs,
         };
         try {
-          await cache.set(key, memo);
+          // No single-flight across concurrent requests — a parallel request
+          // may have stored a FRESH result while ours was failing. Re-read and
+          // only write the backoff memo if the entry is unchanged; never
+          // clobber newer data with a stale snapshot.
+          const current = await cache.get(key);
+          const unchanged =
+            (current?.storedAt ?? null) === (cached?.storedAt ?? null) &&
+            (current?.etag ?? null) === (cached?.etag ?? null);
+          if (unchanged) {
+            await cache.set(key, memo);
+          }
         } catch {
           // The memo is best-effort; serving stale must not depend on it.
         }
@@ -153,9 +173,7 @@ export async function handleHtml(
 ): Promise<string> {
   try {
     if (ctx.status < 200 || ctx.status > 299) return ctx.html;
-    if (ctx.contentType === null || !ctx.contentType.toLowerCase().startsWith('text/html')) {
-      return ctx.html;
-    }
+    if (!isHtmlMediaType(ctx.contentType)) return ctx.html;
     if (config.apiKey === '') return ctx.html;
 
     const snippet = await getJsonLdSnippet(ctx.url, cache, config);

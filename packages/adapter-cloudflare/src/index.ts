@@ -6,7 +6,9 @@
  *   2. Gate: GET + 2xx + text/html + API key configured — else return as-is.
  *   3. Ask injector-core for the page's JSON-LD snippet (cache + ETag + timeout
  *      + fail-open all live in the core).
- *   4. Append the snippet as the last child of <head> via HTMLRewriter.
+ *   4. Append the snippet as the last child of <head> via HTMLRewriter,
+ *      fully buffered (see src/inject.ts) so a mid-stream rewrite error can
+ *      never truncate the body on the wire.
  *
  * Fail-open invariant: everything after the origin fetch is wrapped in
  * try/catch; any surprise returns the untouched origin response. A document
@@ -15,11 +17,14 @@
 import { defineConfig, getJsonLdSnippet, MemoryCache } from '@enhancely/injector-core';
 import type { CacheBackend } from '@enhancely/injector-core';
 import { shouldAttemptInjection } from './gate.js';
+import { injectSnippetBuffered } from './inject.js';
 import { KVCacheBackend } from './kv-cache.js';
 
 export { shouldAttemptInjection } from './gate.js';
 export type { GateInput } from './gate.js';
-export { KVCacheBackend, kvExpirationTtlSeconds } from './kv-cache.js';
+export { injectSnippetBuffered } from './inject.js';
+export type { RewriterElementLike, RewriterLike } from './inject.js';
+export { KVCacheBackend, kvExpirationTtlSeconds, kvKeyFor } from './kv-cache.js';
 export type { KVNamespaceLike } from './kv-cache.js';
 
 export interface Env {
@@ -91,13 +96,10 @@ export default {
 
       // Append as last child of <head> ≙ immediately before </head>.
       // No <head> in the document → handler never fires → original content.
-      return new HTMLRewriter()
-        .on('head', {
-          element(el) {
-            el.append(snippet, { html: true });
-          },
-        })
-        .transform(response);
+      // Buffered (not streamed) so a mid-stream HTMLRewriter error fails open
+      // to the untouched origin response instead of truncating the body —
+      // see src/inject.ts for the trade-off notes.
+      return await injectSnippetBuffered(response, snippet, () => new HTMLRewriter());
     } catch {
       // Fail-open: any unexpected error serves the untouched origin response.
       return response;
