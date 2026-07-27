@@ -68,8 +68,9 @@ const MAX_RETRY_BACKOFF_MS = 60_000;
  *     (without touching storedAt) and record a short retryNotBefore memo:
  *     min(Retry-After, 60 s) on 429, 10 s otherwise
  *
- * The API request always carries the RAW page URL — `normalizeLite` is used
- * for the local cache key ONLY (the server normalizes authoritatively).
+ * The API request carries the query-stripped URL (`normalizeLite(url)`, = the
+ * cache key), never a locally computed hash. The server normalizes identically,
+ * so the record is the same — but no query string (tokens/PII) leaves the edge.
  *
  * Never throws.
  */
@@ -91,7 +92,13 @@ export async function getJsonLdSnippet(
       return snippetFromEntry(cached);
     }
 
-    const result = await fetchJsonLd(config, url, cached?.etag);
+    // Send the query-stripped URL (= the cache key), NOT the raw request URL.
+    // The server normalizes identically (same 4 rules, same `new URL()`), so
+    // the resolved record is byte-for-byte the same — but query strings (which
+    // routinely carry tokens, search terms and PII) never leave the edge, and
+    // the URL we look up matches the URL we cache under (`?a=1` and `?a=2`
+    // share one entry precisely because they are the same page server-side).
+    const result = await fetchJsonLd(config, key, cached?.etag);
 
     switch (result.status) {
       case 'ok': {
@@ -122,7 +129,9 @@ export async function getJsonLdSnippet(
         // registrations) for a full TTL; after expiry the next view picks up
         // the generated JSON-LD via the normal GET path.
         if (config.autoRegister) {
-          await registerJsonLd(config, url);
+          // Register the query-stripped URL for the same reason (see above):
+          // no query string is ever POSTed to the third party.
+          await registerJsonLd(config, key);
         }
         await cache.set(key, { jsonldRaw: null, etag: null, storedAt: Date.now() });
         return null;

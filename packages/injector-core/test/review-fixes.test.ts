@@ -6,12 +6,13 @@ import {
   buildScriptTag,
   defineConfig,
   getJsonLdSnippet,
+  handleHtml,
   injectIntoHead,
   isHtmlMediaType,
   MemoryCache,
 } from '../src/index.js';
 import { parseRetryAfter } from '../src/client.js';
-import type { CacheBackend, CacheEntry, Fetcher } from '../src/index.js';
+import type { CacheBackend, CacheEntry, Fetcher, HtmlContext } from '../src/index.js';
 
 const SNIP = '<x/>';
 
@@ -119,6 +120,58 @@ describe('buildScriptTag stays verbatim', () => {
     expect(buildScriptTag('{"a":"\\u003c"}')).toBe(
       '<script type="application/ld+json">{"a":"\\u003c"}</script>'
     );
+  });
+});
+
+describe('buildScriptTag — XSS defense-in-depth (escapes literal <)', () => {
+  it('neutralizes a </script><script> breakout in the payload', () => {
+    // A hostile / mis-escaped upstream body carrying a raw closing script tag.
+    const malicious = '{"x":"</script><script>alert(1)</script>"}';
+    const out = buildScriptTag(malicious);
+
+    // The ONLY literal `</script` is the wrapper's own closing tag — the
+    // payload's `<` were all turned into the JSON unicode escape `\u003c`.
+    expect(out).toContain('</script');
+    expect(out).not.toContain('</script><script>');
+    // Every payload `<` became `\u003c`; none survive as a literal `<`.
+    expect(out.split('</script>')).toHaveLength(2);
+    expect(out).toBe(
+      '<script type="application/ld+json">' +
+        '{"x":"\\u003c/script>\\u003cscript>alert(1)\\u003c/script>"}' +
+        '</script>'
+    );
+  });
+
+  it('is idempotent: already-escaped `\\u003c` round-trips unchanged', () => {
+    const alreadyEscaped = '{"x":"\\u003c/script>"}';
+    expect(buildScriptTag(alreadyEscaped)).toBe(
+      `<script type="application/ld+json">${alreadyEscaped}</script>`
+    );
+    // Re-wrapping the escaped inner content changes nothing further.
+    expect(buildScriptTag(alreadyEscaped)).toBe(buildScriptTag(alreadyEscaped));
+  });
+
+  it('end-to-end handleHtml output for a malicious payload has no breakout', async () => {
+    const cache = new MemoryCache();
+    const malicious = '{"@context":"</script><script>alert(document.cookie)</script>"}';
+    const fetchImpl = vi.fn<Fetcher>(() =>
+      Promise.resolve(new Response(malicious, { status: 200, headers: { ETag: '"v1"' } }))
+    );
+    const config = defineConfig({ apiKey: 'sk-k', fetchImpl });
+    const ctx: HtmlContext = {
+      html: '<html><head><title>t</title></head><body>b</body></html>',
+      url: 'https://ex.com/p',
+      contentType: 'text/html; charset=utf-8',
+      status: 200,
+    };
+
+    const result = await handleHtml(ctx, cache, config);
+
+    // The injected snippet sits inside <head>, and the page's ONLY </script>
+    // is the JSON-LD wrapper's — the payload could not break out of it.
+    expect(result).toContain('application/ld+json');
+    expect(result).not.toContain('</script><script>');
+    expect(result.split('</script>')).toHaveLength(2); // exactly one closer
   });
 });
 
