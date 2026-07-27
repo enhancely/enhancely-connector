@@ -23,8 +23,8 @@ variable "ssm_parameter_name" {
 
 variable "create_ssm_parameter" {
   type        = bool
-  default     = true
-  description = "Create the SSM parameter as a REPLACE_ME placeholder (value ignored on later changes). Set false to reference an existing parameter."
+  default     = false
+  description = "Whether Terraform creates a REPLACE_ME placeholder for the API-key parameter. Default false (recommended): the operator creates+sets the SecureString out-of-band so the decrypted key never gets read into Terraform state on refresh. Set true only for throwaway environments."
 }
 
 variable "auto_register" {
