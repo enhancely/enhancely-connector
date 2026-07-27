@@ -23,13 +23,13 @@ export {
 } from './config.js';
 export { normalizeLite } from './normalize.js';
 export { MemoryCache, isFresh } from './cache.js';
-export { fetchJsonLd } from './client.js';
+export { fetchJsonLd, registerJsonLd, parseRetryAfter } from './client.js';
 export { buildScriptTag, injectIntoHead } from './inject.js';
 
 import type { CacheBackend, CacheEntry, HtmlContext, InjectorConfig } from './types.js';
 import { normalizeLite } from './normalize.js';
 import { isFresh } from './cache.js';
-import { fetchJsonLd } from './client.js';
+import { fetchJsonLd, registerJsonLd } from './client.js';
 import { buildScriptTag, injectIntoHead } from './inject.js';
 
 /** Positive entry → script tag, negative entry (404 memo) → null. */
@@ -116,6 +116,14 @@ export async function getJsonLdSnippet(
         return snippetFromEntry(cached);
       }
       case 'not-found': {
+        // Auto-registration: the page is really being served (adapters gate on
+        // 200 + text/html) but unknown to Enhancely — register it once. The
+        // negative entry below suppresses further lookups (and thus further
+        // registrations) for a full TTL; after expiry the next view picks up
+        // the generated JSON-LD via the normal GET path.
+        if (config.autoRegister) {
+          await registerJsonLd(config, url);
+        }
         await cache.set(key, { jsonldRaw: null, etag: null, storedAt: Date.now() });
         return null;
       }

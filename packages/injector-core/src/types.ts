@@ -19,6 +19,14 @@ export interface InjectorConfig {
   cacheTtlMs: number;
   /** Only supported position today; kept in config for forward compatibility. */
   injectPosition: 'before-head-close';
+  /**
+   * When true, a 404 from Enhancely triggers ONE fire-and-forget
+   * `POST /api/v1/jsonld {url}` that registers the page and starts
+   * generation — the connector becomes self-populating for every really
+   * visited page. The negative cache entry still suppresses re-lookups for a
+   * full TTL, so each URL registers at most once per TTL. Default false.
+   */
+  autoRegister: boolean;
   /** Platform fetch override (defaults to globalThis.fetch). */
   fetchImpl?: Fetcher;
 }

@@ -69,3 +69,27 @@ export async function fetchJsonLd(
     return { status: 'error', reason: 'body-read-failed' };
   }
 }
+
+/**
+ * Register a page at Enhancely: `POST /api/v1/jsonld { url }` creates the
+ * record and starts generation (201/202). Called at most once per URL per
+ * cache TTL (guarded by the caller's negative cache). Fire-and-forget
+ * semantics: the boolean result is informational, failures never propagate.
+ */
+export async function registerJsonLd(config: InjectorConfig, pageUrl: string): Promise<boolean> {
+  const fetchImpl = config.fetchImpl ?? globalThis.fetch;
+  try {
+    const response = await fetchImpl(`${config.enhancelyBase}/api/v1/jsonld`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ url: pageUrl }),
+      signal: AbortSignal.timeout(config.timeoutMs),
+    });
+    return response.status === 201 || response.status === 200 || response.status === 202;
+  } catch {
+    return false;
+  }
+}

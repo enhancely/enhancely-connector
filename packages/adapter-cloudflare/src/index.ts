@@ -36,6 +36,8 @@ export interface Env {
   ENHANCELY_TIMEOUT_MS?: string;
   /** Optional numeric override for cache freshness TTL (default 300000 = 5 min). */
   ENHANCELY_CACHE_TTL_MS?: string;
+  /** "true" enables self-registration of unknown pages (POST on 404). */
+  ENHANCELY_AUTO_REGISTER?: string;
   /** Optional KV namespace for a distributed cache; falls back to per-isolate memory. */
   JSONLD_CACHE?: KVNamespace;
 }
@@ -82,6 +84,7 @@ export default {
           env.ENHANCELY_BASE !== '' && { enhancelyBase: env.ENHANCELY_BASE }),
         ...(timeoutMs !== undefined && { timeoutMs }),
         ...(cacheTtlMs !== undefined && { cacheTtlMs }),
+        ...(env.ENHANCELY_AUTO_REGISTER === 'true' && { autoRegister: true }),
       });
 
       const cache: CacheBackend =
