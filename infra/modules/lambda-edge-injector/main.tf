@@ -54,12 +54,22 @@ data "archive_file" "bundle" {
   }
 }
 
+# Optional placeholder SecureString (default OFF — create_ssm_parameter = false).
+# SECURITY NOTE: when Terraform owns this parameter, `terraform refresh` reads
+# its DECRYPTED value back into the state file on every run — ignore_changes
+# does not prevent the read. So once the real key is set out-of-band, it would
+# live in state as plaintext (encrypted at rest in the backend, but readable by
+# anyone with state access). The recommended setup therefore leaves this off and
+# has the operator create+set the SecureString entirely out-of-band:
+#   aws ssm put-parameter --region us-east-1 --name <ssm_parameter_name> \
+#     --type SecureString --value 'sk-…'
+# Enable this only for a convenience placeholder in throwaway environments.
 resource "aws_ssm_parameter" "api_key" {
   count = var.create_ssm_parameter ? 1 : 0
 
   name  = var.ssm_parameter_name
   type  = "SecureString"
-  value = "REPLACE_ME" # set the real key out-of-band; never in state/repo
+  value = "REPLACE_ME"
   tags  = var.tags
 
   lifecycle {

@@ -41,13 +41,18 @@ lambda_function_association = {
 }
 ```
 
-After the first apply, set the real API key (never in repo/state):
+Create the API key SecureString out-of-band (the module does NOT manage it by
+default — `create_ssm_parameter = false` — because Terraform would otherwise read
+the decrypted value into state on every refresh):
 
 ```bash
 aws ssm put-parameter --region us-east-1 \
   --name /enhancely/connector/api-key \
-  --type SecureString --overwrite --value 'sk-…'
+  --type SecureString --value 'sk-…'
 ```
+
+Until the parameter exists the injector fails open (passes every response through
+uninjected), so creation order relative to `terraform apply` does not matter.
 
 Use an **organization key** (`sk-org-…`) to cover every domain of your
 Enhancely organization with one parameter — records are routed to the right
