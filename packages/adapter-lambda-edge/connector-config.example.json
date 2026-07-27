@@ -1,0 +1,10 @@
+{
+  "apiKey": "sk-REPLACE-ME-or-delete-this-line-to-use-SSM",
+  "enhancelyBase": "https://app.enhancely.ai",
+  "timeoutMs": 800,
+  "cacheTtlMs": 300000,
+  "originTimeoutMs": 2000,
+  "ssmParameterName": "/enhancely/connector/api-key",
+  "ssmRegion": "us-east-1",
+  "ssmTimeoutMs": 2000
+}
