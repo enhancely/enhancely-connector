@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Enhancely Connector Demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; color: #1a1a1a; }
+    code { background: #f4f4f5; padding: 2px 6px; border-radius: 4px; }
+    .ok { color: #16a34a; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Enhancely Connector Demo</h1>
+  <p>Diese statische Seite wird von S3 über CloudFront ausgeliefert. Der
+  <strong>Lambda@Edge-Adapter</strong> (origin-response) injiziert JSON-LD aus
+  Enhancely Staging vor <code>&lt;/head&gt;</code>.</p>
+  <p>Prüfung: <code>document.querySelector('script[type="application/ld+json"]')</code></p>
+  <p id="result">Prüfe…</p>
+  <script>
+    const el = document.querySelector('script[type="application/ld+json"]');
+    document.getElementById('result').innerHTML = el
+      ? '<span class="ok">✓ JSON-LD injiziert:</span><br><pre>' + el.textContent.slice(0, 400) + '</pre>'
+      : '✗ Kein JSON-LD gefunden (Injection fehlt)';
+  </script>
+</body>
+</html>
