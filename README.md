@@ -61,6 +61,22 @@ The API key is a secret — it must never be exposed client-side or committed. `
 - [`CLAUDE.md`](CLAUDE.md) — commands, rules, and the Enhancely API contract.
 - [`docs/architecture/2026-07-27-connector-architecture.md`](docs/architecture/2026-07-27-connector-architecture.md) — full architecture writeup and binding decisions.
 
+## Terraform module (recommended for CloudFront customers)
+
+New integrations should use the reusable module instead of vendoring files —
+see [`infra/modules/lambda-edge-injector/`](infra/modules/lambda-edge-injector/):
+
+```hcl
+module "enhancely_injector" {
+  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.2.0"
+  providers = { aws = aws.us_east_1 }
+  auto_register = true
+}
+```
+
+Upgrades are a `?ref=` bump. Environments without egress to GitHub can fall
+back to vendoring the release assets below.
+
 ## Consuming releases (for integrators)
 
 Every tag `vX.Y.Z` publishes a [GitHub Release](https://github.com/enhancely/enhancely-connector/releases) with versioned, checksummed artifacts:
