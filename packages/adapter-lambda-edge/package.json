@@ -2,26 +2,24 @@
   "name": "@enhancely/adapter-lambda-edge",
   "version": "0.1.0",
   "private": true,
-  "description": "CloudFront Lambda@Edge origin-response adapter for the Enhancely JSON-LD injector (stub — not implemented yet)",
+  "description": "CloudFront Lambda@Edge origin-response adapter for the Enhancely JSON-LD injector (origin re-fetch pattern, fail-open)",
   "type": "module",
   "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
-  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js \"--external:@aws-sdk/*\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "echo \"no tests yet\""
+    "package": "pnpm run build && { cp connector-config.json dist/ 2>/dev/null || true; } && cd dist && rm -f lambda.zip && zip -q -X lambda.zip index.js && { zip -q lambda.zip connector-config.json >/dev/null 2>&1 || true; } && echo 'dist/lambda.zip ready'",
+    "test": "vitest run"
   },
   "dependencies": {
     "@enhancely/injector-core": "workspace:*"
   },
   "devDependencies": {
+    "@aws-sdk/client-ssm": "^3.716.0",
     "@types/aws-lambda": "^8.10.147",
-    "typescript": "^5.7.3"
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.0"
   }
 }

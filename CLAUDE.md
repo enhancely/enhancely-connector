@@ -19,7 +19,8 @@ pnpm format              # Prettier format
 pnpm format:check        # Prettier check
 
 # Adapter development
-pnpm --filter @enhancely/adapter-cloudflare dev   # wrangler dev (needs .dev.vars with ENHANCELY_API_KEY)
+pnpm --filter @enhancely/adapter-cloudflare dev       # wrangler dev (needs .dev.vars with ENHANCELY_API_KEY)
+pnpm --filter @enhancely/adapter-lambda-edge package  # esbuild bundle + dist/lambda.zip for Lambda@Edge
 ```
 
 Node version: 22.22.0 (see `.nvmrc`). Package manager: pnpm (pinned via `packageManager` in root `package.json`).
