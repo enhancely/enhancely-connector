@@ -34,6 +34,8 @@ export interface EventOptions {
   originPath?: string;
   /** Simulate a non-custom (e.g. S3) origin. */
   noCustomOrigin?: boolean;
+  /** Static origin custom headers (e.g. x-enhancely-page-host). */
+  originCustomHeaders?: Record<string, string>;
 }
 
 export function makeEvent(options: EventOptions = {}): CloudFrontResponseEvent {
@@ -50,6 +52,7 @@ export function makeEvent(options: EventOptions = {}): CloudFrontResponseEvent {
     originPort = 80,
     originPath = '',
     noCustomOrigin = false,
+    originCustomHeaders = {},
   } = options;
 
   return {
@@ -73,7 +76,7 @@ export function makeEvent(options: EventOptions = {}): CloudFrontResponseEvent {
               : {
                   origin: {
                     custom: {
-                      customHeaders: {},
+                      customHeaders: cfHeaders(originCustomHeaders),
                       domainName: originDomain,
                       keepaliveTimeout: 5,
                       path: originPath,

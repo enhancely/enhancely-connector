@@ -194,6 +194,24 @@ describe('handler — happy path', () => {
     expect(result?.body).toContain('application/ld+json');
   });
 
+  it('uses x-enhancely-page-host for the page URL when the origin cannot see the viewer Host (S3 website pattern)', async () => {
+    // S3-style distribution: viewer Host is NOT forwarded, so the request's
+    // Host header is the origin's own domain; the public hostname arrives as
+    // a static origin custom header instead.
+    const event = eventFor('/page', {
+      host: '127.0.0.1',
+      originCustomHeaders: { 'x-enhancely-page-host': 'demo.example.org' },
+    });
+    const result = await invoke(event);
+
+    // Enhancely lookup uses the PUBLIC page URL…
+    const [endpoint] = enhancelyFetch.mock.calls[0] ?? [];
+    expect(endpoint).toContain(encodeURIComponent('https://demo.example.org/page'));
+    // …while the origin re-fetch keeps the origin-facing Host header.
+    expect(lastHostHeader).toBe('127.0.0.1');
+    expect(result?.body).toContain('application/ld+json');
+  });
+
   it('serves the second hit for the same URL from the core cache', async () => {
     await invoke(eventFor('/page'));
     await invoke(eventFor('/page'));

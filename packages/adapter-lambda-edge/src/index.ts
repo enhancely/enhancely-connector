@@ -166,6 +166,22 @@ export function buildOriginUrl(
   return `${custom.protocol}://${custom.domainName}${portPart}${custom.path}${request.uri}${query}`;
 }
 
+/**
+ * Static origin custom header that carries the public page hostname for
+ * distributions whose origin cannot receive the viewer Host header
+ * (e.g. S3 website endpoints). Configured on the CloudFront origin.
+ */
+export const PAGE_HOST_HEADER = 'x-enhancely-page-host';
+
+/** First value of a static origin custom header, or null. */
+function customHeaderValue(
+  request: Pick<CloudFrontRequest, 'origin'>,
+  name: string
+): string | null {
+  const value = request.origin?.custom?.customHeaders[name]?.[0]?.value ?? null;
+  return value !== null && value !== '' ? value : null;
+}
+
 /** First value of a (lowercase-keyed) CloudFront header, or null. */
 function headerValue(headers: CloudFrontHeaders, name: string): string | null {
   return headers[name]?.[0]?.value ?? null;
@@ -241,15 +257,23 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     if (originUrl === null) return response;
 
     // Host header CloudFront sent to the origin (the viewer Host when the
-    // origin request policy forwards it — recommended, see README).
-    const host = headerValue(request.headers, 'host') ?? request.origin?.custom?.domainName ?? '';
-    if (host === '') return response;
-    const pageUrl = buildPageUrl(host, request.uri, request.querystring);
+    // origin request policy forwards it — recommended, see README). This is
+    // what the origin re-fetch must present so vhosts resolve.
+    const originHost =
+      headerValue(request.headers, 'host') ?? request.origin?.custom?.domainName ?? '';
+    if (originHost === '') return response;
+
+    // Public page host for the Enhancely lookup. Origins that must NOT
+    // receive the viewer Host (S3 website endpoints reject foreign hosts, so
+    // their distributions cannot forward it) declare the public hostname as a
+    // static origin custom header instead: X-Enhancely-Page-Host.
+    const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
+    const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
 
     // Re-fetch the page: origin-response events do not expose the body.
     const origin = await fetchOriginHtml(
       originUrl,
-      host,
+      originHost,
       getOriginTimeoutMs(),
       MAX_BODY_BYTES,
       forwardedHeaders(request.headers)
