@@ -121,3 +121,47 @@ describe('buildScriptTag stays verbatim', () => {
     );
   });
 });
+
+describe('autoRegister (self-populating connector)', () => {
+  const notFound = () => Promise.resolve(new Response('nf', { status: 404 }));
+
+  it('POSTs the page once on 404, then stays quiet for the negative-cache TTL', async () => {
+    const cache = new MemoryCache();
+    const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+    const fetchImpl = vi.fn<Fetcher>((url, init) => {
+      calls.push({ url, method: init.method, body: init.body });
+      return init.method === 'POST'
+        ? Promise.resolve(new Response('{"status":"processing"}', { status: 201 }))
+        : notFound();
+    });
+    const config = defineConfig({ apiKey: 'k', autoRegister: true, fetchImpl });
+
+    expect(await getJsonLdSnippet('https://ex.com/new-page', cache, config)).toBeNull();
+    const posts = calls.filter((c) => c.method === 'POST');
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.url).toContain('/api/v1/jsonld');
+    expect(JSON.parse(String(posts[0]?.body))).toEqual({ url: 'https://ex.com/new-page' });
+
+    // Second view within the TTL: negative cache answers, no GET, no POST.
+    await getJsonLdSnippet('https://ex.com/new-page', cache, config);
+    expect(fetchImpl.mock.calls).toHaveLength(2); // 1 GET + 1 POST only
+  });
+
+  it('does not POST when autoRegister is off (default)', async () => {
+    const cache = new MemoryCache();
+    const fetchImpl = vi.fn<Fetcher>(() => notFound());
+    await getJsonLdSnippet('https://ex.com/p', cache, defineConfig({ apiKey: 'k', fetchImpl }));
+    expect(fetchImpl.mock.calls.filter(([, i]) => i.method === 'POST')).toHaveLength(0);
+  });
+
+  it('stays fail-open when the registration POST rejects', async () => {
+    const cache = new MemoryCache();
+    const fetchImpl = vi.fn<Fetcher>((_u, init) =>
+      init.method === 'POST' ? Promise.reject(new Error('boom')) : notFound()
+    );
+    const config = defineConfig({ apiKey: 'k', autoRegister: true, fetchImpl });
+    expect(await getJsonLdSnippet('https://ex.com/p', cache, config)).toBeNull();
+    const entry = await cache.get('https://ex.com/p');
+    expect(entry?.jsonldRaw).toBeNull(); // negative entry still stored
+  });
+});

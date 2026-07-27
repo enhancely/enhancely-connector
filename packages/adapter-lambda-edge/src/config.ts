@@ -76,6 +76,8 @@ export interface BakedConnectorConfig {
   timeoutMs?: number;
   /** JSON-LD cache TTL (core default: 300 000 ms). */
   cacheTtlMs?: number;
+  /** Enable self-registration: POST unknown pages to Enhancely on 404. */
+  autoRegister?: boolean;
   /** Timeout for the origin re-fetch (default: 2000 ms). */
   originTimeoutMs?: number;
   /** SSM parameter holding the API key (used only when `apiKey` is absent). */
@@ -123,6 +125,7 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   if (timeoutMs !== undefined) baked.timeoutMs = timeoutMs;
   const cacheTtlMs = positiveNumber(source['cacheTtlMs']);
   if (cacheTtlMs !== undefined) baked.cacheTtlMs = cacheTtlMs;
+  if (typeof source['autoRegister'] === 'boolean') baked.autoRegister = source['autoRegister'];
   const originTimeoutMs = positiveNumber(source['originTimeoutMs']);
   if (originTimeoutMs !== undefined) baked.originTimeoutMs = originTimeoutMs;
   const ssmParameterName = nonEmptyString(source['ssmParameterName']);
@@ -219,6 +222,7 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
       ...(baked?.enhancelyBase !== undefined && { enhancelyBase: baked.enhancelyBase }),
       ...(baked?.timeoutMs !== undefined && { timeoutMs: baked.timeoutMs }),
       ...(baked?.cacheTtlMs !== undefined && { cacheTtlMs: baked.cacheTtlMs }),
+      ...(baked?.autoRegister !== undefined && { autoRegister: baked.autoRegister }),
       ...configOverrides,
     });
   } catch (error) {

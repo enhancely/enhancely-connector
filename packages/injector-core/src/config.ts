@@ -42,6 +42,7 @@ export function defineConfig(input: InjectorConfigInput): InjectorConfig {
     timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     cacheTtlMs: input.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
     injectPosition: 'before-head-close',
+    autoRegister: input.autoRegister ?? false,
     ...(input.fetchImpl !== undefined && { fetchImpl: input.fetchImpl }),
   };
 }
