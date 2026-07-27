@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        # pnpm version is taken from "packageManager" in package.json
+
+      # setup-node's pnpm cache requires a lockfile; skip caching until
+      # pnpm-lock.yaml is committed (setup-node hard-fails otherwise).
+      - uses: actions/setup-node@v4
+        if: ${{ hashFiles('pnpm-lock.yaml') != '' }}
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - uses: actions/setup-node@v4
+        if: ${{ hashFiles('pnpm-lock.yaml') == '' }}
+        with:
+          node-version-file: .nvmrc
+
+      # The first CI runs predate a committed pnpm-lock.yaml; fall back to a
+      # plain install until the lockfile lands, then --frozen-lockfile applies.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile || pnpm install
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Build
+        run: pnpm -r build
+
+      - name: Test
+        run: pnpm -r test
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Format check
+        run: pnpm format:check
