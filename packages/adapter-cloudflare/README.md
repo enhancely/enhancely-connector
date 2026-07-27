@@ -15,7 +15,7 @@ All connector logic (URL normalization for cache keys, API client, caching,
 ETag revalidation, timeouts, fail-open orchestration) lives in
 [`@enhancely/injector-core`](../injector-core). This adapter only translates
 Workers primitives: `fetch` pass-through, env/bindings → config, KV →
-`CacheBackend`, and `HTMLRewriter` for streaming injection.
+`CacheBackend`, and `HTMLRewriter` for the injection itself.
 
 ## Fail-open guarantees
 
@@ -32,6 +32,18 @@ The origin response is returned **untouched** whenever any of these holds:
 The customer's site can never break because of the connector; the worst case
 is a page without JSON-LD.
 
+### Buffered injection (why the response is not streamed)
+
+`HTMLRewriter.transform()` returns a _streamed_ response: a parse or handler
+error while the body streams out happens after the worker has already started
+responding, and the client can receive a **truncated page** — a fail-open
+violation. The adapter therefore clones the origin response first, fully
+buffers the rewritten HTML (`src/inject.ts`), and only then responds; any
+error during buffering serves the untouched origin clone instead. Buffering
+trades streaming latency for this hard guarantee, which is acceptable for
+HTML documents (size-bounded). A streaming mode could become an opt-in later
+for callers who prefer latency over the guarantee.
+
 ## Why a KV cache?
 
 The Enhancely read API deliberately responds `Cache-Control: no-store` — the
@@ -42,6 +54,12 @@ Entries are kept in KV for `max(60s, 2 × cacheTtlMs)` so a stale entry can
 still be served while Enhancely is slow, rate-limited, or down. Without the KV
 binding the worker falls back to a per-isolate in-memory cache (fine for dev,
 modest hit rates in production).
+
+Workers KV limits keys to 512 bytes. Cache keys longer than 400 UTF-8 bytes
+(very long URLs) are transparently replaced by a stable
+`sha256:<hex-of-SHA-256>` digest (`kvKeyFor` in `src/kv-cache.ts`) so that
+long-URL pages keep their cache entries and 429 retry backoff instead of
+silently failing every KV read/write.
 
 ## Env vars & bindings
 
@@ -94,5 +112,7 @@ pnpm --filter @enhancely/adapter-cloudflare test   # vitest: KV backend + respon
 ```
 
 The unit-testable pieces are exported: `KVCacheBackend` /
-`kvExpirationTtlSeconds` (`src/kv-cache.ts`) and `shouldAttemptInjection`
-(`src/gate.ts`).
+`kvExpirationTtlSeconds` / `kvKeyFor` (`src/kv-cache.ts`),
+`shouldAttemptInjection` (`src/gate.ts`), and `injectSnippetBuffered`
+(`src/inject.ts` — takes a rewriter-like factory so it is testable without
+the workers runtime).

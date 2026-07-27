@@ -14,6 +14,18 @@ import type { InjectorConfig, JsonLdFetchResult } from './types.js';
  * - The API responds `Cache-Control: no-store` by design; caching is OUR job,
  *   revalidation happens via ETag / If-None-Match (304).
  */
+/**
+ * RFC 9110 §10.2.3: Retry-After is either delay-seconds or an HTTP-date.
+ * Returns whole seconds from now (≥ 0), or null when absent/unparsable.
+ */
+export function parseRetryAfter(value: string | null, now: number = Date.now()): number | null {
+  if (value === null || value.trim() === '') return null;
+  if (/^\d+$/.test(value.trim())) return Number.parseInt(value, 10);
+  const date = Date.parse(value);
+  if (Number.isNaN(date)) return null;
+  return Math.max(0, Math.ceil((date - now) / 1000));
+}
+
 export async function fetchJsonLd(
   config: InjectorConfig,
   pageUrl: string,
@@ -42,11 +54,9 @@ export async function fetchJsonLd(
   if (response.status === 304) return { status: 'not-modified' };
   if (response.status === 404) return { status: 'not-found' };
   if (response.status === 429) {
-    const retryAfter = response.headers.get('retry-after');
-    const seconds = retryAfter !== null ? Number.parseInt(retryAfter, 10) : Number.NaN;
     return {
       status: 'rate-limited',
-      retryAfterSeconds: Number.isFinite(seconds) ? seconds : null,
+      retryAfterSeconds: parseRetryAfter(response.headers.get('retry-after')),
     };
   }
   if (!response.ok) return { status: 'error', reason: `http-${response.status}` };

@@ -11,8 +11,14 @@ import {
   __setBakedConfigForTests,
   __setConfigOverridesForTests,
 } from '../src/config.js';
-import { MAX_BODY_BYTES, __resetHandlerStateForTests } from '../src/index.js';
-import { makeEvent, invoke } from './fixtures.js';
+import {
+  GENERATED_RESPONSE_SAFETY_MARGIN_BYTES,
+  MAX_GENERATED_RESPONSE_BYTES,
+  MAX_ORIGIN_BODY_BYTES,
+  serializedHeaderBytes,
+  __resetHandlerStateForTests,
+} from '../src/index.js';
+import { cfHeaders, makeEvent, invoke } from './fixtures.js';
 
 // The no-key test path would otherwise import the real SDK and walk the AWS
 // credential chain; keep it hermetic.
@@ -50,7 +56,7 @@ beforeAll(async () => {
 
     if (path === '/big') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(`<html><head></head><body>${'x'.repeat(MAX_BODY_BYTES + 1024)}</body></html>`);
+      res.end(`<html><head></head><body>${'x'.repeat(MAX_ORIGIN_BODY_BYTES + 1024)}</body></html>`);
       return;
     }
     if (path === '/sized') {
@@ -220,14 +226,15 @@ describe('handler — happy path', () => {
     expect(originHits).toBe(2); // but every CloudFront miss re-fetches HTML
   });
 
-  it('forwards Cookie, Authorization and Accept-Language on the re-fetch', async () => {
+  it('forwards ALL origin-request headers on the re-fetch (same representation, Vary respected)', async () => {
     const event = eventFor('/page', {
       requestHeaders: {
         cookie: 'session=s1; theme=dark',
         authorization: 'Bearer viewer-token',
         'accept-language': 'de-DE,de;q=0.9',
-        // NOT on the forward list — must not reach the origin re-fetch.
+        accept: 'text/html,application/xhtml+xml',
         'x-forwarded-for': '203.0.113.1',
+        'cloudfront-viewer-country': 'DE',
       },
     });
     const result = await invoke(event);
@@ -236,7 +243,34 @@ describe('handler — happy path', () => {
     expect(lastRequestHeaders['cookie']).toBe('session=s1; theme=dark');
     expect(lastRequestHeaders['authorization']).toBe('Bearer viewer-token');
     expect(lastRequestHeaders['accept-language']).toBe('de-DE,de;q=0.9');
-    expect(lastRequestHeaders['x-forwarded-for']).toBeUndefined();
+    expect(lastRequestHeaders['accept']).toBe('text/html,application/xhtml+xml');
+    expect(lastRequestHeaders['x-forwarded-for']).toBe('203.0.113.1');
+    expect(lastRequestHeaders['cloudfront-viewer-country']).toBe('DE');
+  });
+
+  it('forwards User-Agent and device headers; Accept-Encoding stays identity; hop-by-hop dropped', async () => {
+    const event = eventFor('/page', {
+      requestHeaders: {
+        'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        'cloudfront-is-mobile-viewer': 'true',
+        // Must NEVER reach the origin re-fetch as-is: injection needs raw bytes.
+        'accept-encoding': 'gzip, br',
+        // Hop-by-hop — never replayed end-to-end.
+        te: 'trailers',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain('application/ld+json');
+    // The viewer UA overrides the connector's fallback identity.
+    expect(lastRequestHeaders['user-agent']).toBe(
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
+    );
+    expect(lastRequestHeaders['cloudfront-is-mobile-viewer']).toBe('true');
+    expect(lastRequestHeaders['accept-encoding']).toBe('identity');
+    expect(lastRequestHeaders['te']).toBeUndefined();
+    // Host is still the explicit viewer Host, not overridden by forwarding.
+    expect(lastHostHeader).toBe('www.example.com');
   });
 
   it('falls back to the origin domain when the request carries no Host header', async () => {
@@ -251,12 +285,16 @@ describe('handler — happy path', () => {
     expect(endpoint).toContain(encodeURIComponent('https://127.0.0.1/page'));
   });
 
-  it('drops the origin ETag/Last-Modified when the body is replaced (stale validators)', async () => {
+  it('drops stale validators AND integrity digests when the body is replaced', async () => {
     const event = eventFor('/page', {
       responseHeaders: {
         'content-type': 'text/html; charset=utf-8',
         etag: '"original-body"',
         'last-modified': 'Wed, 01 Jan 2026 00:00:00 GMT',
+        'content-md5': 'Q2h1Y2sgSW51ZwDIAXR5IQ==',
+        digest: 'sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=',
+        'content-digest': 'sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:',
+        'repr-digest': 'sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:',
       },
     });
     const result = await invoke(event);
@@ -264,6 +302,10 @@ describe('handler — happy path', () => {
     expect(result?.body).toContain('application/ld+json');
     expect(result?.headers?.['etag']).toBeUndefined();
     expect(result?.headers?.['last-modified']).toBeUndefined();
+    expect(result?.headers?.['content-md5']).toBeUndefined();
+    expect(result?.headers?.['digest']).toBeUndefined();
+    expect(result?.headers?.['content-digest']).toBeUndefined();
+    expect(result?.headers?.['repr-digest']).toBeUndefined();
     expect(result?.headers?.['content-type']?.[0]?.value).toBe('text/html; charset=utf-8');
   });
 });
@@ -318,7 +360,7 @@ describe('handler — gating pass-through (original response, no origin contact)
 });
 
 describe('handler — generated-response size boundary (502 territory, must fail open)', () => {
-  it('fetched HTML far above the body cap → untouched response', async () => {
+  it('fetched HTML far above the origin-fetch cap → untouched response', async () => {
     const event = eventFor('/big');
     const result = await invoke(event);
 
@@ -326,16 +368,65 @@ describe('handler — generated-response size boundary (502 territory, must fail
     expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 
-  it('fetched HTML of exactly MAX_BODY_BYTES + 1 → truncated, untouched, no Enhancely call', async () => {
-    const event = eventFor('/sized', { querystring: `n=${MAX_BODY_BYTES + 1}` });
+  it('fetched HTML of exactly MAX_ORIGIN_BODY_BYTES + 1 → truncated, untouched, no Enhancely call', async () => {
+    const event = eventFor('/sized', { querystring: `n=${MAX_ORIGIN_BODY_BYTES + 1}` });
     const result = await invoke(event);
 
     expect(result).toBe(event.Records[0]?.cf.response);
     expect(enhancelyFetch).not.toHaveBeenCalled(); // truncation path, pre-core
   });
 
-  it('fetched HTML of exactly MAX_BODY_BYTES → injection would exceed the cap → untouched', async () => {
-    const event = eventFor('/sized', { querystring: `n=${MAX_BODY_BYTES}` });
+  it('normal headers: body at the origin-fetch cap fits the header-aware budget → injected', async () => {
+    // The fetch cap reserves worst-case (32 KB) headers; with a normal small
+    // header set the real budget is far larger, so injection proceeds. (Under
+    // the old fixed 16 KB allowance this exact size passed through.)
+    const event = eventFor('/sized', { querystring: `n=${MAX_ORIGIN_BODY_BYTES}` });
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(result?.body).toContain(SNIPPET);
+    expect(Buffer.byteLength(result?.body ?? '', 'utf8')).toBe(
+      MAX_ORIGIN_BODY_BYTES + SNIPPET.length
+    );
+  });
+
+  it('~30 KB of headers + body that fit the OLD 16 KB allowance but not the real budget → passthrough', async () => {
+    // Regression for the fixed-allowance bug: this body is below the old
+    // 1 MB − 16 KB cap, so the old code fetched AND injected it — and the
+    // generated response (headers + body) blew the 1 MB quota → viewer 502.
+    // Now the conservative fetch cap (1 MB − 33 KB) truncates it → fail-open.
+    const n = MAX_GENERATED_RESPONSE_BYTES - 16_384 - 4_096;
+    const event = eventFor('/sized', {
+      querystring: `n=${n}`,
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'x-heavy': 'h'.repeat(30_000),
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  // Header set heavy enough (near CloudFront's 32,768-byte header cap) that
+  // the ACTUAL header-aware body budget dips to the origin-fetch cap region —
+  // exercising the serializedHeaderBytes gate itself, not truncation.
+  const heavyHeaders = {
+    'content-type': 'text/html; charset=utf-8',
+    'x-heavy': 'h'.repeat(32_650),
+  };
+  const heavyBudget =
+    MAX_GENERATED_RESPONSE_BYTES -
+    serializedHeaderBytes(cfHeaders(heavyHeaders)) -
+    GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
+
+  it('heavy headers: injected body one byte over the real budget → passthrough (would 502)', async () => {
+    const n = heavyBudget - SNIPPET.length + 1;
+    // Sanity: below the fetch cap, so this exercises the budget gate.
+    expect(n).toBeLessThanOrEqual(MAX_ORIGIN_BODY_BYTES);
+
+    const event = eventFor('/sized', { querystring: `n=${n}`, responseHeaders: heavyHeaders });
     const result = await invoke(event);
 
     // Distinguish from truncation: the core DID run (Enhancely was called),
@@ -345,12 +436,15 @@ describe('handler — generated-response size boundary (502 territory, must fail
     expect(result?.body).toBeUndefined();
   });
 
-  it('injected HTML of exactly MAX_BODY_BYTES still fits → body replaced', async () => {
-    const event = eventFor('/sized', { querystring: `n=${MAX_BODY_BYTES - SNIPPET.length}` });
+  it('heavy headers: injected body exactly at the real budget → body replaced', async () => {
+    const n = heavyBudget - SNIPPET.length;
+    expect(n).toBeLessThanOrEqual(MAX_ORIGIN_BODY_BYTES);
+
+    const event = eventFor('/sized', { querystring: `n=${n}`, responseHeaders: heavyHeaders });
     const result = await invoke(event);
 
     expect(result?.body).toContain(SNIPPET);
-    expect(Buffer.byteLength(result?.body ?? '', 'utf8')).toBe(MAX_BODY_BYTES);
+    expect(Buffer.byteLength(result?.body ?? '', 'utf8')).toBe(heavyBudget);
   });
 });
 

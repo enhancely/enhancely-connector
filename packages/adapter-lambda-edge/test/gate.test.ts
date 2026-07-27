@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { buildOriginUrl, buildPageUrl, charsetOf, shouldAttempt } from '../src/index.js';
+import {
+  buildOriginUrl,
+  buildPageUrl,
+  charsetOf,
+  forwardedHeaders,
+  serializedHeaderBytes,
+  shouldAttempt,
+} from '../src/index.js';
 import type { AttemptInput } from '../src/index.js';
+import { cfHeaders } from './fixtures.js';
 
 function attempt(overrides: Partial<AttemptInput> = {}): AttemptInput {
   return {
@@ -75,6 +83,87 @@ describe('charsetOf', () => {
     expect(charsetOf('text/html; charset=UTF-8')).toBe('utf-8');
     expect(charsetOf('text/html;charset="iso-8859-1"')).toBe('iso-8859-1');
     expect(charsetOf('text/html')).toBeNull();
+  });
+});
+
+describe('forwardedHeaders', () => {
+  it('forwards ALL request headers, not just a fixed trio', () => {
+    const out = forwardedHeaders(
+      cfHeaders({
+        cookie: 'session=s1',
+        authorization: 'Bearer t',
+        'accept-language': 'de-DE',
+        'user-agent': 'Mozilla/5.0 (iPhone)',
+        accept: 'text/html,application/xhtml+xml',
+        'cloudfront-is-mobile-viewer': 'true',
+        'cloudfront-viewer-country': 'DE',
+        'x-forwarded-for': '203.0.113.1',
+      })
+    );
+    expect(out).toEqual({
+      cookie: 'session=s1',
+      authorization: 'Bearer t',
+      'accept-language': 'de-DE',
+      'user-agent': 'Mozilla/5.0 (iPhone)',
+      accept: 'text/html,application/xhtml+xml',
+      'cloudfront-is-mobile-viewer': 'true',
+      'cloudfront-viewer-country': 'DE',
+      'x-forwarded-for': '203.0.113.1',
+    });
+  });
+
+  it('excludes host, accept-encoding and every hop-by-hop header', () => {
+    const out = forwardedHeaders(
+      cfHeaders({
+        host: 'www.example.com',
+        'accept-encoding': 'gzip, br',
+        connection: 'keep-alive',
+        'keep-alive': 'timeout=5',
+        'proxy-authenticate': 'Basic',
+        'proxy-authorization': 'Basic Zm9v',
+        te: 'trailers',
+        trailer: 'Expires',
+        'transfer-encoding': 'chunked',
+        upgrade: 'h2c',
+        'user-agent': 'UA',
+      })
+    );
+    expect(out).toEqual({ 'user-agent': 'UA' });
+  });
+
+  it('recombines repeated entries: cookies with "; ", others with ", "', () => {
+    const out = forwardedHeaders({
+      cookie: [
+        { key: 'Cookie', value: 'a=1' },
+        { key: 'Cookie', value: 'b=2' },
+      ],
+      accept: [
+        { key: 'Accept', value: 'text/html' },
+        { key: 'Accept', value: 'application/xhtml+xml' },
+      ],
+    });
+    expect(out['cookie']).toBe('a=1; b=2');
+    expect(out['accept']).toBe('text/html, application/xhtml+xml');
+  });
+});
+
+describe('serializedHeaderBytes', () => {
+  it('sums key + value + 4 per header value, plus the 64-byte overhead', () => {
+    // 64 + ('Content-Type' 12 + 'text/html' 9 + 4) + ('X-A' 3 + 'b' 1 + 4)
+    const bytes = serializedHeaderBytes(cfHeaders({ 'Content-Type': 'text/html', 'X-A': 'b' }));
+    expect(bytes).toBe(64 + (12 + 9 + 4) + (3 + 1 + 4));
+  });
+
+  it('counts every value of a repeated header and falls back to the map key', () => {
+    const bytes = serializedHeaderBytes({
+      'set-cookie': [{ key: 'Set-Cookie', value: 'a=1' }, { value: 'b=2' }],
+    });
+    // 64 + ('Set-Cookie' 10 + 'a=1' 3 + 4) + ('set-cookie' 10 + 'b=2' 3 + 4)
+    expect(bytes).toBe(64 + (10 + 3 + 4) + (10 + 3 + 4));
+  });
+
+  it('is 64 (overhead only) for an empty header map', () => {
+    expect(serializedHeaderBytes({})).toBe(64);
   });
 });
 

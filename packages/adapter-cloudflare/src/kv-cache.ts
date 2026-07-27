@@ -26,6 +26,33 @@ export function kvExpirationTtlSeconds(cacheTtlMs: number): number {
   return Math.max(MIN_EXPIRATION_TTL_SECONDS, Math.ceil((2 * cacheTtlMs) / 1000));
 }
 
+/**
+ * Keys at or below this UTF-8 byte length are used verbatim. Workers KV caps
+ * keys at 512 bytes; 400 leaves comfortable headroom while keeping the vast
+ * majority of real-world URLs human-readable in the KV dashboard.
+ */
+const MAX_VERBATIM_KEY_BYTES = 400;
+
+/**
+ * Map a cache key (the normalized page URL) to a KV-safe key.
+ *
+ * Workers KV rejects keys longer than 512 bytes; because get/put errors are
+ * deliberately swallowed (fail-open), an oversized key would otherwise
+ * *silently* lose both caching and the 429 retry backoff — every view of a
+ * long-URL page would re-hit the Enhancely API. Keys over
+ * {@link MAX_VERBATIM_KEY_BYTES} UTF-8 bytes are therefore replaced by a
+ * stable digest: `sha256:` + lowercase hex SHA-256 of the key (71 bytes,
+ * well under the 512-byte limit). Short keys pass through unchanged.
+ */
+export async function kvKeyFor(key: string): Promise<string> {
+  const bytes = new TextEncoder().encode(key);
+  if (bytes.byteLength <= MAX_VERBATIM_KEY_BYTES) return key;
+
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+  return `sha256:${hex}`;
+}
+
 function isCacheEntry(value: unknown): value is CacheEntry {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
@@ -52,7 +79,7 @@ export class KVCacheBackend implements CacheBackend {
 
   async get(key: string): Promise<CacheEntry | undefined> {
     try {
-      const value = await this.kv.get(key, 'json');
+      const value = await this.kv.get(await kvKeyFor(key), 'json');
       return isCacheEntry(value) ? value : undefined;
     } catch {
       return undefined;
@@ -61,7 +88,7 @@ export class KVCacheBackend implements CacheBackend {
 
   async set(key: string, entry: CacheEntry): Promise<void> {
     try {
-      await this.kv.put(key, JSON.stringify(entry), {
+      await this.kv.put(await kvKeyFor(key), JSON.stringify(entry), {
         expirationTtl: kvExpirationTtlSeconds(this.cacheTtlMs),
       });
     } catch {

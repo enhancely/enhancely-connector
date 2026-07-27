@@ -11,11 +11,12 @@
  * - `Accept-Encoding: identity` — we need the raw bytes; a compressed body
  *   cannot be injected into (and any Content-Encoding on the answer makes the
  *   caller fail open).
- * - Representation-selecting request headers (`Cookie`, `Authorization`,
- *   `Accept-Language`) are forwarded by the caller via `extraHeaders`:
- *   origin-response also fires for non-cacheable responses, and without them
- *   the re-fetch would fetch the anonymous/default variant of a page whose
- *   body varies on those headers (logged-in vs logged-out, language, …).
+ * - The caller forwards the FULL request header set CloudFront sent to the
+ *   origin via `extraHeaders` (minus Host, Accept-Encoding and hop-by-hop
+ *   headers): origin-response also fires for non-cacheable responses, and
+ *   any header left out would make the re-fetch return a DIFFERENT variant
+ *   of a page whose body varies on it (User-Agent device detection,
+ *   Accept negotiation, CloudFront geo/device headers, cookies, …).
  * - Bounded buffering: bodies larger than `maxBytes` abort the download and
  *   come back as `truncated: true` (Lambda@Edge caps generated origin-response
  *   bodies at ~1 MB anyway, so there is no point buffering more).
@@ -62,12 +63,16 @@ export function fetchOriginHtml(
         method: 'GET',
         agent: false,
         headers: {
-          // Forwarded representation-selecting headers first — the fixed
-          // trio below must always win on a (pathological) key clash.
+          // Fallback identity — a forwarded viewer User-Agent (in
+          // extraHeaders) overrides it, so the origin sees the same UA it
+          // already answered.
+          'user-agent': 'enhancely-connector-lambda-edge',
+          // Full forwarded request header set from the caller.
           ...extraHeaders,
+          // Non-negotiable, always win over anything forwarded: the vhost
+          // Host header and the raw (uncompressed) bytes for injection.
           host: hostHeader,
           'accept-encoding': 'identity',
-          'user-agent': 'enhancely-connector-lambda-edge',
         },
         signal: AbortSignal.timeout(timeoutMs),
       },
