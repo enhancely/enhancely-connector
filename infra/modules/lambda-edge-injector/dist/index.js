@@ -46,6 +46,7 @@ __export(index_exports, {
   charsetOf: () => charsetOf,
   fetchOriginHtml: () => fetchOriginHtml,
   forwardedHeaders: () => forwardedHeaders,
+  getConfigRetryInMs: () => getConfigRetryInMs,
   handler: () => handler,
   resolveAdapterConfig: () => resolveAdapterConfig,
   serializedHeaderBytes: () => serializedHeaderBytes,
@@ -57,6 +58,7 @@ module.exports = __toCommonJS(index_exports);
 var DEFAULT_ENHANCELY_BASE = "https://app.enhancely.ai";
 var DEFAULT_TIMEOUT_MS = 800;
 var DEFAULT_CACHE_TTL_MS = 3e5;
+var DEFAULT_MAX_JSONLD_BYTES = 256 * 1024;
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]"]);
 function assertSafeBase(base) {
   let parsed;
@@ -74,11 +76,16 @@ function assertSafeBase(base) {
 function defineConfig(input) {
   const base = (input.enhancelyBase ?? DEFAULT_ENHANCELY_BASE).replace(/\/$/, "");
   assertSafeBase(base);
+  const maxJsonLdBytes = input.maxJsonLdBytes ?? DEFAULT_MAX_JSONLD_BYTES;
+  if (!Number.isSafeInteger(maxJsonLdBytes) || maxJsonLdBytes <= 0 || maxJsonLdBytes > DEFAULT_MAX_JSONLD_BYTES) {
+    throw new RangeError(`maxJsonLdBytes must be a positive integer no greater than ${DEFAULT_MAX_JSONLD_BYTES}`);
+  }
   return {
     enhancelyBase: base,
     apiKey: input.apiKey,
     timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     cacheTtlMs: input.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
+    maxJsonLdBytes,
     injectPosition: "before-head-close",
     autoRegister: input.autoRegister ?? false,
     ...input.fetchImpl !== void 0 && { fetchImpl: input.fetchImpl }
@@ -124,6 +131,99 @@ function isFresh(entry, ttlMs, now = Date.now()) {
 }
 
 // ../injector-core/dist/client.js
+function cancelResponseBody(response, reason) {
+  if (response.body === null || response.body.locked)
+    return;
+  try {
+    void response.body.cancel(reason).catch(() => void 0);
+  } catch {
+  }
+}
+function declaredContentLength(response) {
+  const raw = response.headers.get("content-length");
+  if (raw === null || !/^\d+$/.test(raw.trim()))
+    return null;
+  const length = Number(raw);
+  return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
+}
+function errorName(error, fallback) {
+  if (typeof error === "object" && error !== null && "name" in error && typeof error.name === "string" && error.name !== "") {
+    return error.name;
+  }
+  return fallback;
+}
+async function readJsonLdBody(response, maxBytes, signal) {
+  const contentLength = declaredContentLength(response);
+  if (contentLength !== null && contentLength > maxBytes) {
+    cancelResponseBody(response, "body-too-large");
+    return { status: "error", reason: "body-too-large" };
+  }
+  if (response.body === null)
+    return { status: "ok", text: "" };
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  let aborted = signal.aborted;
+  const cancelReader = (reason) => {
+    try {
+      void reader.cancel(reason).catch(() => void 0);
+    } catch {
+    }
+  };
+  const onAbort = () => {
+    aborted = true;
+    cancelReader(signal.reason);
+  };
+  if (aborted) {
+    cancelReader(signal.reason);
+  } else {
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (aborted) {
+        return {
+          status: "error",
+          reason: errorName(signal.reason, "body-read-failed")
+        };
+      }
+      if (done)
+        break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        cancelReader("body-too-large");
+        return { status: "error", reason: "body-too-large" };
+      }
+      chunks.push(value);
+    }
+    if (aborted) {
+      return {
+        status: "error",
+        reason: errorName(signal.reason, "body-read-failed")
+      };
+    }
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { status: "ok", text: new TextDecoder().decode(bytes) };
+  } catch (error) {
+    cancelReader(error);
+    return {
+      status: "error",
+      reason: signal.aborted ? errorName(signal.reason, "body-read-failed") : "body-read-failed"
+    };
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    try {
+      reader.releaseLock();
+    } catch {
+    }
+  }
+}
 function parseRetryAfter(value, now = Date.now()) {
   if (value === null || value.trim() === "")
     return null;
@@ -144,35 +244,48 @@ async function fetchJsonLd(config, pageUrl, etag) {
   if (etag)
     headers["If-None-Match"] = etag;
   let response;
+  let signal;
   try {
+    signal = AbortSignal.timeout(config.timeoutMs);
     response = await fetchImpl(endpoint, {
       method: "GET",
       headers,
-      signal: AbortSignal.timeout(config.timeoutMs)
+      signal
     });
   } catch (error) {
     return { status: "error", reason: error instanceof Error ? error.name : "fetch-failed" };
   }
-  if (response.status === 304)
+  if (response.status === 304) {
+    cancelResponseBody(response, "not-modified");
     return { status: "not-modified" };
-  if (response.status === 404)
+  }
+  if (response.status === 404) {
+    cancelResponseBody(response, "not-found");
     return { status: "not-found" };
+  }
   if (response.status === 429) {
+    const retryAfterSeconds = parseRetryAfter(response.headers.get("retry-after"));
+    cancelResponseBody(response, "rate-limited");
     return {
       status: "rate-limited",
-      retryAfterSeconds: parseRetryAfter(response.headers.get("retry-after"))
+      retryAfterSeconds
     };
   }
-  if (!response.ok)
+  if (!response.ok) {
+    cancelResponseBody(response, `http-${response.status}`);
     return { status: "error", reason: `http-${response.status}` };
+  }
+  let body;
   try {
-    const jsonldRaw = await response.text();
-    if (jsonldRaw.trim() === "")
-      return { status: "error", reason: "empty-body" };
-    return { status: "ok", jsonldRaw, etag: response.headers.get("etag") };
+    body = await readJsonLdBody(response, config.maxJsonLdBytes, signal);
   } catch {
     return { status: "error", reason: "body-read-failed" };
   }
+  if (body.status === "error")
+    return body;
+  if (body.text.trim() === "")
+    return { status: "error", reason: "empty-body" };
+  return { status: "ok", jsonldRaw: body.text, etag: response.headers.get("etag") };
 }
 async function registerJsonLd(config, pageUrl) {
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
@@ -186,7 +299,9 @@ async function registerJsonLd(config, pageUrl) {
       body: JSON.stringify({ url: pageUrl }),
       signal: AbortSignal.timeout(config.timeoutMs)
     });
-    return response.status === 201 || response.status === 200 || response.status === 202;
+    const accepted = response.status === 201 || response.status === 200 || response.status === 202;
+    cancelResponseBody(response, accepted ? "body-unused" : `http-${response.status}`);
+    return accepted;
   } catch {
     return false;
   }
@@ -211,6 +326,21 @@ function endOfTag(html, start) {
     } else if (c === ">") {
       return i + 1;
     }
+  }
+  return -1;
+}
+function endOfRawTextElement(html, lower, tag, start) {
+  const needle = `</${tag}`;
+  let from = start;
+  while (from < html.length) {
+    const close = lower.indexOf(needle, from);
+    if (close < 0)
+      return -1;
+    const after = html[close + needle.length];
+    if (after !== void 0 && /[\t\n\f\r />]/.test(after)) {
+      return endOfTag(html, close);
+    }
+    from = close + needle.length;
   }
   return -1;
 }
@@ -244,11 +374,10 @@ function findHeadCloseIndex(html) {
     if (tagEnd < 0)
       return -1;
     if (raw !== null) {
-      const close = lower.indexOf(`</${raw}`, tagEnd);
-      if (close < 0)
+      const closeEnd = endOfRawTextElement(html, lower, raw, tagEnd);
+      if (closeEnd < 0)
         return -1;
-      const gt = html.indexOf(">", close);
-      i = gt < 0 ? html.length : gt + 1;
+      i = closeEnd;
     } else {
       i = tagEnd;
     }
@@ -266,17 +395,28 @@ function injectIntoHead(html, snippet) {
 function snippetFromEntry(entry) {
   return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw) : null;
 }
+function lookupFromEntry(entry, cacheTtlMs, now = Date.now()) {
+  if (entry.jsonldRaw !== null) {
+    return { snippet: snippetFromEntry(entry), revalidateInMs: null };
+  }
+  const cacheExpiry = entry.storedAt > 0 ? entry.storedAt + cacheTtlMs : 0;
+  const nextLookupAt = Math.max(cacheExpiry, entry.retryNotBefore ?? 0);
+  return {
+    snippet: null,
+    revalidateInMs: Math.max(1, nextLookupAt - now)
+  };
+}
 var DEFAULT_RETRY_BACKOFF_MS = 1e4;
 var MAX_RETRY_BACKOFF_MS = 6e4;
-async function getJsonLdSnippet(url, cache2, config) {
+async function getJsonLdLookup(url, cache2, config) {
   try {
     const key = normalizeLite(url);
     const cached = await cache2.get(key);
     if (cached && isFresh(cached, config.cacheTtlMs)) {
-      return snippetFromEntry(cached);
+      return lookupFromEntry(cached, config.cacheTtlMs);
     }
     if (cached?.retryNotBefore !== void 0 && Date.now() < cached.retryNotBefore) {
-      return snippetFromEntry(cached);
+      return lookupFromEntry(cached, config.cacheTtlMs);
     }
     const result = await fetchJsonLd(config, key, cached?.etag);
     switch (result.status) {
@@ -286,24 +426,32 @@ async function getJsonLdSnippet(url, cache2, config) {
           etag: result.etag,
           storedAt: Date.now()
         });
-        return buildScriptTag(result.jsonldRaw);
+        return { snippet: buildScriptTag(result.jsonldRaw), revalidateInMs: null };
       }
       case "not-modified": {
         if (!cached)
-          return null;
-        await cache2.set(key, {
+          return { snippet: null, revalidateInMs: null };
+        const refreshed = {
           jsonldRaw: cached.jsonldRaw,
           etag: cached.etag,
-          storedAt: Date.now()
-        });
-        return snippetFromEntry(cached);
+          storedAt: Date.now(),
+          ...cached.registrationPending === true && { registrationPending: true }
+        };
+        await cache2.set(key, refreshed);
+        return lookupFromEntry(refreshed, config.cacheTtlMs);
       }
       case "not-found": {
         if (config.autoRegister) {
           await registerJsonLd(config, key);
         }
-        await cache2.set(key, { jsonldRaw: null, etag: null, storedAt: Date.now() });
-        return null;
+        const negative = {
+          jsonldRaw: null,
+          etag: null,
+          storedAt: Date.now(),
+          ...config.autoRegister && { registrationPending: true }
+        };
+        await cache2.set(key, negative);
+        return lookupFromEntry(negative, config.cacheTtlMs);
       }
       case "rate-limited":
       case "error": {
@@ -314,6 +462,7 @@ async function getJsonLdSnippet(url, cache2, config) {
           // No previous entry → storedAt 0 keeps the memo permanently stale,
           // so it only suppresses retries until retryNotBefore, nothing more.
           storedAt: cached?.storedAt ?? 0,
+          ...cached?.registrationPending === true && { registrationPending: true },
           retryNotBefore: Date.now() + backoffMs
         };
         try {
@@ -324,11 +473,11 @@ async function getJsonLdSnippet(url, cache2, config) {
           }
         } catch {
         }
-        return cached ? snippetFromEntry(cached) : null;
+        return lookupFromEntry(memo, config.cacheTtlMs);
       }
     }
   } catch {
-    return null;
+    return { snippet: null, revalidateInMs: null };
   }
 }
 
@@ -424,7 +573,7 @@ async function resolveOnce() {
     }
     if (apiKey === void 0) {
       console.error(
-        "[enhancely-lambda-edge] NO API KEY: neither a baked connector-config.json apiKey nor a non-empty SSM parameter was found \u2014 every response passes through UNINJECTED until this execution environment is recycled"
+        "[enhancely-lambda-edge] NO API KEY: neither a baked connector-config.json apiKey nor a non-empty SSM parameter was found \u2014 responses pass through UNINJECTED for 30 seconds, then config resolution is retried"
       );
       return null;
     }
@@ -444,7 +593,7 @@ async function resolveOnce() {
     });
   } catch (error) {
     console.error(
-      "[enhancely-lambda-edge] config resolution FAILED \u2014 every response passes through UNINJECTED until this execution environment is recycled:",
+      "[enhancely-lambda-edge] config resolution FAILED \u2014 every response passes through UNINJECTED for 30 seconds, then config resolution is retried:",
       error instanceof Error ? `${error.name}: ${error.message}` : String(error)
     );
     return null;
@@ -465,6 +614,10 @@ function resolveAdapterConfig() {
   });
   return inflight;
 }
+function getConfigRetryInMs() {
+  if (resolvedConfig !== null || negativeUntil <= Date.now()) return null;
+  return negativeUntil - Date.now();
+}
 function getOriginTimeoutMs() {
   return resolvedOriginTimeoutMs;
 }
@@ -472,8 +625,8 @@ function getOriginTimeoutMs() {
 // src/origin-fetch.ts
 var http = __toESM(require("node:http"), 1);
 var https = __toESM(require("node:https"), 1);
-function firstHeaderValue(value) {
-  if (Array.isArray(value)) return value[0] ?? null;
+function combinedHeaderValue(value) {
+  if (Array.isArray(value)) return value.join(", ");
   return value ?? null;
 }
 function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeaders = {}) {
@@ -507,9 +660,10 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
         const contentType = response.headers["content-type"] ?? null;
         const contentEncoding = response.headers["content-encoding"] ?? null;
         const cacheControl = response.headers["cache-control"] ?? null;
+        const expires = response.headers["expires"] ?? null;
         const hasSetCookie = response.headers["set-cookie"] !== void 0;
-        const csp = firstHeaderValue(response.headers["content-security-policy"]);
-        const cspReportOnly = firstHeaderValue(
+        const csp = combinedHeaderValue(response.headers["content-security-policy"]);
+        const cspReportOnly = combinedHeaderValue(
           response.headers["content-security-policy-report-only"]
         );
         const chunks = [];
@@ -525,6 +679,7 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
               contentType,
               contentEncoding,
               cacheControl,
+              expires,
               hasSetCookie,
               contentSecurityPolicy: csp,
               contentSecurityPolicyReportOnly: cspReportOnly,
@@ -544,6 +699,7 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
             contentType,
             contentEncoding,
             cacheControl,
+            expires,
             hasSetCookie,
             contentSecurityPolicy: csp,
             contentSecurityPolicyReportOnly: cspReportOnly,
@@ -569,12 +725,15 @@ var MAX_RESPONSE_HEADER_BYTES = 32768;
 var GENERATED_RESPONSE_SAFETY_MARGIN_BYTES = 1024;
 var MAX_ORIGIN_BODY_BYTES = MAX_GENERATED_RESPONSE_BYTES - MAX_RESPONSE_HEADER_BYTES - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
 var UTF8_COMPATIBLE_CHARSETS = /* @__PURE__ */ new Set(["utf-8", "utf8", "us-ascii", "ascii"]);
+var GENERATED_HTML_CONTENT_TYPE = "text/html; charset=utf-8";
 var RESPONSE_STATUS_LINE_OVERHEAD_BYTES = 64;
-function serializedHeaderBytes(headers) {
-  let total = RESPONSE_STATUS_LINE_OVERHEAD_BYTES;
+function serializedHeaderBytes(headers, status = "200", statusDescription = "OK") {
+  const actualFramingBytes = Buffer.byteLength(`HTTP/1.1 ${status} ${statusDescription}\r
+`, "utf8") + 2;
+  let total = Math.max(RESPONSE_STATUS_LINE_OVERHEAD_BYTES, actualFramingBytes);
   for (const [name, entries] of Object.entries(headers)) {
     for (const entry of entries) {
-      total += (entry.key ?? name).length + entry.value.length + 4;
+      total += Buffer.byteLength(entry.key ?? name, "utf8") + Buffer.byteLength(entry.value, "utf8") + 4;
     }
   }
   return total;
@@ -582,6 +741,12 @@ function serializedHeaderBytes(headers) {
 function charsetOf(contentType) {
   const match = /;\s*charset\s*=\s*"?([\w-]+)"?/i.exec(contentType);
   return match?.[1]?.toLowerCase() ?? null;
+}
+function containsOnlyAscii(body) {
+  return body.every((byte) => byte <= 127);
+}
+function hasUtf8Bom(body) {
+  return body.length >= 3 && body[0] === 239 && body[1] === 187 && body[2] === 191;
 }
 var PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
 function shouldAttempt(input, ignoreContentEncoding = false) {
@@ -617,6 +782,90 @@ function customHeaderValue(request, name) {
 }
 function headerValue(headers, name) {
   return headers[name]?.[0]?.value ?? null;
+}
+function cacheControlValue(headers) {
+  const entries = headers["cache-control"];
+  return entries === void 0 ? null : entries.map((entry) => entry.value).join(", ");
+}
+function combinedHeaderValue2(headers, name) {
+  const entries = headers[name];
+  return entries === void 0 ? null : entries.map((entry) => entry.value).join(", ");
+}
+function cacheDirectiveSeconds(policy, wanted) {
+  for (const directive of policy.split(",")) {
+    const [rawName, rawValue] = directive.trim().split("=", 2);
+    if (rawName?.toLowerCase() !== wanted || rawValue === void 0) continue;
+    const value = rawValue.trim().replace(/^"|"$/g, "");
+    if (!/^\d+$/.test(value)) return null;
+    const seconds = Number(value);
+    return Number.isSafeInteger(seconds) ? seconds : null;
+  }
+  return null;
+}
+function normalizedCacheControl(policy) {
+  if (policy === null) return null;
+  return policy.split(",").map((directive) => directive.trim().toLowerCase()).sort().join(",");
+}
+function normalizedCspStructure(policy) {
+  return policy.split(";").map((rawDirective) => {
+    const [rawName, ...rawSources] = rawDirective.trim().split(/\s+/);
+    if (rawName === void 0 || rawName === "") return "";
+    const sources = rawSources.map((source) => {
+      if (/^'nonce-[^']+'$/i.test(source)) return "'nonce-*'";
+      const hash = /^'(sha256|sha384|sha512)-[^']+'$/i.exec(source);
+      return hash?.[1] === void 0 ? source : `'${hash[1].toLowerCase()}-*'`;
+    });
+    return [rawName.toLowerCase(), ...sources].join(" ");
+  }).filter((directive) => directive !== "").join(";");
+}
+function retrySharedTtlSeconds(headers, revalidateInMs) {
+  let ttl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
+  const policy = cacheControlValue(headers);
+  let hasExplicitLifetime = false;
+  if (policy !== null) {
+    const directiveNames = policy.split(",").map((directive) => directive.split("=", 1)[0]?.trim().toLowerCase());
+    if (directiveNames.includes("no-cache")) {
+      return 0;
+    }
+    const originTtl = cacheDirectiveSeconds(policy, "s-maxage") ?? cacheDirectiveSeconds(policy, "max-age");
+    if (originTtl !== null) {
+      ttl = Math.min(ttl, originTtl);
+      hasExplicitLifetime = true;
+    }
+  }
+  if (!hasExplicitLifetime) {
+    const expires = headerValue(headers, "expires");
+    if (expires !== null) {
+      const expiresAt = Date.parse(expires);
+      const responseDate = Date.parse(headerValue(headers, "date") ?? "");
+      if (!Number.isNaN(expiresAt)) {
+        const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
+        ttl = Math.min(ttl, Math.max(0, Math.ceil((expiresAt - reference) / 1e3)));
+      }
+    }
+  }
+  return ttl;
+}
+function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) {
+  if (requestHeaders["authorization"] !== void 0 || requestHeaders["cookie"] !== void 0) {
+    return response;
+  }
+  const originalHeaders = response.headers ?? {};
+  const headers = { ...originalHeaders };
+  const sharedTtlSeconds = retrySharedTtlSeconds(originalHeaders, revalidateInMs);
+  headers["cache-control"] = [
+    {
+      key: "Cache-Control",
+      value: `max-age=0, s-maxage=${sharedTtlSeconds}, must-revalidate`
+    }
+  ];
+  delete headers["expires"];
+  delete headers["etag"];
+  delete headers["last-modified"];
+  if (serializedHeaderBytes(headers, response.status, response.statusDescription) > MAX_RESPONSE_HEADER_BYTES) {
+    return response;
+  }
+  return { ...response, headers };
 }
 var NON_FORWARDED_REQUEST_HEADERS = /* @__PURE__ */ new Set([
   "host",
@@ -657,7 +906,7 @@ var handler = async (event) => {
         status: response.status,
         contentType: headerValue(response.headers, "content-type"),
         contentEncoding: headerValue(response.headers, "content-encoding"),
-        cacheControl: headerValue(response.headers, "cache-control"),
+        cacheControl: cacheControlValue(response.headers),
         hasSetCookie: response.headers["set-cookie"] !== void 0
       },
       // Ignore the first response's content-encoding — we re-fetch identity.
@@ -665,16 +914,21 @@ var handler = async (event) => {
     )) {
       return response;
     }
-    const config = await resolveAdapterConfig();
-    if (config === null) return response;
     const originUrl = buildOriginUrl(request);
     if (originUrl === null) return response;
     const originHost = headerValue(request.headers, "host") ?? request.origin?.custom?.domainName ?? "";
     if (originHost === "") return response;
+    const config = await resolveAdapterConfig();
+    if (config === null) {
+      const retryInMs = getConfigRetryInMs();
+      return retryInMs === null ? response : retryablePassThroughResponse(response, request.headers, retryInMs);
+    }
     const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
     const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
-    const snippet = await getJsonLdSnippet(pageUrl, cache, config);
-    if (snippet === null) return response;
+    const lookup = await getJsonLdLookup(pageUrl, cache, config);
+    if (lookup.snippet === null) {
+      return lookup.revalidateInMs === null ? response : retryablePassThroughResponse(response, request.headers, lookup.revalidateInMs);
+    }
     const origin = await fetchOriginHtml(
       originUrl,
       originHost,
@@ -695,9 +949,32 @@ var handler = async (event) => {
     })) {
       return response;
     }
+    const firstCacheControl = cacheControlValue(response.headers);
+    if (normalizedCacheControl(firstCacheControl) !== normalizedCacheControl(origin.cacheControl)) {
+      return response;
+    }
+    if (headerValue(response.headers, "expires") !== origin.expires) {
+      return response;
+    }
+    const firstCsp = combinedHeaderValue2(response.headers, "content-security-policy");
+    const firstCspReportOnly = combinedHeaderValue2(
+      response.headers,
+      "content-security-policy-report-only"
+    );
+    if (firstCsp !== null && origin.contentSecurityPolicy === null || firstCsp !== null && origin.contentSecurityPolicy !== null && normalizedCspStructure(firstCsp) !== normalizedCspStructure(origin.contentSecurityPolicy) || firstCspReportOnly !== null && origin.contentSecurityPolicyReportOnly === null || firstCspReportOnly !== null && origin.contentSecurityPolicyReportOnly !== null && normalizedCspStructure(firstCspReportOnly) !== normalizedCspStructure(origin.contentSecurityPolicyReportOnly)) {
+      return response;
+    }
     const originalHtml = origin.body.toString("utf8");
     if (!Buffer.from(originalHtml, "utf8").equals(origin.body)) return response;
-    const injected = injectIntoHead(originalHtml, snippet);
+    const originCharset = charsetOf(origin.contentType ?? "");
+    const asciiBody = containsOnlyAscii(origin.body);
+    if ((originCharset === "ascii" || originCharset === "us-ascii") && !asciiBody) {
+      return response;
+    }
+    if (originCharset === null && !asciiBody && !hasUtf8Bom(origin.body)) {
+      return response;
+    }
+    const injected = injectIntoHead(originalHtml, lookup.snippet);
     if (injected === originalHtml) return response;
     const headers = { ...response.headers };
     delete headers["content-length"];
@@ -708,6 +985,19 @@ var handler = async (event) => {
     delete headers["digest"];
     delete headers["content-digest"];
     delete headers["repr-digest"];
+    headers["content-type"] = [{ key: "Content-Type", value: GENERATED_HTML_CONTENT_TYPE }];
+    if (origin.cacheControl === null) {
+      delete headers["cache-control"];
+    } else {
+      headers["cache-control"] = [{ key: "Cache-Control", value: origin.cacheControl }];
+    }
+    if (origin.expires === null) {
+      delete headers["expires"];
+    } else {
+      headers["expires"] = [{ key: "Expires", value: origin.expires }];
+    }
+    delete headers["content-security-policy"];
+    delete headers["content-security-policy-report-only"];
     if (origin.contentSecurityPolicy !== null) {
       headers["content-security-policy"] = [
         { key: "Content-Security-Policy", value: origin.contentSecurityPolicy }
@@ -721,7 +1011,13 @@ var handler = async (event) => {
         }
       ];
     }
-    const bodyBudgetBytes = MAX_GENERATED_RESPONSE_BYTES - serializedHeaderBytes(headers) - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
+    const responseHeaderBytes = serializedHeaderBytes(
+      headers,
+      response.status,
+      response.statusDescription
+    );
+    if (responseHeaderBytes > MAX_RESPONSE_HEADER_BYTES) return response;
+    const bodyBudgetBytes = MAX_GENERATED_RESPONSE_BYTES - responseHeaderBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
     if (Buffer.byteLength(injected, "utf8") > bodyBudgetBytes) return response;
     const result = {
       ...response,
@@ -756,6 +1052,7 @@ var handler = async (event) => {
   charsetOf,
   fetchOriginHtml,
   forwardedHeaders,
+  getConfigRetryInMs,
   handler,
   resolveAdapterConfig,
   serializedHeaderBytes,

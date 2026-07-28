@@ -13,17 +13,24 @@
  * `Accept-Encoding: identity` for raw injectable bytes), injects the snippet
  * before </head> and replaces the body. The first gate IGNORES the CloudFront
  * response's Content-Encoding (real viewers get gzip/br, but we re-fetch
- * identity); the identity re-fetch is re-gated on encoding. A per-response CSP
- * from the re-fetch is copied onto the generated response so header and body
- * agree. CloudFront then caches the injected page, so the extra origin roundtrip
- * is paid once per CloudFront cache miss — origin-response does not fire on hits.
+ * identity); the identity re-fetch is re-gated on encoding. Representation
+ * headers are handled conservatively: Content-Type becomes explicit UTF-8;
+ * Cache-Control/Expires must be stable across both responses; and CSP structure
+ * must remain stable except for body-bound nonces/hashes (the accepted
+ * re-fetch value matches its body). CloudFront then caches the
+ * injected page, so the extra origin roundtrip is paid once per CloudFront
+ * cache miss — origin-response does not fire on hits. A retryable no-snippet
+ * result receives a short shared-cache TTL aligned with the core/config retry
+ * and loses its origin validators, unless the request carries Authorization
+ * or Cookie. That prevents a long default TTL (or later 304) from pinning a
+ * transiently uninjected public representation.
  *
  * Fail-open invariant: the whole handler is wrapped in try/catch and ALWAYS
  * returns the original response on any failure — config unresolvable, origin
  * re-fetch error/timeout/non-200, body over the generated-response quota
  * (1 MB INCLUDING headers; see MAX_ORIGIN_BODY_BYTES and
- * serializedHeaderBytes), unexpected charset/encoding, lossy UTF-8 decode,
- * core errors.
+ * serializedHeaderBytes), unstable cache/security metadata, ambiguous
+ * charset/encoding, lossy UTF-8 decode, core errors.
  *
  * All connector logic (Enhancely API client, cache + ETag revalidation,
  * injection, fail-open orchestration) lives in @enhancely/injector-core; this
@@ -35,8 +42,8 @@ import type {
   CloudFrontResponseHandler,
   CloudFrontResultResponse,
 } from 'aws-lambda';
-import { getJsonLdSnippet, injectIntoHead, MemoryCache } from '@enhancely/injector-core';
-import { getOriginTimeoutMs, resolveAdapterConfig } from './config.js';
+import { getJsonLdLookup, injectIntoHead, MemoryCache } from '@enhancely/injector-core';
+import { getConfigRetryInMs, getOriginTimeoutMs, resolveAdapterConfig } from './config.js';
 import { fetchOriginHtml } from './origin-fetch.js';
 
 export {
@@ -46,6 +53,7 @@ export {
   DEFAULT_SSM_REGION,
   DEFAULT_SSM_TIMEOUT_MS,
   CONFIG_FILE_NAME,
+  getConfigRetryInMs,
 } from './config.js';
 export type { BakedConnectorConfig } from './config.js';
 export { fetchOriginHtml } from './origin-fetch.js';
@@ -99,6 +107,9 @@ export const MAX_ORIGIN_BODY_BYTES =
  */
 const UTF8_COMPATIBLE_CHARSETS = new Set(['utf-8', 'utf8', 'us-ascii', 'ascii']);
 
+/** Lambda's text response is serialized as UTF-8, so advertise that explicitly. */
+const GENERATED_HTML_CONTENT_TYPE = 'text/html; charset=utf-8';
+
 /**
  * Bytes reserved for the response status line and framing overhead on top of
  * the per-header bytes in serializedHeaderBytes.
@@ -108,14 +119,23 @@ const RESPONSE_STATUS_LINE_OVERHEAD_BYTES = 64;
 /**
  * Serialized size of a CloudFront header map as it will count against the
  * 1 MB generated-response quota: per header value, name + value + 4 bytes
- * (": " separator + CRLF), plus a 64-byte status-line/framing margin.
- * CloudFront header names/values are ASCII, so string length == byte length.
+ * (": " separator + CRLF), plus the actual status line and final CRLF (never
+ * less than the existing conservative 64-byte framing allowance).
+ * CloudFront passes header values to edge functions as UTF-8, so JavaScript
+ * string length is not a byte count for non-ASCII values.
  */
-export function serializedHeaderBytes(headers: CloudFrontHeaders): number {
-  let total = RESPONSE_STATUS_LINE_OVERHEAD_BYTES;
+export function serializedHeaderBytes(
+  headers: CloudFrontHeaders,
+  status = '200',
+  statusDescription = 'OK'
+): number {
+  const actualFramingBytes =
+    Buffer.byteLength(`HTTP/1.1 ${status} ${statusDescription}\r\n`, 'utf8') + 2;
+  let total = Math.max(RESPONSE_STATUS_LINE_OVERHEAD_BYTES, actualFramingBytes);
   for (const [name, entries] of Object.entries(headers)) {
     for (const entry of entries) {
-      total += (entry.key ?? name).length + entry.value.length + 4;
+      total +=
+        Buffer.byteLength(entry.key ?? name, 'utf8') + Buffer.byteLength(entry.value, 'utf8') + 4;
     }
   }
   return total;
@@ -125,6 +145,15 @@ export function serializedHeaderBytes(headers: CloudFrontHeaders): number {
 export function charsetOf(contentType: string): string | null {
   const match = /;\s*charset\s*=\s*"?([\w-]+)"?/i.exec(contentType);
   return match?.[1]?.toLowerCase() ?? null;
+}
+
+function containsOnlyAscii(body: Buffer): boolean {
+  return body.every((byte) => byte <= 0x7f);
+}
+
+/** A byte-order mark is unambiguous UTF-8 evidence without parsing HTML. */
+function hasUtf8Bom(body: Buffer): boolean {
+  return body.length >= 3 && body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf;
 }
 
 export interface AttemptInput {
@@ -233,6 +262,150 @@ function headerValue(headers: CloudFrontHeaders, name: string): string | null {
   return headers[name]?.[0]?.value ?? null;
 }
 
+/** Cache-Control is a list field: every CloudFront header entry is operative. */
+function cacheControlValue(headers: CloudFrontHeaders): string | null {
+  const entries = headers['cache-control'];
+  return entries === undefined ? null : entries.map((entry) => entry.value).join(', ');
+}
+
+/** Combine every value of a list-like response header. */
+function combinedHeaderValue(headers: CloudFrontHeaders, name: string): string | null {
+  const entries = headers[name];
+  return entries === undefined ? null : entries.map((entry) => entry.value).join(', ');
+}
+
+/** Numeric Cache-Control directive value, or null when absent/invalid. */
+function cacheDirectiveSeconds(policy: string, wanted: 'max-age' | 's-maxage'): number | null {
+  for (const directive of policy.split(',')) {
+    const [rawName, rawValue] = directive.trim().split('=', 2);
+    if (rawName?.toLowerCase() !== wanted || rawValue === undefined) continue;
+    const value = rawValue.trim().replace(/^"|"$/g, '');
+    if (!/^\d+$/.test(value)) return null;
+    const seconds = Number(value);
+    return Number.isSafeInteger(seconds) ? seconds : null;
+  }
+  return null;
+}
+
+/** Compare Cache-Control semantically enough to ignore order/casing/spacing. */
+function normalizedCacheControl(policy: string | null): string | null {
+  if (policy === null) return null;
+  return policy
+    .split(',')
+    .map((directive) => directive.trim().toLowerCase())
+    .sort()
+    .join(',');
+}
+
+/**
+ * Compare CSP structure while allowing per-response nonces and body hashes to
+ * rotate. Every other directive/source must remain stable or injection fails
+ * open rather than weakening the policy seen on the first response.
+ */
+function normalizedCspStructure(policy: string): string {
+  return policy
+    .split(';')
+    .map((rawDirective) => {
+      const [rawName, ...rawSources] = rawDirective.trim().split(/\s+/);
+      if (rawName === undefined || rawName === '') return '';
+      const sources = rawSources.map((source) => {
+        if (/^'nonce-[^']+'$/i.test(source)) return "'nonce-*'";
+        const hash = /^'(sha256|sha384|sha512)-[^']+'$/i.exec(source);
+        return hash?.[1] === undefined ? source : `'${hash[1].toLowerCase()}-*'`;
+      });
+      return [rawName.toLowerCase(), ...sources].join(' ');
+    })
+    .filter((directive) => directive !== '')
+    .join(';');
+}
+
+/**
+ * Never make an origin response more cacheable than it already was. The
+ * retry TTL only replaces CloudFront's default when the origin supplied no
+ * shorter explicit shared-cache lifetime.
+ */
+function retrySharedTtlSeconds(headers: CloudFrontHeaders, revalidateInMs: number): number {
+  let ttl = Math.max(1, Math.ceil(revalidateInMs / 1000));
+  const policy = cacheControlValue(headers);
+  let hasExplicitLifetime = false;
+
+  if (policy !== null) {
+    const directiveNames = policy
+      .split(',')
+      .map((directive) => directive.split('=', 1)[0]?.trim().toLowerCase());
+    if (directiveNames.includes('no-cache')) {
+      return 0;
+    }
+    const originTtl =
+      cacheDirectiveSeconds(policy, 's-maxage') ?? cacheDirectiveSeconds(policy, 'max-age');
+    if (originTtl !== null) {
+      ttl = Math.min(ttl, originTtl);
+      hasExplicitLifetime = true;
+    }
+  }
+
+  // Expires remains the freshness fallback when Cache-Control exists but
+  // carries no max-age/s-maxage (for example just `public`).
+  if (!hasExplicitLifetime) {
+    const expires = headerValue(headers, 'expires');
+    if (expires !== null) {
+      const expiresAt = Date.parse(expires);
+      const responseDate = Date.parse(headerValue(headers, 'date') ?? '');
+      if (!Number.isNaN(expiresAt)) {
+        const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
+        ttl = Math.min(ttl, Math.max(0, Math.ceil((expiresAt - reference) / 1000)));
+      }
+    }
+  }
+
+  return ttl;
+}
+
+/**
+ * Keep a retryable pass-through response in CloudFront only until the core or
+ * config resolver will try again. Validators for the untouched origin body
+ * are removed deliberately: after this short TTL CloudFront must obtain a full
+ * origin response, so the origin-response Lambda runs again. A 304 would
+ * otherwise keep the old uninjected body.
+ *
+ * Never add cacheability to a request carrying credentials/personalization.
+ * In particular, s-maxage/public/must-revalidate override the normal shared
+ * cache restriction on Authorization responses (RFC 9111 §3.5).
+ */
+function retryablePassThroughResponse(
+  response: CloudFrontResultResponse,
+  requestHeaders: CloudFrontHeaders,
+  revalidateInMs: number
+): CloudFrontResultResponse {
+  if (requestHeaders['authorization'] !== undefined || requestHeaders['cookie'] !== undefined) {
+    return response;
+  }
+
+  const originalHeaders = response.headers ?? {};
+  const headers: CloudFrontHeaders = { ...originalHeaders };
+  const sharedTtlSeconds = retrySharedTtlSeconds(originalHeaders, revalidateInMs);
+
+  headers['cache-control'] = [
+    {
+      key: 'Cache-Control',
+      value: `max-age=0, s-maxage=${sharedTtlSeconds}, must-revalidate`,
+    },
+  ];
+  delete headers['expires'];
+  delete headers['etag'];
+  delete headers['last-modified'];
+
+  // Header edits are still subject to CloudFront's independent 32 KB limit.
+  // If the safer policy would cross it, retain the byte-for-byte response.
+  if (
+    serializedHeaderBytes(headers, response.status, response.statusDescription) >
+    MAX_RESPONSE_HEADER_BYTES
+  ) {
+    return response;
+  }
+  return { ...response, headers };
+}
+
 /**
  * Request headers NEVER forwarded on the origin re-fetch:
  * - `host` — set explicitly by the caller (vhost resolution),
@@ -314,7 +487,7 @@ export const handler: CloudFrontResponseHandler = async (event) => {
           status: response.status,
           contentType: headerValue(response.headers, 'content-type'),
           contentEncoding: headerValue(response.headers, 'content-encoding'),
-          cacheControl: headerValue(response.headers, 'cache-control'),
+          cacheControl: cacheControlValue(response.headers),
           hasSetCookie: response.headers['set-cookie'] !== undefined,
         },
         // Ignore the first response's content-encoding — we re-fetch identity.
@@ -323,10 +496,6 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     ) {
       return response;
     }
-
-    // No resolvable API key → pure pass-through (logged loudly once).
-    const config = await resolveAdapterConfig();
-    if (config === null) return response;
 
     const originUrl = buildOriginUrl(request);
     if (originUrl === null) return response;
@@ -337,6 +506,17 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     const originHost =
       headerValue(request.headers, 'host') ?? request.origin?.custom?.domainName ?? '';
     if (originHost === '') return response;
+
+    // No resolvable API key → body pass-through (logged once per failed
+    // resolution), with a bounded cache retry only for an otherwise eligible
+    // custom-origin response.
+    const config = await resolveAdapterConfig();
+    if (config === null) {
+      const retryInMs = getConfigRetryInMs();
+      return retryInMs === null
+        ? response
+        : retryablePassThroughResponse(response, request.headers, retryInMs);
+    }
 
     // Public page host for the Enhancely lookup. Origins that must NOT
     // receive the viewer Host (S3 website endpoints reject foreign hosts, so
@@ -351,8 +531,12 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // rate-limited, upstream error) therefore never double the origin load —
     // during an early pilot that is the large majority of requests, and it also
     // means a not-yet-configured key (no snippet) costs zero extra origin hits.
-    const snippet = await getJsonLdSnippet(pageUrl, cache, config);
-    if (snippet === null) return response;
+    const lookup = await getJsonLdLookup(pageUrl, cache, config);
+    if (lookup.snippet === null) {
+      return lookup.revalidateInMs === null
+        ? response
+        : retryablePassThroughResponse(response, request.headers, lookup.revalidateInMs);
+    }
 
     // Re-fetch the page: origin-response events do not expose the body.
     const origin = await fetchOriginHtml(
@@ -380,6 +564,42 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       return response;
     }
 
+    // Cache semantics must be stable across the first response and the
+    // representation we re-fetch. Choosing either side of a mismatch can make
+    // the viewer response more cacheable than the other one intended, so the
+    // only fail-open choice is to leave the first response untouched.
+    const firstCacheControl = cacheControlValue(response.headers);
+    if (normalizedCacheControl(firstCacheControl) !== normalizedCacheControl(origin.cacheControl)) {
+      return response;
+    }
+    if (headerValue(response.headers, 'expires') !== origin.expires) {
+      return response;
+    }
+
+    // Dropping or structurally weakening a CSP that protected the first
+    // response would be a security downgrade. Per-response nonces/hashes may
+    // rotate; every other directive/source must remain stable. The re-fetch's
+    // accepted value is copied below because it matches that body.
+    const firstCsp = combinedHeaderValue(response.headers, 'content-security-policy');
+    const firstCspReportOnly = combinedHeaderValue(
+      response.headers,
+      'content-security-policy-report-only'
+    );
+    if (
+      (firstCsp !== null && origin.contentSecurityPolicy === null) ||
+      (firstCsp !== null &&
+        origin.contentSecurityPolicy !== null &&
+        normalizedCspStructure(firstCsp) !==
+          normalizedCspStructure(origin.contentSecurityPolicy)) ||
+      (firstCspReportOnly !== null && origin.contentSecurityPolicyReportOnly === null) ||
+      (firstCspReportOnly !== null &&
+        origin.contentSecurityPolicyReportOnly !== null &&
+        normalizedCspStructure(firstCspReportOnly) !==
+          normalizedCspStructure(origin.contentSecurityPolicyReportOnly))
+    ) {
+      return response;
+    }
+
     const originalHtml = origin.body.toString('utf8');
     // Charset gate, part 2: a page may omit the charset parameter yet carry
     // non-UTF-8 bytes (e.g. `<meta charset="iso-8859-1">` in the markup). A
@@ -387,9 +607,25 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // CACHE the mojibake. Prove the decode was lossless before doing anything
     // with it; otherwise pass through byte-identical.
     if (!Buffer.from(originalHtml, 'utf8').equals(origin.body)) return response;
+    const originCharset = charsetOf(origin.contentType ?? '');
+    const asciiBody = containsOnlyAscii(origin.body);
+    // `ascii`/`us-ascii` are legacy web-encoding labels. Relabeling non-ASCII
+    // bytes as UTF-8 can change visible origin text even when those bytes form
+    // valid UTF-8, so only genuinely ASCII source bytes are safe.
+    if ((originCharset === 'ascii' || originCharset === 'us-ascii') && !asciiBody) {
+      return response;
+    }
+    // With no header charset, valid UTF-8 bytes are not proof of UTF-8 intent:
+    // browsers perform a context-sensitive HTML encoding prescan and might
+    // interpret the same bytes as windows-1252. Without implementing that
+    // complete algorithm, only ASCII bytes or an unambiguous UTF-8 BOM are
+    // safe to relabel.
+    if (originCharset === null && !asciiBody && !hasUtf8Bom(origin.body)) {
+      return response;
+    }
     // We already hold the snippet — inject it directly. injectIntoHead returns
     // the HTML unchanged when there is no </head>, preserving fail-open.
-    const injected = injectIntoHead(originalHtml, snippet);
+    const injected = injectIntoHead(originalHtml, lookup.snippet);
 
     // Nothing injected (no </head>) → return the untouched response; CloudFront
     // serves the origin's own (byte-identical) body without us generating one.
@@ -422,11 +658,34 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     delete headers['digest'];
     delete headers['content-digest'];
     delete headers['repr-digest'];
+
+    // The generated text is UTF-8 regardless of whether the re-fetch declared
+    // UTF-8, ASCII, or no charset. Canonicalize the Content-Type so Unicode in
+    // the injected JSON-LD can never be decoded under a stale ASCII label.
+    headers['content-type'] = [{ key: 'Content-Type', value: GENERATED_HTML_CONTENT_TYPE }];
+
+    // The equality gate above proved the cache policy stable across both
+    // responses. Re-emit the re-fetch's canonical value with its body.
+    if (origin.cacheControl === null) {
+      delete headers['cache-control'];
+    } else {
+      headers['cache-control'] = [{ key: 'Cache-Control', value: origin.cacheControl }];
+    }
+    if (origin.expires === null) {
+      delete headers['expires'];
+    } else {
+      headers['expires'] = [{ key: 'Expires', value: origin.expires }];
+    }
+
     // The generated body is the re-fetch's, so the CSP that matches it (an
     // origin minting a per-response nonce would put a DIFFERENT nonce in each
     // response) is the re-fetch's — not the first response's. Copy it over so
     // header and body agree; otherwise the page's own inline scripts would be
-    // CSP-blocked (a page-breaking, fail-CLOSED outcome).
+    // CSP-blocked (a page-breaking, fail-CLOSED outcome). The asymmetry gate
+    // above already returned the original response if a first-response CSP
+    // disappeared; deleting first is now safe and prevents duplicate values.
+    delete headers['content-security-policy'];
+    delete headers['content-security-policy-report-only'];
     if (origin.contentSecurityPolicy !== null) {
       headers['content-security-policy'] = [
         { key: 'Content-Security-Policy', value: origin.contentSecurityPolicy },
@@ -441,16 +700,24 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       ];
     }
 
-    // The injected page must fit the 1 MB generated-response quota, which
+    // CloudFront independently caps an origin response's headers at 32 KB.
+    // A larger per-response CSP from the re-fetch can push a previously valid
+    // first-response header set over that limit; returning it would produce a
+    // viewer-facing 502 after Lambda has completed, so fail open here.
+    const responseHeaderBytes = serializedHeaderBytes(
+      headers,
+      response.status,
+      response.statusDescription
+    );
+    if (responseHeaderBytes > MAX_RESPONSE_HEADER_BYTES) return response;
+
+    // The injected page must also fit the 1 MB generated-response quota, which
     // counts headers AND body together. Budget the body against the ACTUAL
-    // serialized size of the headers being returned (CloudFront permits up to
-    // 32 KB of headers — a fixed optimistic allowance is no guarantee), plus
-    // a safety margin. An over-quota generated response is a viewer-facing
-    // 502, not fail-open — so when in doubt, pass through.
+    // serialized header size plus a safety margin. An over-quota generated
+    // response is a viewer-facing 502, not fail-open — so when in doubt, pass
+    // through.
     const bodyBudgetBytes =
-      MAX_GENERATED_RESPONSE_BYTES -
-      serializedHeaderBytes(headers) -
-      GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
+      MAX_GENERATED_RESPONSE_BYTES - responseHeaderBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
     if (Buffer.byteLength(injected, 'utf8') > bodyBudgetBytes) return response;
 
     const result: CloudFrontResultResponse = {

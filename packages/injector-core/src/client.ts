@@ -1,5 +1,131 @@
 import type { InjectorConfig, JsonLdFetchResult } from './types.js';
 
+type BodyReadResult = { status: 'ok'; text: string } | { status: 'error'; reason: string };
+
+/** Cancel an unused response body without letting cancellation failures escape. */
+function cancelResponseBody(response: Response, reason: string): void {
+  if (response.body === null || response.body.locked) return;
+  try {
+    void response.body.cancel(reason).catch(() => undefined);
+  } catch {
+    // Cancellation is best-effort; the connector still fails open.
+  }
+}
+
+/** Return a trustworthy non-negative Content-Length, or null when absent/invalid. */
+function declaredContentLength(response: Response): number | null {
+  const raw = response.headers.get('content-length');
+  if (raw === null || !/^\d+$/.test(raw.trim())) return null;
+  const length = Number(raw);
+  return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
+}
+
+function errorName(error: unknown, fallback: string): string {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'name' in error &&
+    typeof error.name === 'string' &&
+    error.name !== ''
+  ) {
+    return error.name;
+  }
+  return fallback;
+}
+
+/**
+ * Read a successful JSON-LD body with a hard byte cap.
+ *
+ * `response.text()` would buffer an attacker-controlled body before we could
+ * inspect its size. Reading the stream lets us stop and cancel immediately
+ * after the configured byte limit. The same timeout signal passed to fetch
+ * remains active for the complete body read, including a stalled stream.
+ */
+async function readJsonLdBody(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal
+): Promise<BodyReadResult> {
+  const contentLength = declaredContentLength(response);
+  if (contentLength !== null && contentLength > maxBytes) {
+    cancelResponseBody(response, 'body-too-large');
+    return { status: 'error', reason: 'body-too-large' };
+  }
+
+  if (response.body === null) return { status: 'ok', text: '' };
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let aborted = signal.aborted;
+
+  const cancelReader = (reason: unknown): void => {
+    try {
+      void reader.cancel(reason).catch(() => undefined);
+    } catch {
+      // Cancellation is best-effort; the bounded result is still an error.
+    }
+  };
+  const onAbort = (): void => {
+    aborted = true;
+    cancelReader(signal.reason);
+  };
+
+  if (aborted) {
+    cancelReader(signal.reason);
+  } else {
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (aborted) {
+        return {
+          status: 'error',
+          reason: errorName(signal.reason, 'body-read-failed'),
+        };
+      }
+      if (done) break;
+
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        cancelReader('body-too-large');
+        return { status: 'error', reason: 'body-too-large' };
+      }
+      chunks.push(value);
+    }
+
+    if (aborted) {
+      return {
+        status: 'error',
+        reason: errorName(signal.reason, 'body-read-failed'),
+      };
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { status: 'ok', text: new TextDecoder().decode(bytes) };
+  } catch (error) {
+    cancelReader(error);
+    return {
+      status: 'error',
+      reason: signal.aborted ? errorName(signal.reason, 'body-read-failed') : 'body-read-failed',
+    };
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    try {
+      reader.releaseLock();
+    } catch {
+      // A platform may still be settling cancellation; there is nothing else to do.
+    }
+  }
+}
+
 /**
  * One conditional GET against `GET {base}/api/v1/jsonld/{url}`.
  *
@@ -43,33 +169,51 @@ export async function fetchJsonLd(
   if (etag) headers['If-None-Match'] = etag;
 
   let response: Response;
+  let signal: AbortSignal;
   try {
+    signal = AbortSignal.timeout(config.timeoutMs);
     response = await fetchImpl(endpoint, {
       method: 'GET',
       headers,
-      signal: AbortSignal.timeout(config.timeoutMs),
+      signal,
     });
   } catch (error) {
     return { status: 'error', reason: error instanceof Error ? error.name : 'fetch-failed' };
   }
 
-  if (response.status === 304) return { status: 'not-modified' };
-  if (response.status === 404) return { status: 'not-found' };
+  if (response.status === 304) {
+    cancelResponseBody(response, 'not-modified');
+    return { status: 'not-modified' };
+  }
+  if (response.status === 404) {
+    cancelResponseBody(response, 'not-found');
+    return { status: 'not-found' };
+  }
   if (response.status === 429) {
+    const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after'));
+    cancelResponseBody(response, 'rate-limited');
     return {
       status: 'rate-limited',
-      retryAfterSeconds: parseRetryAfter(response.headers.get('retry-after')),
+      retryAfterSeconds,
     };
   }
-  if (!response.ok) return { status: 'error', reason: `http-${response.status}` };
+  if (!response.ok) {
+    cancelResponseBody(response, `http-${response.status}`);
+    return { status: 'error', reason: `http-${response.status}` };
+  }
 
+  let body: BodyReadResult;
   try {
-    const jsonldRaw = await response.text();
-    if (jsonldRaw.trim() === '') return { status: 'error', reason: 'empty-body' };
-    return { status: 'ok', jsonldRaw, etag: response.headers.get('etag') };
+    body = await readJsonLdBody(response, config.maxJsonLdBytes, signal);
   } catch {
+    // A non-standard/locked response stream may throw while acquiring its
+    // reader. Direct client callers receive the same fail-open result as the
+    // orchestrator instead of an escaping rejection.
     return { status: 'error', reason: 'body-read-failed' };
   }
+  if (body.status === 'error') return body;
+  if (body.text.trim() === '') return { status: 'error', reason: 'empty-body' };
+  return { status: 'ok', jsonldRaw: body.text, etag: response.headers.get('etag') };
 }
 
 /**
@@ -90,7 +234,9 @@ export async function registerJsonLd(config: InjectorConfig, pageUrl: string): P
       body: JSON.stringify({ url: pageUrl }),
       signal: AbortSignal.timeout(config.timeoutMs),
     });
-    return response.status === 201 || response.status === 200 || response.status === 202;
+    const accepted = response.status === 201 || response.status === 200 || response.status === 202;
+    cancelResponseBody(response, accepted ? 'body-unused' : `http-${response.status}`);
+    return accepted;
   } catch {
     return false;
   }

@@ -60,6 +60,8 @@ function isCacheEntry(value: unknown): value is CacheEntry {
     (typeof candidate['jsonldRaw'] === 'string' || candidate['jsonldRaw'] === null) &&
     (typeof candidate['etag'] === 'string' || candidate['etag'] === null) &&
     typeof candidate['storedAt'] === 'number' &&
+    (candidate['registrationPending'] === undefined ||
+      typeof candidate['registrationPending'] === 'boolean') &&
     (candidate['retryNotBefore'] === undefined || typeof candidate['retryNotBefore'] === 'number')
   );
 }

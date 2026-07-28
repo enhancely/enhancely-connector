@@ -35,7 +35,7 @@ Node version: 22.22.0 (see `.nvmrc`). Package manager: pnpm (pinned via `package
 
 1. **API key never client-side.** `sk-…` / `sk-org-…` keys stay on the edge/server. Nothing that could leak the key may reach the browser.
 2. **Send a URL to Enhancely, never a locally computed hash.** Specifically the query-stripped `normalizeLite(url)` (= the cache key): the server strips the query anyway so the resolved record is identical, but query strings (tokens/PII) never leave the edge. The server still hashes authoritatively.
-3. **Fail-open everywhere.** Any error, timeout, missing `</head>`, non-HTML, or non-2xx origin response → serve the original HTML untouched. Every Enhancely call uses `AbortSignal.timeout` (default 800 ms).
+3. **Fail-open everywhere.** Any error, timeout, oversized JSON-LD body, missing `</head>`, non-HTML, or non-2xx origin response → serve the original HTML untouched. Every Enhancely call uses `AbortSignal.timeout` (default 800 ms). JSON-LD bodies are streamed with a 256 KiB hard ceiling.
 4. **Own cache + ETag revalidation is mandatory.** The API responds `Cache-Control: no-store`; the connector brings its own cache and revalidates with `If-None-Match` → 304.
 5. **Inject only into `text/html` responses with 2xx status.** Everything else passes through untouched.
 6. **`normalizeLite` (4 rules: force https, strip query, strip fragment, strip single trailing slash) is both the cache key AND the URL sent to Enhancely.** It MUST stay byte-for-byte identical to the server's `normalizeUrl` — since the connector sends the normalized URL, a divergence would now serve the wrong record (a correctness bug), not merely a cache miss. Today they are the exact same code; keep them in lockstep.
@@ -48,7 +48,7 @@ Node version: 22.22.0 (see `.nvmrc`). Package manager: pnpm (pinned via `package
 - Auth required: `Authorization: Bearer <sk-… | sk-org-…>`.
 - `Accept: application/ld+json` — the server does an **EXACT string match** on this header. Response body is the raw, already script-safe-escaped JSON-LD string (`<` pre-escaped as a unicode escape). It goes **verbatim** into `<script type="application/ld+json">…</script>` — never re-serialize or re-escape it.
 - `Cache-Control: no-store`, but ETag + `If-None-Match` (304) are supported for cheap revalidation.
-- `404` = record missing; `429` = org rate limit (`Retry-After` header). Both → fail-open, serve original HTML. The core additionally records a short retry backoff in its cache after a `429`/error (`Retry-After` capped at 60 s; 10 s default) so page views don't hammer a rate-limited or down API.
+- `404` = record missing; `429` = org rate limit (`Retry-After` header). Both → fail-open, serve original HTML. For public, non-credentialed requests the Lambda@Edge adapter caps an uninjected response's shared-cache TTL at the next core/config retry and strips origin validators, so CloudFront cannot pin a 404, rate limit, timeout, or missing-key cooldown for its longer default TTL. The core additionally records a short retry backoff after a `429`/error (`Retry-After` capped at 60 s; 10 s default) so page views don't hammer a rate-limited or down API.
 
 ## Doc maintenance
 

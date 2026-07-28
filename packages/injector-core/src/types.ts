@@ -17,6 +17,11 @@ export interface InjectorConfig {
   timeoutMs: number;
   /** How long a cache entry (positive or negative) is considered fresh. */
   cacheTtlMs: number;
+  /**
+   * Maximum UTF-8 byte length accepted from a successful JSON-LD response.
+   * The body is streamed and cancelled as soon as this limit is exceeded.
+   */
+  maxJsonLdBytes: number;
   /** Only supported position today; kept in config for forward compatibility. */
   injectPosition: 'before-head-close';
   /**
@@ -44,6 +49,13 @@ export interface CacheEntry {
   etag: string | null;
   storedAt: number;
   /**
+   * True when this negative entry came from a 404 while auto-registration was
+   * enabled. Adapters can use this signal to cap downstream cache lifetime so
+   * a generated record is discovered after the core TTL instead of leaving an
+   * uninjected page in a CDN cache for its much longer default TTL.
+   */
+  registrationPending?: boolean;
+  /**
    * Backoff memo (epoch ms), set after a 429 or an upstream error/timeout.
    * While `Date.now() < retryNotBefore` the orchestrator answers from this
    * entry (stale positive → snippet, negative → nothing) WITHOUT calling
@@ -52,6 +64,18 @@ export interface CacheEntry {
    * next successful 200/304/404. Absent on healthy entries.
    */
   retryNotBefore?: number;
+}
+
+/** Rich lookup result for adapters that also manage a downstream page cache. */
+export interface JsonLdLookupResult {
+  /** Ready-to-inject script tag, or null when the page stays untouched. */
+  snippet: string | null;
+  /**
+   * Milliseconds until a currently missing/transiently unavailable record
+   * should be looked up again. Downstream caches should not retain the
+   * uninjected representation beyond this delay. Null for positive entries.
+   */
+  revalidateInMs: number | null;
 }
 
 /** Pluggable cache. Implementations: MemoryCache (core), KV (Cloudflare adapter), … */

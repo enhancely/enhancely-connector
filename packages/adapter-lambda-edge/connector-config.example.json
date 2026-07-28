@@ -3,6 +3,7 @@
   "enhancelyBase": "https://app.enhancely.ai",
   "timeoutMs": 800,
   "cacheTtlMs": 300000,
+  "autoRegister": false,
   "originTimeoutMs": 2000,
   "ssmParameterName": "/enhancely/connector/api-key",
   "ssmRegion": "us-east-1",

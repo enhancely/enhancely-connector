@@ -14,13 +14,13 @@ immediately before `</head>`. If anything goes wrong — timeout, missing record
 
 ## Packages
 
-| Package                                                           | Status                                                                                                                                                                                                                            |
-| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/injector-core` (`@enhancely/injector-core`)             | **Implemented + tested.** Shared core: API client, cache + ETag revalidation, HTML injection, fail-open orchestration.                                                                                                            |
-| `packages/adapter-cloudflare` (`@enhancely/adapter-cloudflare`)   | **Reference adapter.** Cloudflare Worker wrapping the core.                                                                                                                                                                       |
-| `packages/adapter-lambda-edge` (`@enhancely/adapter-lambda-edge`) | **Implemented + tested.** CloudFront Lambda@Edge (origin-response) adapter — cannot read the origin body, so it re-fetches the page from the origin (one extra roundtrip per CloudFront cache miss); key via baked config or SSM. |
-| `packages/adapter-sidecar` (`@enhancely/adapter-sidecar`)         | **Functional skeleton.** Node HTTP reverse proxy for nginx/apache setups.                                                                                                                                                         |
-| `packages/adapter-sidecar-go`                                     | **Reserved.** Planned Go single-binary distribution of the sidecar.                                                                                                                                                               |
+| Package                                                           | Status                                                                                                                                                                                                                                                                                                                |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/injector-core` (`@enhancely/injector-core`)             | **Implemented + tested.** Shared core: API client, cache + ETag revalidation, HTML injection, fail-open orchestration.                                                                                                                                                                                                |
+| `packages/adapter-cloudflare` (`@enhancely/adapter-cloudflare`)   | **Reference adapter.** Cloudflare Worker wrapping the core.                                                                                                                                                                                                                                                           |
+| `packages/adapter-lambda-edge` (`@enhancely/adapter-lambda-edge`) | **Implemented + tested.** CloudFront Lambda@Edge (origin-response) adapter — cannot read the origin body, so it re-fetches the page from the origin (one extra roundtrip per CloudFront cache miss), synchronizes replacement metadata, and fails open on CloudFront body/header quotas; key via baked config or SSM. |
+| `packages/adapter-sidecar` (`@enhancely/adapter-sidecar`)         | **Functional skeleton.** Node HTTP reverse proxy for nginx/apache setups.                                                                                                                                                                                                                                             |
+| `packages/adapter-sidecar-go`                                     | **Reserved.** Planned Go single-binary distribution of the sidecar.                                                                                                                                                                                                                                                   |
 
 All adapters are thin wrappers — connector logic lives exclusively in `injector-core`.
 
@@ -55,6 +55,8 @@ The API key is a secret — it must never be exposed client-side or committed. `
 | `ENHANCELY_BASE`    | `https://app.enhancely.ai` | **TODO: confirm** final production API base URL.                        |
 | `timeoutMs`         | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call.              |
 | `cacheTtlMs`        | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry. |
+| `maxJsonLdBytes`    | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                 |
+| `autoRegister`      | `false`                    | Register unknown pages after a 404; adapters still fail open.           |
 
 ## Documentation
 
@@ -68,7 +70,7 @@ see [`infra/modules/lambda-edge-injector/`](infra/modules/lambda-edge-injector/)
 
 ```hcl
 module "enhancely_injector" {
-  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.2.0"
+  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.5.0"
   providers = { aws = aws.us_east_1 }
   auto_register = true
 }
