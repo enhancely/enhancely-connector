@@ -198,26 +198,59 @@ function buildScriptTag(jsonldRaw) {
   return `<script type="application/ld+json">${safe}</script>`;
 }
 var RAW_TEXT_ELEMENTS = ["script", "style", "title", "textarea", "noscript"];
-var SCAN_TOKEN = new RegExp(["<!--", "-->", ...RAW_TEXT_ELEMENTS.flatMap((t) => [`<${t}\\b`, `</${t}\\s*>`]), "</head\\s*>"].join("|").replace(/[/]/g, "\\/"), "gi");
+var HEAD_CLOSE = /^<\/head\s*>/i;
+function endOfTag(html, start) {
+  let quote = "";
+  for (let i = start + 1; i < html.length; i++) {
+    const c = html[i];
+    if (quote !== "") {
+      if (c === quote)
+        quote = "";
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (c === ">") {
+      return i + 1;
+    }
+  }
+  return -1;
+}
 function findHeadCloseIndex(html) {
-  let inRawText = null;
-  let inComment = false;
-  for (const match of html.matchAll(SCAN_TOKEN)) {
-    const token = match[0].toLowerCase();
-    if (inComment) {
-      if (token === "-->")
-        inComment = false;
-    } else if (inRawText !== null) {
-      if (token.startsWith(`</${inRawText}`))
-        inRawText = null;
-    } else if (token === "<!--") {
-      inComment = true;
-    } else if (token.startsWith("</head")) {
-      return match.index ?? -1;
-    } else if (!token.startsWith("</")) {
-      const open = RAW_TEXT_ELEMENTS.find((t) => token === `<${t}`);
-      if (open !== void 0)
-        inRawText = open;
+  const lower = html.toLowerCase();
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf("<", i);
+    if (lt < 0)
+      return -1;
+    if (lower.startsWith("<!--", lt)) {
+      const end = html.indexOf("-->", lt + 4);
+      if (end < 0)
+        return -1;
+      i = end + 3;
+      continue;
+    }
+    if (HEAD_CLOSE.test(html.slice(lt, lt + 32)))
+      return lt;
+    let raw = null;
+    for (const t of RAW_TEXT_ELEMENTS) {
+      if (lower.startsWith(`<${t}`, lt)) {
+        const after = html[lt + 1 + t.length];
+        if (after === void 0 || /[\s/>]/.test(after)) {
+          raw = t;
+          break;
+        }
+      }
+    }
+    const tagEnd = endOfTag(html, lt);
+    if (tagEnd < 0)
+      return -1;
+    if (raw !== null) {
+      const close = lower.indexOf(`</${raw}`, tagEnd);
+      if (close < 0)
+        return -1;
+      const gt = html.indexOf(">", close);
+      i = gt < 0 ? html.length : gt + 1;
+    } else {
+      i = tagEnd;
     }
   }
   return -1;
@@ -275,7 +308,7 @@ async function getJsonLdSnippet(url, cache2, config) {
       case "rate-limited":
       case "error": {
         const backoffMs = result.status === "rate-limited" && result.retryAfterSeconds !== null ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1e3, MAX_RETRY_BACKOFF_MS) : DEFAULT_RETRY_BACKOFF_MS;
-        const memo2 = {
+        const memo = {
           jsonldRaw: cached?.jsonldRaw ?? null,
           etag: cached?.etag ?? null,
           // No previous entry → storedAt 0 keeps the memo permanently stale,
@@ -287,7 +320,7 @@ async function getJsonLdSnippet(url, cache2, config) {
           const current = await cache2.get(key);
           const unchanged = (current?.storedAt ?? null) === (cached?.storedAt ?? null) && (current?.etag ?? null) === (cached?.etag ?? null);
           if (unchanged) {
-            await cache2.set(key, memo2);
+            await cache2.set(key, memo);
           }
         } catch {
         }
@@ -307,7 +340,10 @@ var DEFAULT_SSM_REGION = "us-east-1";
 var CONFIG_FILE_NAME = "connector-config.json";
 var DEFAULT_ORIGIN_TIMEOUT_MS = 2e3;
 var DEFAULT_SSM_TIMEOUT_MS = 2e3;
-var memo = null;
+var resolvedConfig = null;
+var negativeUntil = 0;
+var inflight = null;
+var NEGATIVE_TTL_MS = 3e4;
 var resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
 var bakedOverride;
 var configOverrides = null;
@@ -415,8 +451,19 @@ async function resolveOnce() {
   }
 }
 function resolveAdapterConfig() {
-  memo ??= resolveOnce();
-  return memo;
+  if (resolvedConfig !== null) return Promise.resolve(resolvedConfig);
+  if (Date.now() < negativeUntil) return Promise.resolve(null);
+  if (inflight !== null) return inflight;
+  inflight = resolveOnce().then((result) => {
+    inflight = null;
+    if (result !== null) {
+      resolvedConfig = result;
+    } else {
+      negativeUntil = Date.now() + NEGATIVE_TTL_MS;
+    }
+    return result;
+  });
+  return inflight;
 }
 function getOriginTimeoutMs() {
   return resolvedOriginTimeoutMs;
@@ -425,6 +472,10 @@ function getOriginTimeoutMs() {
 // src/origin-fetch.ts
 var http = __toESM(require("node:http"), 1);
 var https = __toESM(require("node:https"), 1);
+function firstHeaderValue(value) {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
 function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(originUrl);
@@ -457,6 +508,10 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
         const contentEncoding = response.headers["content-encoding"] ?? null;
         const cacheControl = response.headers["cache-control"] ?? null;
         const hasSetCookie = response.headers["set-cookie"] !== void 0;
+        const csp = firstHeaderValue(response.headers["content-security-policy"]);
+        const cspReportOnly = firstHeaderValue(
+          response.headers["content-security-policy-report-only"]
+        );
         const chunks = [];
         let size = 0;
         let settled = false;
@@ -471,6 +526,8 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
               contentEncoding,
               cacheControl,
               hasSetCookie,
+              contentSecurityPolicy: csp,
+              contentSecurityPolicyReportOnly: cspReportOnly,
               body: Buffer.alloc(0),
               truncated: true
             });
@@ -488,6 +545,8 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
             contentEncoding,
             cacheControl,
             hasSetCookie,
+            contentSecurityPolicy: csp,
+            contentSecurityPolicyReportOnly: cspReportOnly,
             body: Buffer.concat(chunks),
             truncated: false
           });
@@ -525,7 +584,7 @@ function charsetOf(contentType) {
   return match?.[1]?.toLowerCase() ?? null;
 }
 var PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
-function shouldAttempt(input) {
+function shouldAttempt(input, ignoreContentEncoding = false) {
   if (input.method !== "GET") return false;
   if (input.status !== "200") return false;
   const contentType = input.contentType ?? "";
@@ -537,6 +596,7 @@ function shouldAttempt(input) {
   if (input.cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(input.cacheControl)) {
     return false;
   }
+  if (ignoreContentEncoding) return true;
   return input.contentEncoding === null;
 }
 function buildPageUrl(host, uri, querystring) {
@@ -591,14 +651,18 @@ var handler = async (event) => {
   }
   const { request, response } = record.cf;
   try {
-    if (!shouldAttempt({
-      method: request.method,
-      status: response.status,
-      contentType: headerValue(response.headers, "content-type"),
-      contentEncoding: headerValue(response.headers, "content-encoding"),
-      cacheControl: headerValue(response.headers, "cache-control"),
-      hasSetCookie: response.headers["set-cookie"] !== void 0
-    })) {
+    if (!shouldAttempt(
+      {
+        method: request.method,
+        status: response.status,
+        contentType: headerValue(response.headers, "content-type"),
+        contentEncoding: headerValue(response.headers, "content-encoding"),
+        cacheControl: headerValue(response.headers, "cache-control"),
+        hasSetCookie: response.headers["set-cookie"] !== void 0
+      },
+      // Ignore the first response's content-encoding — we re-fetch identity.
+      true
+    )) {
       return response;
     }
     const config = await resolveAdapterConfig();
@@ -637,12 +701,26 @@ var handler = async (event) => {
     if (injected === originalHtml) return response;
     const headers = { ...response.headers };
     delete headers["content-length"];
+    delete headers["content-encoding"];
     delete headers["etag"];
     delete headers["last-modified"];
     delete headers["content-md5"];
     delete headers["digest"];
     delete headers["content-digest"];
     delete headers["repr-digest"];
+    if (origin.contentSecurityPolicy !== null) {
+      headers["content-security-policy"] = [
+        { key: "Content-Security-Policy", value: origin.contentSecurityPolicy }
+      ];
+    }
+    if (origin.contentSecurityPolicyReportOnly !== null) {
+      headers["content-security-policy-report-only"] = [
+        {
+          key: "Content-Security-Policy-Report-Only",
+          value: origin.contentSecurityPolicyReportOnly
+        }
+      ];
+    }
     const bodyBudgetBytes = MAX_GENERATED_RESPONSE_BYTES - serializedHeaderBytes(headers) - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
     if (Buffer.byteLength(injected, "utf8") > bodyBudgetBytes) return response;
     const result = {
