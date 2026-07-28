@@ -954,7 +954,14 @@ describe('handler — fail-open on the re-fetch path', () => {
 
   it('Enhancely has no record (404) → no body replacement and a bounded retry TTL', async () => {
     enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
-    const event = eventFor('/page');
+    // The origin declares an explicit (long) shared-cache lifetime, so the
+    // retry TTL is free to SHORTEN it to the bounded retry window.
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
     const result = await invoke(event);
 
     expect(result).not.toBe(event.Records[0]?.cf.response);
@@ -964,7 +971,12 @@ describe('handler — fail-open on the re-fetch path', () => {
 
   it('Enhancely fetch rejects → no body replacement and the core backoff TTL', async () => {
     enhancelyFetch.mockRejectedValueOnce(new Error('ECONNRESET'));
-    const event = eventFor('/page');
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
     const result = await invoke(event);
 
     expect(result).not.toBe(event.Records[0]?.cf.response);
@@ -976,7 +988,12 @@ describe('handler — fail-open on the re-fetch path', () => {
 describe('handler — Enhancely-first reorder (no snippet ⇒ no origin re-fetch)', () => {
   it('404 from Enhancely (no snippet) → ZERO origin re-fetch, bounded cache TTL', async () => {
     enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
-    const event = eventFor('/page');
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
     const result = await invoke(event);
 
     expect(enhancelyFetch).toHaveBeenCalledTimes(1);
@@ -990,7 +1007,12 @@ describe('handler — Enhancely-first reorder (no snippet ⇒ no origin re-fetch
     enhancelyFetch.mockResolvedValueOnce(
       new Response(null, { status: 429, headers: { 'retry-after': '30' } })
     );
-    const event = eventFor('/page');
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
     const result = await invoke(event);
 
     expect(enhancelyFetch).toHaveBeenCalledTimes(1);
@@ -1159,6 +1181,64 @@ describe('handler — pending auto-registration cache policy', () => {
     expect(enhancelyFetch).toHaveBeenCalledTimes(2);
     expect(originHits).toBe(0);
   });
+
+  it('origin declared NO cache lifetime → response returned UNCHANGED (never made cacheable)', async () => {
+    // Invariant: with no explicit origin lifetime (no Cache-Control freshness,
+    // no Expires) the response's cacheability is the distribution's DefaultTTL,
+    // which the adapter cannot see. Introducing an s-maxage here could make an
+    // origin-uncacheable response (DefaultTTL=0) shared-cacheable — the opposite
+    // of "never make a response more cacheable than it already was". So the
+    // pass-through is byte-for-byte the original, with Cache-Control untouched.
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const event = eventFor('/no-lifetime-miss', {
+      responseHeaders: { 'content-type': 'text/html; charset=utf-8' },
+    });
+    const result = await invoke(event);
+
+    // Same object back, no injected shared-cache directive introduced.
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.headers?.['cache-control']).toBeUndefined();
+    // The lookup still ran (GET + registration POST); the origin was not re-fetched.
+    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(originHits).toBe(0);
+  });
+
+  it('a long explicit max-age is still CAPPED (shortened) to the retry window', async () => {
+    // Counterpart to the invariant above: when the origin DOES declare a
+    // lifetime, the retry TTL shortens (never lengthens) it. A 3600 s origin
+    // max-age is capped to the ~20 s retry window.
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const event = eventFor('/long-lifetime-miss', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
+    const result = await invoke(event);
+
+    const policy = result?.headers?.['cache-control']?.[0]?.value ?? '';
+    expect(policy).toMatch(/^max-age=0, s-maxage=\d+, must-revalidate$/);
+    const ttl = Number(/s-maxage=(\d+)/.exec(policy)?.[1]);
+    expect(ttl).toBeGreaterThanOrEqual(19);
+    expect(ttl).toBeLessThanOrEqual(20); // shortened from 3600 to the retry window
+    expect(originHits).toBe(0);
+  });
 });
 
 describe('handler — placeholder key guard (no re-fetch when key not configured)', () => {
@@ -1167,7 +1247,12 @@ describe('handler — placeholder key guard (no re-fetch when key not configured
     // Overwrite the beforeEach sk-test key with the SSM placeholder value.
     __setBakedConfigForTests({ apiKey: 'REPLACE_ME' });
 
-    const event = eventFor('/page');
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
     const result = await invoke(event);
 
     expect(result).not.toBe(event.Records[0]?.cf.response);
@@ -1185,7 +1270,12 @@ describe('handler — config failures', () => {
     __setBakedConfigForTests({}); // no apiKey; mocked SSM has no usable client
     __setConfigOverridesForTests(null);
 
-    const event = eventFor('/page');
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
     const result = await invoke(event);
 
     expect(result).not.toBe(event.Records[0]?.cf.response);
@@ -1194,7 +1284,12 @@ describe('handler — config failures', () => {
     expect(consoleError).toHaveBeenCalledTimes(1);
 
     // Second invocation: inside the 30-second cooldown → no retry or second log.
-    const secondEvent = eventFor('/page');
+    const secondEvent = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=3600',
+      },
+    });
     const again = await invoke(secondEvent);
     expect(again).not.toBe(secondEvent.Records[0]?.cf.response);
     expect(again?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=30');
