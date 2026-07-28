@@ -12,6 +12,7 @@ export type {
   InjectorConfigInput,
   CacheEntry,
   CacheBackend,
+  JsonLdLookupResult,
   JsonLdFetchResult,
   HtmlContext,
 } from './types.js';
@@ -20,13 +21,20 @@ export {
   DEFAULT_ENHANCELY_BASE,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_CACHE_TTL_MS,
+  DEFAULT_MAX_JSONLD_BYTES,
 } from './config.js';
 export { normalizeLite } from './normalize.js';
 export { MemoryCache, isFresh } from './cache.js';
 export { fetchJsonLd, registerJsonLd, parseRetryAfter } from './client.js';
 export { buildScriptTag, injectIntoHead } from './inject.js';
 
-import type { CacheBackend, CacheEntry, HtmlContext, InjectorConfig } from './types.js';
+import type {
+  CacheBackend,
+  CacheEntry,
+  HtmlContext,
+  InjectorConfig,
+  JsonLdLookupResult,
+} from './types.js';
 import { normalizeLite } from './normalize.js';
 import { isFresh } from './cache.js';
 import { fetchJsonLd, registerJsonLd } from './client.js';
@@ -35,6 +43,31 @@ import { buildScriptTag, injectIntoHead } from './inject.js';
 /** Positive entry → script tag, negative entry (404 memo) → null. */
 function snippetFromEntry(entry: CacheEntry): string | null {
   return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw) : null;
+}
+
+/**
+ * Turn a cache entry into the adapter-facing lookup result.
+ *
+ * A negative entry becomes meaningful again at the later of its normal TTL
+ * (for a stored 404) and any temporary upstream backoff. Clamp to one
+ * millisecond so adapters never accidentally emit a zero-second downstream
+ * TTL because the clock advanced between lookup and header construction.
+ */
+function lookupFromEntry(
+  entry: CacheEntry,
+  cacheTtlMs: number,
+  now: number = Date.now()
+): JsonLdLookupResult {
+  if (entry.jsonldRaw !== null) {
+    return { snippet: snippetFromEntry(entry), revalidateInMs: null };
+  }
+
+  const cacheExpiry = entry.storedAt > 0 ? entry.storedAt + cacheTtlMs : 0;
+  const nextLookupAt = Math.max(cacheExpiry, entry.retryNotBefore ?? 0);
+  return {
+    snippet: null,
+    revalidateInMs: Math.max(1, nextLookupAt - now),
+  };
 }
 
 /**
@@ -54,7 +87,8 @@ const MAX_RETRY_BACKOFF_MS = 60_000;
 
 /**
  * Resolve the ready-to-inject `<script type="application/ld+json">…</script>`
- * snippet for a page URL, or null when nothing should be injected.
+ * snippet for a page URL plus an optional retryable-miss revalidation delay
+ * for adapters that manage a downstream page cache.
  *
  * - Fresh cache entry → answered locally (positive → snippet, negative → null).
  * - Entry carrying a retry backoff memo (previous 429/error) that has not
@@ -74,22 +108,22 @@ const MAX_RETRY_BACKOFF_MS = 60_000;
  *
  * Never throws.
  */
-export async function getJsonLdSnippet(
+export async function getJsonLdLookup(
   url: string,
   cache: CacheBackend,
   config: InjectorConfig
-): Promise<string | null> {
+): Promise<JsonLdLookupResult> {
   try {
     const key = normalizeLite(url);
     const cached = await cache.get(key);
 
     if (cached && isFresh(cached, config.cacheTtlMs)) {
-      return snippetFromEntry(cached);
+      return lookupFromEntry(cached, config.cacheTtlMs);
     }
 
     // Backoff memo from a previous 429/error: answer locally, no upstream call.
     if (cached?.retryNotBefore !== undefined && Date.now() < cached.retryNotBefore) {
-      return snippetFromEntry(cached);
+      return lookupFromEntry(cached, config.cacheTtlMs);
     }
 
     // Send the query-stripped URL (= the cache key), NOT the raw request URL.
@@ -107,20 +141,22 @@ export async function getJsonLdSnippet(
           etag: result.etag,
           storedAt: Date.now(),
         });
-        return buildScriptTag(result.jsonldRaw);
+        return { snippet: buildScriptTag(result.jsonldRaw), revalidateInMs: null };
       }
       case 'not-modified': {
         // 304 without a cached entry should be impossible (we only send
         // If-None-Match when we hold one) — treat it like an error: nothing
         // to serve, nothing to store. Rebuilding the entry (instead of
         // spreading) drops any leftover retryNotBefore memo.
-        if (!cached) return null;
-        await cache.set(key, {
+        if (!cached) return { snippet: null, revalidateInMs: null };
+        const refreshed: CacheEntry = {
           jsonldRaw: cached.jsonldRaw,
           etag: cached.etag,
           storedAt: Date.now(),
-        });
-        return snippetFromEntry(cached);
+          ...(cached.registrationPending === true && { registrationPending: true }),
+        };
+        await cache.set(key, refreshed);
+        return lookupFromEntry(refreshed, config.cacheTtlMs);
       }
       case 'not-found': {
         // Auto-registration: the page is really being served (adapters gate on
@@ -133,8 +169,14 @@ export async function getJsonLdSnippet(
           // no query string is ever POSTed to the third party.
           await registerJsonLd(config, key);
         }
-        await cache.set(key, { jsonldRaw: null, etag: null, storedAt: Date.now() });
-        return null;
+        const negative: CacheEntry = {
+          jsonldRaw: null,
+          etag: null,
+          storedAt: Date.now(),
+          ...(config.autoRegister && { registrationPending: true }),
+        };
+        await cache.set(key, negative);
+        return lookupFromEntry(negative, config.cacheTtlMs);
       }
       case 'rate-limited':
       case 'error': {
@@ -151,6 +193,7 @@ export async function getJsonLdSnippet(
           // No previous entry → storedAt 0 keeps the memo permanently stale,
           // so it only suppresses retries until retryNotBefore, nothing more.
           storedAt: cached?.storedAt ?? 0,
+          ...(cached?.registrationPending === true && { registrationPending: true }),
           retryNotBefore: Date.now() + backoffMs,
         };
         try {
@@ -168,12 +211,24 @@ export async function getJsonLdSnippet(
         } catch {
           // The memo is best-effort; serving stale must not depend on it.
         }
-        return cached ? snippetFromEntry(cached) : null;
+        return lookupFromEntry(memo, config.cacheTtlMs);
       }
     }
   } catch {
-    return null;
+    return { snippet: null, revalidateInMs: null };
   }
+}
+
+/**
+ * Backwards-compatible snippet-only API for adapters that do not manage a
+ * downstream page cache.
+ */
+export async function getJsonLdSnippet(
+  url: string,
+  cache: CacheBackend,
+  config: InjectorConfig
+): Promise<string | null> {
+  return (await getJsonLdLookup(url, cache, config)).snippet;
 }
 
 /**

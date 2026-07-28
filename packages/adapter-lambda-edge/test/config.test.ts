@@ -8,6 +8,7 @@ import {
   DEFAULT_SSM_REGION,
   __resetAdapterConfigForTests,
   __setBakedConfigForTests,
+  getConfigRetryInMs,
   getOriginTimeoutMs,
   resolveAdapterConfig,
 } from '../src/config.js';
@@ -115,7 +116,7 @@ describe('resolveAdapterConfig — SSM', () => {
     expect(ssm.clientConfigs[0]?.region).toBe('eu-west-1');
   });
 
-  it('a hung GetParameter is aborted after ssmTimeoutMs → memoized null (pass-through)', async () => {
+  it('a hung GetParameter is aborted after ssmTimeoutMs → cooldown null (pass-through)', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     // A send that NEVER settles on its own — only the abort signal ends it.
     ssm.send.mockImplementation(
@@ -129,7 +130,7 @@ describe('resolveAdapterConfig — SSM', () => {
     __setBakedConfigForTests({ ssmTimeoutMs: 50 });
 
     expect(await resolveAdapterConfig()).toBeNull();
-    expect(await resolveAdapterConfig()).toBeNull(); // memoized, no second hang
+    expect(await resolveAdapterConfig()).toBeNull(); // cooldown, no immediate second hang
     expect(ssm.send).toHaveBeenCalledTimes(1);
     expect(consoleError).toHaveBeenCalledTimes(1);
   });
@@ -171,10 +172,11 @@ describe('resolveAdapterConfig — no key resolvable', () => {
     __setBakedConfigForTests(null);
 
     expect(await resolveAdapterConfig()).toBeNull();
-    expect(await resolveAdapterConfig()).toBeNull(); // memoized — no retry, no re-log
+    expect(await resolveAdapterConfig()).toBeNull(); // cooldown — no immediate retry or re-log
 
     expect(ssm.send).toHaveBeenCalledTimes(1);
     expect(consoleError).toHaveBeenCalledTimes(1);
+    expect(consoleError.mock.calls[0]?.[0]).toContain('30 seconds');
   });
 
   it('returns null when the SSM parameter exists but is empty', async () => {
@@ -200,6 +202,7 @@ describe('resolveAdapterConfig — negative-result cooldown (failure not cached 
     // First resolution fails → null, exactly one SSM call.
     expect(await resolveAdapterConfig()).toBeNull();
     expect(ssm.send).toHaveBeenCalledTimes(1);
+    expect(getConfigRetryInMs()).toBe(30_000);
 
     // Second immediate call: inside the cooldown → still null, NO new SSM call.
     expect(await resolveAdapterConfig()).toBeNull();
@@ -210,6 +213,7 @@ describe('resolveAdapterConfig — negative-result cooldown (failure not cached 
     vi.advanceTimersByTime(30_001);
     const config = await resolveAdapterConfig();
     expect(config?.apiKey).toBe('sk-later');
+    expect(getConfigRetryInMs()).toBeNull();
     expect(ssm.send).toHaveBeenCalledTimes(2);
 
     // The now-successful config is memoized: no further SSM reads.

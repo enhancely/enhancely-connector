@@ -16,19 +16,20 @@ viewer ──> CloudFront ──(cache miss)──> origin
                 │<───── origin response ───┘   status + headers ONLY
                 │
                 ├─ origin-response trigger: this handler
-                │    1. gate: GET + status "200" + text/html + no
-                │       Content-Encoding + UTF-8-compatible charset +
-                │       no Set-Cookie + no private/no-store Cache-Control
+                │    1. gate: GET + status "200" + text/html +
+                │       UTF-8-compatible charset + no Set-Cookie +
+                │       no private/no-store Cache-Control (the first
+                │       response may be gzip/br; it is not the body used)
                 │    2. resolve config (baked file or SSM, memoized)
-                │    3. RE-FETCH the page from the custom origin
+                │    3. resolve JSON-LD (cache/ETag/Enhancely API)
+                │    4. RE-FETCH the page from the custom origin
                 │       (same URI+query, incoming Host header, ALL other
                 │        origin-request headers forwarded — except
                 │        Accept-Encoding and hop-by-hop headers —
                 │        Accept-Encoding: identity)
-                │    4. handleHtml() from injector-core:
-                │       cache → ETag revalidation → Enhancely API → inject
                 │    5. replace the response body (within the 1 MB
-                │       generated-response quota) — or fail open
+                │       generated-response quota), synchronize its
+                │       representation headers — or fail open
                 │
                 └──> CloudFront caches the INJECTED page ──> viewer
 ```
@@ -57,6 +58,16 @@ injected result). Give HTML behaviors a sensible TTL and the re-fetch cost
 amortizes away. The JSON-LD lookup itself is additionally cached per
 execution environment (core `MemoryCache` + ETag revalidation).
 
+When no snippet is available yet, the page still passes through without an
+origin re-fetch. For public requests without `Authorization` or `Cookie`, the
+adapter marks that response `max-age=0`, caps CloudFront `s-maxage` at the next
+meaningful retry (404 cache TTL, `Retry-After`/error backoff, or config
+cooldown), and removes `ETag`, `Last-Modified`, and `Expires`. It never exceeds
+a shorter origin `max-age`, `s-maxage`, or `Expires`. CloudFront therefore runs
+the origin-response Lambda again when the lookup/config should recover and
+cannot retain the old uninjected body via a 304. Credentialed requests remain
+byte-for-byte pass-through so the adapter never grants shared-cache permission.
+
 **Fail-open invariant:** the whole handler is wrapped in try/catch and always
 returns the original response — config unresolvable, re-fetch error/timeout/
 non-200/redirect, body over the generated-response quota, unexpected charset
@@ -77,17 +88,19 @@ sources are implemented, tried in this order:
    automatically from the package root). Gitignored; start from
    [`connector-config.example.json`](connector-config.example.json).
 2. **SSM Parameter Store** — used when no baked `apiKey` exists. The key is
-   fetched with `GetParameter` (`WithDecryption: true`) and memoized in module
-   scope, so all concurrent invocations of one execution environment share a
-   single SSM call. The call is **bounded** (`AbortSignal.timeout`, default
-   2 s, at most 2 attempts) — a hung SSM resolves to "no key" (pass-through)
-   instead of riding the invocation into a Lambda timeout, which CloudFront
-   would surface as a viewer-facing 502. The SDK is imported dynamically and
-   only when needed (and never bundled — the Lambda Node runtime ships AWS
-   SDK v3).
+   fetched with `GetParameter` (`WithDecryption: true`). Concurrent invocations
+   of one execution environment share a single in-flight call, and a successful
+   result is memoized for that environment. The call is **bounded**
+   (`AbortSignal.timeout`, default 2 s, at most 2 attempts) — a hung SSM resolves
+   to "no key" (pass-through) instead of riding the invocation into a Lambda
+   timeout, which CloudFront would surface as a viewer-facing 502. The SDK is
+   imported dynamically and only when needed (and never bundled — the Lambda
+   Node runtime ships AWS SDK v3).
 
-If neither yields a key, the function logs **one** loud error and passes every
-response through uninjected until the execution environment is recycled.
+If neither source yields a key, the function logs a loud error and passes
+responses through uninjected for a **30-second cooldown**. The next invocation
+after the cooldown retries resolution, so a key created later or a transient
+SSM failure does not strand a warm execution environment.
 
 | `connector-config.json` key | Default                        | Notes                                                             |
 | --------------------------- | ------------------------------ | ----------------------------------------------------------------- |
@@ -95,6 +108,7 @@ response through uninjected until the execution environment is recycled.
 | `enhancelyBase`             | `https://app.enhancely.ai`     | Enhancely API base URL.                                           |
 | `timeoutMs`                 | `800`                          | Enhancely API call timeout (enforced by the core).                |
 | `cacheTtlMs`                | `300000` (5 min)               | JSON-LD cache TTL.                                                |
+| `autoRegister`              | `false`                        | POST unknown pages after 404 and use the pending cache policy.    |
 | `originTimeoutMs`           | `2000`                         | Origin re-fetch timeout (higher than the API timeout on purpose). |
 | `ssmParameterName`          | `/enhancely/connector/api-key` | Only used when `apiKey` is absent.                                |
 | `ssmRegion`                 | `us-east-1`                    | Region of the SSM parameter.                                      |
@@ -124,22 +138,27 @@ to the browser (non-negotiable rule #1 of this repo).
      pass through untouched (fail-open).
   2. Before returning an injected body, the **actual** serialized size of the
      response headers being returned is measured (`serializedHeaderBytes`:
-     name + value + 4 bytes per header, plus a 64-byte status-line margin)
-     and the body must fit `1 MB − actual header bytes − 1 KB safety margin`.
-     A fixed allowance would not be a guarantee — CloudFront permits up to
-     32 KB of headers. Injected HTML over the real budget passes through
+     UTF-8 bytes of name + value + 4 bytes per header, plus the actual
+     status/status-description framing with a 64-byte minimum allowance).
+     The headers must independently fit CloudFront's 32 KB header cap, and the
+     body must fit `1 MB − actual header bytes − 1 KB safety margin`. A fixed
+     allowance would not be a guarantee. Either overage passes through
      untouched.
 - **No environment variables** (hence the two key sources above).
 - **No streaming**: the page is buffered, injected, returned in one piece.
-- **Compressed origin answers pass through**: the re-fetch asks for
-  `Accept-Encoding: identity`; if the origin sends `Content-Encoding` anyway
-  (or the original response carries one), we fail open rather than corrupt.
+- **Compressed first responses are supported**: real viewers commonly cause
+  the original origin response to be gzip/br. The handler re-fetches with
+  `Accept-Encoding: identity` and drops the stale `Content-Encoding` when it
+  generates the replacement. If the _re-fetch_ is nevertheless compressed, it
+  passes through untouched.
 - **Non-UTF-8 charsets pass through** (`iso-8859-1`, `windows-1252`, …) —
   same gate as the sidecar adapter; transcoding is not supported. Pages with
-  **no** charset parameter are additionally verified byte-for-byte: if the
-  UTF-8 decode of the fetched bytes is lossy (e.g. a latin1 page declaring
-  its charset only in `<meta>`), the response passes through instead of
-  caching mojibake.
+  an ASCII header label must contain ASCII bytes only. Pages with **no** charset
+  parameter may contain non-ASCII only when the lossless UTF-8 bytes carry an
+  unambiguous UTF-8 BOM; safely emulating the browser's context-sensitive HTML
+  meta prescan is out of scope, so non-ASCII meta/no-meta pages pass through.
+  Generated HTML is always advertised explicitly as
+  `text/html; charset=utf-8`, so Unicode JSON-LD cannot be mislabeled.
 - **Per-request responses pass through**: `Set-Cookie` on the response, or
   `Cache-Control: private`/`no-store`, marks a representation that a
   re-fetch cannot faithfully reproduce — no injection there.
@@ -154,6 +173,12 @@ to the browser (non-negotiable rule #1 of this repo).
   `Repr-Digest` are deleted for the same reason — they were computed over
   the original bytes and would make verifying clients reject the injected
   body as corrupted.
+- `Cache-Control` and `Expires` must be stable across the first response and
+  re-fetch; a mismatch passes through rather than making the viewer response
+  more cacheable. Enforcing and report-only CSP structure must likewise remain
+  stable, except that per-response nonces and body hashes may rotate. The
+  accepted re-fetch CSP is copied so those values match the generated body;
+  disappearance or any other policy change passes through.
 - Best results when the origin request policy **forwards the viewer `Host`
   header** — it is used both for the re-fetch vhost and for the page URL sent
   to Enhancely. Without it, the origin domain is used instead.
@@ -277,8 +302,10 @@ through the core's `fetchImpl` seam, and mocks `@aws-sdk/client-ssm` to
 verify key resolution order, memoization (one `GetParameter` for concurrent
 cold-start invocations), the bounded-SSM-timeout fallback, and the real
 `connector-config.json` file read (valid, unparsable, junk-typed). Fail-open
-coverage includes the exact generated-size boundaries (origin-fetch cap, the
-header-aware body budget with ~30–32 KB header sets, injection pushing one
-byte over), origin connection errors and re-fetch timeouts, redirects,
-charset/encoding/lossy-decode gates, Set-Cookie / private / no-store gates,
-Enhancely 404s and network errors, and the missing-key pass-through.
+coverage includes the exact generated-size boundaries (origin-fetch cap,
+independent 32 KB header cap, header-aware body budget, injection pushing one
+byte over), CSP/cache-metadata stability, Unicode JSON-LD on genuinely ASCII
+source HTML, ambiguous charset gates, origin connection errors and re-fetch
+timeouts, redirects, Set-Cookie / private / no-store gates, credential-safe
+retry policies, Enhancely 404/rate-limit/network errors, and the missing-key
+pass-through/cooldown.
