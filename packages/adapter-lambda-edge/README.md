@@ -59,14 +59,16 @@ amortizes away. The JSON-LD lookup itself is additionally cached per
 execution environment (core `MemoryCache` + ETag revalidation).
 
 When no snippet is available yet, the page still passes through without an
-origin re-fetch. For public requests without `Authorization` or `Cookie`, the
-adapter marks that response `max-age=0`, caps CloudFront `s-maxage` at the next
-meaningful retry (404 cache TTL, `Retry-After`/error backoff, or config
-cooldown), and removes `ETag`, `Last-Modified`, and `Expires`. It never exceeds
-a shorter origin `max-age`, `s-maxage`, or `Expires`. CloudFront therefore runs
-the origin-response Lambda again when the lookup/config should recover and
-cannot retain the old uninjected body via a 304. Credentialed requests remain
-byte-for-byte pass-through so the adapter never grants shared-cache permission.
+origin re-fetch. For public requests without `Authorization` or `Cookie`, and
+only when the origin declares an explicit cache lifetime (`max-age`,
+`s-maxage`, `Expires`, or `no-cache`), the adapter marks that response
+`max-age=0`, caps CloudFront `s-maxage` at the next meaningful retry (404 cache
+TTL, `Retry-After`/error backoff, or config cooldown), and removes `ETag`,
+`Last-Modified`, and `Expires`. It never exceeds the origin lifetime. When the
+origin declares no lifetime, the response remains byte-for-byte untouched:
+the adapter cannot see the distribution's DefaultTTL and must not accidentally
+turn a DefaultTTL=0 response into a shared-cacheable one. Credentialed requests
+also remain byte-for-byte pass-through.
 
 **Fail-open invariant:** the whole handler is wrapped in try/catch and always
 returns the original response — config unresolvable, re-fetch error/timeout/
@@ -108,7 +110,7 @@ SSM failure does not strand a warm execution environment.
 | `enhancelyBase`             | `https://app.enhancely.ai`     | Enhancely API base URL.                                           |
 | `timeoutMs`                 | `800`                          | Enhancely API call timeout (enforced by the core).                |
 | `cacheTtlMs`                | `300000` (5 min)               | JSON-LD cache TTL.                                                |
-| `autoRegister`              | `false`                        | POST unknown pages after 404 and use the pending cache policy.    |
+| `autoRegister`              | `false`                        | POST unknown pages after 404 and use the normal retry policy.     |
 | `originTimeoutMs`           | `2000`                         | Origin re-fetch timeout (higher than the API timeout on purpose). |
 | `ssmParameterName`          | `/enhancely/connector/api-key` | Only used when `apiKey` is absent.                                |
 | `ssmRegion`                 | `us-east-1`                    | Region of the SSM parameter.                                      |

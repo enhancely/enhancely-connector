@@ -819,9 +819,8 @@ function normalizedCspStructure(policy) {
   }).filter((directive) => directive !== "").join(";");
 }
 function retrySharedTtlSeconds(headers, revalidateInMs) {
-  let ttl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
+  const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
   const policy = cacheControlValue(headers);
-  let hasExplicitLifetime = false;
   if (policy !== null) {
     const directiveNames = policy.split(",").map((directive) => directive.split("=", 1)[0]?.trim().toLowerCase());
     if (directiveNames.includes("no-cache")) {
@@ -829,30 +828,28 @@ function retrySharedTtlSeconds(headers, revalidateInMs) {
     }
     const originTtl = cacheDirectiveSeconds(policy, "s-maxage") ?? cacheDirectiveSeconds(policy, "max-age");
     if (originTtl !== null) {
-      ttl = Math.min(ttl, originTtl);
-      hasExplicitLifetime = true;
+      return Math.min(retryTtl, originTtl);
     }
   }
-  if (!hasExplicitLifetime) {
-    const expires = headerValue(headers, "expires");
-    if (expires !== null) {
-      const expiresAt = Date.parse(expires);
+  const expires = headerValue(headers, "expires");
+  if (expires !== null) {
+    const expiresAt = Date.parse(expires);
+    if (!Number.isNaN(expiresAt)) {
       const responseDate = Date.parse(headerValue(headers, "date") ?? "");
-      if (!Number.isNaN(expiresAt)) {
-        const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
-        ttl = Math.min(ttl, Math.max(0, Math.ceil((expiresAt - reference) / 1e3)));
-      }
+      const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
+      return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1e3)));
     }
   }
-  return ttl;
+  return null;
 }
 function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) {
   if (requestHeaders["authorization"] !== void 0 || requestHeaders["cookie"] !== void 0) {
     return response;
   }
   const originalHeaders = response.headers ?? {};
-  const headers = { ...originalHeaders };
   const sharedTtlSeconds = retrySharedTtlSeconds(originalHeaders, revalidateInMs);
+  if (sharedTtlSeconds === null) return response;
+  const headers = { ...originalHeaders };
   headers["cache-control"] = [
     {
       key: "Cache-Control",
