@@ -57,6 +57,35 @@ function endOfTag(html: string, start: number): number {
 }
 
 /**
+ * Index just past a raw-text element's real end tag, or -1. Matching the tag
+ * name as a mere prefix is not enough: HTML only recognizes it when the next
+ * character is whitespace, `/`, or `>`.
+ */
+function endOfRawTextElement(
+  html: string,
+  lower: string,
+  tag: (typeof RAW_TEXT_ELEMENTS)[number],
+  start: number
+): number {
+  const needle = `</${tag}`;
+  let from = start;
+
+  while (from < html.length) {
+    const close = lower.indexOf(needle, from);
+    if (close < 0) return -1;
+
+    const after = html[close + needle.length];
+    if (after !== undefined && /[\t\n\f\r />]/.test(after)) {
+      return endOfTag(html, close);
+    }
+
+    from = close + needle.length;
+  }
+
+  return -1;
+}
+
+/**
  * Index of the first real `</head>`, or -1. A single left-to-right pass that
  * treats the markup structurally, so a literal `</head>` is ignored when it is
  * inert text: inside an HTML comment, inside a raw-text element
@@ -81,7 +110,7 @@ function findHeadCloseIndex(html: string): number {
     if (HEAD_CLOSE.test(html.slice(lt, lt + 32))) return lt;
 
     // Raw-text element open (`<script`, `<style`, …)? Its end tag terminates it.
-    let raw: string | null = null;
+    let raw: (typeof RAW_TEXT_ELEMENTS)[number] | null = null;
     for (const t of RAW_TEXT_ELEMENTS) {
       if (lower.startsWith(`<${t}`, lt)) {
         const after = html[lt + 1 + t.length];
@@ -95,10 +124,9 @@ function findHeadCloseIndex(html: string): number {
     const tagEnd = endOfTag(html, lt);
     if (tagEnd < 0) return -1; // unterminated tag
     if (raw !== null) {
-      const close = lower.indexOf(`</${raw}`, tagEnd);
-      if (close < 0) return -1; // unterminated raw-text span → no real </head>
-      const gt = html.indexOf('>', close);
-      i = gt < 0 ? html.length : gt + 1;
+      const closeEnd = endOfRawTextElement(html, lower, raw, tagEnd);
+      if (closeEnd < 0) return -1; // unterminated raw-text span → no real </head>
+      i = closeEnd;
     } else {
       i = tagEnd;
     }

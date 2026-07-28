@@ -15,6 +15,7 @@ import {
   GENERATED_RESPONSE_SAFETY_MARGIN_BYTES,
   MAX_GENERATED_RESPONSE_BYTES,
   MAX_ORIGIN_BODY_BYTES,
+  MAX_RESPONSE_HEADER_BYTES,
   serializedHeaderBytes,
   __resetHandlerStateForTests,
 } from '../src/index.js';
@@ -32,6 +33,8 @@ const PAGE_HTML = '<html><head><title>T</title></head><body>Hello</body></html>'
 const JSONLD_RAW = '{"@context":"https://schema.org","@type":"Article","headline":"Hi"}';
 /** Exactly what the core injects before `</head>` (all ASCII → bytes = length). */
 const SNIPPET = `<script type="application/ld+json">${JSONLD_RAW}</script>`;
+const UNICODE_JSONLD_RAW = '{"@context":"https://schema.org","@type":"Place","name":"München"}';
+const OVERSIZED_REFETCH_CSP = `default-src 'self'; report-uri /${'a'.repeat(12_000)}`;
 
 /** Body shell for the exact-size `/sized` route (all ASCII). */
 const SIZED_PREFIX = '<html><head></head><body>';
@@ -96,6 +99,67 @@ beforeAll(async () => {
       res.end(PAGE_HTML);
       return;
     }
+    if (path === '/ascii') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=us-ascii' });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/ascii-non-ascii') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=us-ascii' });
+      res.end('<html><head></head><body>München</body></html>');
+      return;
+    }
+    if (path === '/charsetless-utf8-meta') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><head><meta charset="utf-8"></head><body>München</body></html>');
+      return;
+    }
+    if (path === '/charsetless-utf8-bom') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(
+        Buffer.concat([
+          Buffer.from([0xef, 0xbb, 0xbf]),
+          Buffer.from('<html><head></head><body>München</body></html>', 'utf8'),
+        ])
+      );
+      return;
+    }
+    if (path === '/charsetless-comment-meta') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><head><!-- <meta charset="utf-8"> --></head><body>München</body></html>');
+      return;
+    }
+    if (path === '/charsetless-data-charset') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><head><meta data-charset="utf-8"></head><body>München</body></html>');
+      return;
+    }
+    if (path === '/charsetless-windows-meta') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><head><meta charset="windows-1252"></head><body>München</body></html>');
+      return;
+    }
+    if (path === '/charsetless-no-meta') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><head></head><body>München</body></html>');
+      return;
+    }
+    if (path === '/cache-control') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=17',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/expires') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        expires: 'Wed, 29 Jul 2026 12:00:00 GMT',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
     if (path === '/gzipped') {
       // Origin that ignores Accept-Encoding: identity.
       res.writeHead(200, {
@@ -119,10 +183,26 @@ beforeAll(async () => {
       res.end(PAGE_HTML);
       return;
     }
+    if (path === '/csp-weaker') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': "default-src *; script-src 'nonce-ABC'",
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
     if (path === '/csp-report-only') {
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'content-security-policy-report-only': "script-src 'nonce-RO'",
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/large-csp') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': OVERSIZED_REFETCH_CSP,
       });
       res.end(PAGE_HTML);
       return;
@@ -391,6 +471,22 @@ describe('handler — CSP passthrough from the re-fetch (per-response nonce)', (
     expect(result?.headers?.['content-security-policy']?.[0]?.key).toBe('Content-Security-Policy');
   });
 
+  it('fails open when the re-fetch weakens the non-nonce CSP structure', async () => {
+    const event = eventFor('/csp-weaker', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': "default-src 'none'; script-src 'nonce-FIRST'",
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['content-security-policy']?.[0]?.value).toBe(
+      "default-src 'none'; script-src 'nonce-FIRST'"
+    );
+  });
+
   it('copies the re-fetch content-security-policy-report-only onto the generated response', async () => {
     const event = eventFor('/csp-report-only', {
       responseHeaders: {
@@ -417,6 +513,172 @@ describe('handler — CSP passthrough from the re-fetch (per-response nonce)', (
     expect(result?.body).toContain(SNIPPET);
     expect(result?.headers?.['content-security-policy']).toBeUndefined();
     expect(result?.headers?.['content-security-policy-report-only']).toBeUndefined();
+  });
+
+  it('fails open instead of dropping CSP headers when the re-fetch has none', async () => {
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': "script-src 'nonce-FIRST'",
+        'content-security-policy-report-only': "script-src 'nonce-FIRST-RO'",
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['content-security-policy']?.[0]?.value).toBe(
+      "script-src 'nonce-FIRST'"
+    );
+    expect(result?.headers?.['content-security-policy-report-only']?.[0]?.value).toBe(
+      "script-src 'nonce-FIRST-RO'"
+    );
+  });
+});
+
+describe('handler — representation headers follow the re-fetch body', () => {
+  it('advertises generated text as UTF-8 when Unicode JSON-LD is injected into ASCII HTML', async () => {
+    enhancelyFetch.mockResolvedValueOnce(
+      new Response(UNICODE_JSONLD_RAW, { status: 200, headers: { etag: '"unicode"' } })
+    );
+    const event = eventFor('/ascii', {
+      responseHeaders: { 'content-type': 'text/html; charset=us-ascii' },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(UNICODE_JSONLD_RAW);
+    expect(result?.headers?.['content-type']?.[0]).toEqual({
+      key: 'Content-Type',
+      value: 'text/html; charset=utf-8',
+    });
+  });
+
+  it('fails open when an ASCII-labeled origin body actually contains non-ASCII bytes', async () => {
+    const event = eventFor('/ascii-non-ascii', {
+      responseHeaders: { 'content-type': 'text/html; charset=us-ascii' },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('accepts charset-less non-ASCII HTML only with an unambiguous UTF-8 BOM', async () => {
+    const event = eventFor('/charsetless-utf8-bom', {
+      responseHeaders: { 'content-type': 'text/html' },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain('München');
+    expect(result?.body).toContain(SNIPPET);
+    expect(result?.headers?.['content-type']?.[0]?.value).toBe('text/html; charset=utf-8');
+  });
+
+  it.each([
+    '/charsetless-utf8-meta',
+    '/charsetless-windows-meta',
+    '/charsetless-no-meta',
+    '/charsetless-comment-meta',
+    '/charsetless-data-charset',
+  ])('fails open for ambiguous charset-less non-ASCII HTML at %s', async (uri) => {
+    const event = eventFor(uri, {
+      responseHeaders: { 'content-type': 'text/html' },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('fails open when Cache-Control changes between the first response and re-fetch', async () => {
+    const event = eventFor('/cache-control', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=86400',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['cache-control']?.[0]).toEqual({
+      key: 'cache-control',
+      value: 'public, max-age=86400',
+    });
+  });
+
+  it('retains and copies a stable Cache-Control policy for the generated body', async () => {
+    const event = eventFor('/cache-control', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'PUBLIC, MAX-AGE=17',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(result?.headers?.['cache-control']?.[0]).toEqual({
+      key: 'Cache-Control',
+      value: 'public, max-age=17',
+    });
+  });
+
+  it('fails open when the first response has Cache-Control but the re-fetch does not', async () => {
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public, max-age=86400',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['cache-control']?.[0]?.value).toBe('public, max-age=86400');
+  });
+
+  it('copies Expires from the re-fetch whose body is generated', async () => {
+    const event = eventFor('/expires', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        expires: 'Wed, 29 Jul 2026 12:00:00 GMT',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(result?.headers?.['expires']?.[0]).toEqual({
+      key: 'Expires',
+      value: 'Wed, 29 Jul 2026 12:00:00 GMT',
+    });
+  });
+
+  it('fails open when Expires changes between the first response and re-fetch', async () => {
+    const event = eventFor('/expires', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        expires: 'Wed, 29 Jul 2026 11:00:00 GMT',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['expires']?.[0]?.value).toBe('Wed, 29 Jul 2026 11:00:00 GMT');
+  });
+
+  it('fails open when the first response has Expires but the re-fetch does not', async () => {
+    const event = eventFor('/page', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        expires: 'Wed, 29 Jul 2026 11:00:00 GMT',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['expires']?.[0]?.value).toBe('Wed, 29 Jul 2026 11:00:00 GMT');
   });
 });
 
@@ -454,6 +716,22 @@ describe('handler — gating pass-through (original response, no origin contact)
     expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 
+  it('honors restrictive directives in every Cache-Control header entry', async () => {
+    const event = eventFor('/page');
+    const response = event.Records[0]?.cf.response;
+    if (response === undefined) throw new Error('expected response fixture');
+    response.headers['cache-control'] = [
+      { key: 'Cache-Control', value: 'public, max-age=86400' },
+      { key: 'Cache-Control', value: 'no-store' },
+    ];
+
+    const result = await invoke(event);
+
+    expect(result).toBe(response);
+    expect(originHits).toBe(0);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
   it('non-custom (S3) origin → untouched response', async () => {
     const event = eventFor('/page', { noCustomOrigin: true });
     const result = await invoke(event);
@@ -464,6 +742,29 @@ describe('handler — gating pass-through (original response, no origin contact)
 });
 
 describe('handler — generated-response size boundary (502 territory, must fail open)', () => {
+  it('a larger re-fetch CSP that pushes generated headers over 32 KB → passthrough', async () => {
+    const firstHeaders = {
+      'content-type': 'text/html; charset=utf-8',
+      'x-heavy': 'h'.repeat(21_000),
+    };
+    expect(
+      serializedHeaderBytes(
+        cfHeaders({
+          ...firstHeaders,
+          'content-security-policy': OVERSIZED_REFETCH_CSP,
+        })
+      )
+    ).toBeGreaterThan(MAX_RESPONSE_HEADER_BYTES);
+
+    const event = eventFor('/large-csp', { responseHeaders: firstHeaders });
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(originHits).toBe(1);
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
   it('fetched HTML far above the origin-fetch cap → truncated, untouched response', async () => {
     const event = eventFor('/big');
     const result = await invoke(event);
@@ -556,6 +857,23 @@ describe('handler — generated-response size boundary (502 territory, must fail
     expect(result?.body).toContain(SNIPPET);
     expect(Buffer.byteLength(result?.body ?? '', 'utf8')).toBe(heavyBudget);
   });
+
+  it('a long UTF-8 statusDescription is included in the generated-response budget', async () => {
+    const n = heavyBudget - SNIPPET.length;
+    const event = eventFor('/sized', {
+      querystring: `n=${n}`,
+      responseHeaders: heavyHeaders,
+    });
+    const response = event.Records[0]?.cf.response;
+    if (response === undefined) throw new Error('expected response fixture');
+    response.statusDescription = 'Ü'.repeat(1_024);
+
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(result).toBe(response);
+    expect(result?.body).toBeUndefined();
+  });
 });
 
 describe('handler — fail-open on the re-fetch path', () => {
@@ -634,38 +952,41 @@ describe('handler — fail-open on the re-fetch path', () => {
     expect(result?.body).toBeUndefined();
   });
 
-  it('Enhancely has no record (404) → untouched response, no generated body', async () => {
+  it('Enhancely has no record (404) → no body replacement and a bounded retry TTL', async () => {
     enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
     const event = eventFor('/page');
     const result = await invoke(event);
 
-    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result).not.toBe(event.Records[0]?.cf.response);
     expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=');
   });
 
-  it('Enhancely fetch rejects (network error) → untouched response via the core', async () => {
+  it('Enhancely fetch rejects → no body replacement and the core backoff TTL', async () => {
     enhancelyFetch.mockRejectedValueOnce(new Error('ECONNRESET'));
     const event = eventFor('/page');
     const result = await invoke(event);
 
-    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result).not.toBe(event.Records[0]?.cf.response);
     expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=10');
   });
 });
 
 describe('handler — Enhancely-first reorder (no snippet ⇒ no origin re-fetch)', () => {
-  it('404 from Enhancely (no snippet) → ZERO origin re-fetch, untouched response', async () => {
+  it('404 from Enhancely (no snippet) → ZERO origin re-fetch, bounded cache TTL', async () => {
     enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
     const event = eventFor('/page');
     const result = await invoke(event);
 
     expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(0); // the origin is NOT re-fetched when there is nothing to inject
-    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result).not.toBe(event.Records[0]?.cf.response);
     expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=');
   });
 
-  it('rate-limited (429) from Enhancely → ZERO origin re-fetch, untouched response', async () => {
+  it('rate-limited (429) → ZERO origin re-fetch and Retry-After cache TTL', async () => {
     enhancelyFetch.mockResolvedValueOnce(
       new Response(null, { status: 429, headers: { 'retry-after': '30' } })
     );
@@ -674,8 +995,9 @@ describe('handler — Enhancely-first reorder (no snippet ⇒ no origin re-fetch
 
     expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(0);
-    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result).not.toBe(event.Records[0]?.cf.response);
     expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=30');
   });
 
   it('a successful snippet → re-fetches the origin EXACTLY once and injects', async () => {
@@ -689,8 +1011,158 @@ describe('handler — Enhancely-first reorder (no snippet ⇒ no origin re-fetch
   });
 });
 
+describe('handler — pending auto-registration cache policy', () => {
+  it('caps CloudFront caching at the core TTL and removes origin validators', async () => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const responseHeaders = {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'public, max-age=86400',
+      etag: '"uninjected"',
+      'last-modified': 'Wed, 01 Jan 2026 00:00:00 GMT',
+      expires: 'Thu, 01 Jan 2027 00:00:00 GMT',
+    };
+    const first = await invoke(eventFor('/new-page', { responseHeaders }));
+
+    expect(first?.body).toBeUndefined();
+    expect(originHits).toBe(0);
+    expect(enhancelyFetch).toHaveBeenCalledTimes(2); // one GET + one registration POST
+    expect(first?.headers?.['etag']).toBeUndefined();
+    expect(first?.headers?.['last-modified']).toBeUndefined();
+    expect(first?.headers?.['expires']).toBeUndefined();
+    const firstPolicy = first?.headers?.['cache-control']?.[0]?.value ?? '';
+    expect(firstPolicy).toMatch(/^max-age=0, s-maxage=\d+, must-revalidate$/);
+    const firstTtl = Number(/s-maxage=(\d+)/.exec(firstPolicy)?.[1]);
+    expect(firstTtl).toBeGreaterThanOrEqual(19);
+    expect(firstTtl).toBeLessThanOrEqual(20);
+
+    // A different CloudFront variant of the same normalized page is answered
+    // from the core's pending negative cache and receives the same short policy
+    // without another Enhancely GET/POST or origin re-fetch.
+    const second = await invoke(
+      eventFor('/new-page', { querystring: 'variant=2', responseHeaders })
+    );
+    expect(second?.body).toBeUndefined();
+    expect(second?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=');
+    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(originHits).toBe(0);
+  });
+
+  it.each([
+    ['no-cache', 0],
+    ['public, max-age=4', 4],
+    ['public, s-maxage=3, max-age=100', 3],
+  ])('never lengthens the origin cache policy %j', async (originPolicy, expectedTtl) => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const result = await invoke(
+      eventFor('/short-origin-ttl', {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': originPolicy,
+        },
+      })
+    );
+
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain(`s-maxage=${expectedTtl}`);
+    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(originHits).toBe(0);
+  });
+
+  it('honors no-cache in a second Cache-Control entry when setting the retry policy', async () => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    const event = eventFor('/multi-cache-control');
+    const response = event.Records[0]?.cf.response;
+    if (response === undefined) throw new Error('expected response fixture');
+    response.headers['cache-control'] = [
+      { key: 'Cache-Control', value: 'public, max-age=86400' },
+      { key: 'Cache-Control', value: 'no-cache' },
+    ];
+
+    const result = await invoke(event);
+
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=0');
+    expect(originHits).toBe(0);
+  });
+
+  it('uses Expires when Cache-Control has no explicit freshness lifetime', async () => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const result = await invoke(
+      eventFor('/expires-fallback', {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'public',
+          date: 'Mon, 27 Jul 2026 12:00:00 GMT',
+          expires: 'Mon, 27 Jul 2026 12:00:04 GMT',
+        },
+      })
+    );
+
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=4');
+  });
+
+  it.each([
+    ['authorization', 'Bearer viewer-secret'],
+    ['cookie', 'session=viewer-secret'],
+  ])('does not add shared cacheability to a request carrying %s', async (name, value) => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const event = eventFor('/credentialed-miss', {
+      requestHeaders: { [name]: value },
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'max-age=86400',
+        etag: '"credentialed"',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.headers?.['cache-control']?.[0]?.value).toBe('max-age=86400');
+    expect(result?.headers?.['etag']?.[0]?.value).toBe('"credentialed"');
+    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(originHits).toBe(0);
+  });
+});
+
 describe('handler — placeholder key guard (no re-fetch when key not configured)', () => {
-  it('a baked REPLACE_ME key → config null → untouched response, no origin re-fetch', async () => {
+  it('a baked REPLACE_ME key → pass-through body with a bounded config-retry TTL', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     // Overwrite the beforeEach sk-test key with the SSM placeholder value.
     __setBakedConfigForTests({ apiKey: 'REPLACE_ME' });
@@ -698,8 +1170,9 @@ describe('handler — placeholder key guard (no re-fetch when key not configured
     const event = eventFor('/page');
     const result = await invoke(event);
 
-    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result).not.toBe(event.Records[0]?.cf.response);
     expect(result?.body).toBeUndefined();
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=30');
     expect(originHits).toBe(0); // never pays the doubled origin load
     expect(enhancelyFetch).not.toHaveBeenCalled();
     expect(consoleError).toHaveBeenCalled(); // loud "not configured"
@@ -707,7 +1180,7 @@ describe('handler — placeholder key guard (no re-fetch when key not configured
 });
 
 describe('handler — config failures', () => {
-  it('no API key resolvable → untouched response (loud, once)', async () => {
+  it('no API key resolvable → pass-through body with cooldown TTL (loud, once)', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     __setBakedConfigForTests({}); // no apiKey; mocked SSM has no usable client
     __setConfigOverridesForTests(null);
@@ -715,14 +1188,16 @@ describe('handler — config failures', () => {
     const event = eventFor('/page');
     const result = await invoke(event);
 
-    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result).not.toBe(event.Records[0]?.cf.response);
+    expect(result?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=30');
     expect(originHits).toBe(0);
     expect(consoleError).toHaveBeenCalledTimes(1);
 
-    // Second invocation: memoized null → still pass-through, no second log.
+    // Second invocation: inside the 30-second cooldown → no retry or second log.
     const secondEvent = eventFor('/page');
     const again = await invoke(secondEvent);
-    expect(again).toBe(secondEvent.Records[0]?.cf.response);
+    expect(again).not.toBe(secondEvent.Records[0]?.cf.response);
+    expect(again?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=30');
     expect(consoleError).toHaveBeenCalledTimes(1);
   });
 });
