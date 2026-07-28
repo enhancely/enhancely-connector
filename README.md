@@ -70,7 +70,7 @@ see [`infra/modules/lambda-edge-injector/`](infra/modules/lambda-edge-injector/)
 
 ```hcl
 module "enhancely_injector" {
-  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.5.0"
+  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.5.1"
   providers = { aws = aws.us_east_1 }
   auto_register = true
 }
