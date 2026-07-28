@@ -54,6 +54,23 @@ describe('injectIntoHead', () => {
     );
   });
 
+  it.each(['script', 'style', 'title', 'textarea', 'noscript'])(
+    'does not treat </%sx> as the raw-text closing tag',
+    (tag) => {
+      const html = `<head><${tag}>literal </${tag}x> then </head></${tag}></head>`;
+      expect(injectIntoHead(html, SNIPPET)).toBe(
+        `<head><${tag}>literal </${tag}x> then </head></${tag}>${SNIPPET}</head>`
+      );
+    }
+  );
+
+  it('does not treat non-ASCII whitespace as a raw-text end-tag boundary', () => {
+    const html = '<head><script>literal </script\u00a0foo> then </head></script></head>';
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      `<head><script>literal </script\u00a0foo> then </head></script>${SNIPPET}</head>`
+    );
+  });
+
   it('skips a literal </head> inside an HTML comment', () => {
     const html = '<head><!-- </head> --></head><body></body>';
     expect(injectIntoHead(html, SNIPPET)).toBe(

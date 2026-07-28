@@ -97,7 +97,12 @@ describe('KVCacheBackend', () => {
   it('round-trips a negative (404) entry with jsonldRaw: null', async () => {
     const kv = new FakeKV();
     const backend = new KVCacheBackend(kv, 300_000);
-    const negative: CacheEntry = { jsonldRaw: null, etag: null, storedAt: 123 };
+    const negative: CacheEntry = {
+      jsonldRaw: null,
+      etag: null,
+      storedAt: 123,
+      registrationPending: true,
+    };
 
     await backend.set('k', negative);
     await expect(backend.get('k')).resolves.toEqual(negative);

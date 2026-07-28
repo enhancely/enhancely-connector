@@ -30,9 +30,9 @@
 import * as http from 'node:http';
 import * as https from 'node:https';
 
-/** Node http headers are string | string[] | undefined; take the first value. */
-function firstHeaderValue(value: string | string[] | undefined): string | null {
-  if (Array.isArray(value)) return value[0] ?? null;
+/** Node http headers are string | string[] | undefined; preserve every value. */
+function combinedHeaderValue(value: string | string[] | undefined): string | null {
+  if (Array.isArray(value)) return value.join(', ');
   return value ?? null;
 }
 
@@ -42,6 +42,8 @@ export interface OriginFetchResult {
   contentEncoding: string | null;
   /** Cache-Control of the re-fetched answer (per-request gate in the caller). */
   cacheControl: string | null;
+  /** Expires of the re-fetched answer, synchronized with its generated body. */
+  expires: string | null;
   /** True when the re-fetched answer carries any Set-Cookie header. */
   hasSetCookie: boolean;
   /**
@@ -96,9 +98,10 @@ export function fetchOriginHtml(
         const contentType = response.headers['content-type'] ?? null;
         const contentEncoding = response.headers['content-encoding'] ?? null;
         const cacheControl = response.headers['cache-control'] ?? null;
+        const expires = response.headers['expires'] ?? null;
         const hasSetCookie = response.headers['set-cookie'] !== undefined;
-        const csp = firstHeaderValue(response.headers['content-security-policy']);
-        const cspReportOnly = firstHeaderValue(
+        const csp = combinedHeaderValue(response.headers['content-security-policy']);
+        const cspReportOnly = combinedHeaderValue(
           response.headers['content-security-policy-report-only']
         );
 
@@ -116,6 +119,7 @@ export function fetchOriginHtml(
               contentType,
               contentEncoding,
               cacheControl,
+              expires,
               hasSetCookie,
               contentSecurityPolicy: csp,
               contentSecurityPolicyReportOnly: cspReportOnly,
@@ -136,6 +140,7 @@ export function fetchOriginHtml(
             contentType,
             contentEncoding,
             cacheControl,
+            expires,
             hasSetCookie,
             contentSecurityPolicy: csp,
             contentSecurityPolicyReportOnly: cspReportOnly,

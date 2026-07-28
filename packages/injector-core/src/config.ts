@@ -5,6 +5,13 @@ export const DEFAULT_ENHANCELY_BASE = 'https://app.enhancely.ai';
 
 export const DEFAULT_TIMEOUT_MS = 800;
 export const DEFAULT_CACHE_TTL_MS = 300_000; // 5 minutes
+/**
+ * A JSON-LD payload is only one part of a Lambda@Edge generated response,
+ * whose complete body is capped at 1 MiB. Keep the upstream payload well
+ * below that ceiling so a hostile/buggy API cannot make the connector buffer
+ * an unbounded body. Callers may lower this limit, but not raise it.
+ */
+export const DEFAULT_MAX_JSONLD_BYTES = 256 * 1024;
 
 /** Loopback hosts that may use plain http (local development only). */
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -36,11 +43,22 @@ function assertSafeBase(base: string): void {
 export function defineConfig(input: InjectorConfigInput): InjectorConfig {
   const base = (input.enhancelyBase ?? DEFAULT_ENHANCELY_BASE).replace(/\/$/, '');
   assertSafeBase(base);
+  const maxJsonLdBytes = input.maxJsonLdBytes ?? DEFAULT_MAX_JSONLD_BYTES;
+  if (
+    !Number.isSafeInteger(maxJsonLdBytes) ||
+    maxJsonLdBytes <= 0 ||
+    maxJsonLdBytes > DEFAULT_MAX_JSONLD_BYTES
+  ) {
+    throw new RangeError(
+      `maxJsonLdBytes must be a positive integer no greater than ${DEFAULT_MAX_JSONLD_BYTES}`
+    );
+  }
   return {
     enhancelyBase: base,
     apiKey: input.apiKey,
     timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     cacheTtlMs: input.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
+    maxJsonLdBytes,
     injectPosition: 'before-head-close',
     autoRegister: input.autoRegister ?? false,
     ...(input.fetchImpl !== undefined && { fetchImpl: input.fetchImpl }),

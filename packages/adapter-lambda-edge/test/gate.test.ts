@@ -193,6 +193,22 @@ describe('serializedHeaderBytes', () => {
     expect(bytes).toBe(64 + (10 + 3 + 4) + (10 + 3 + 4));
   });
 
+  it('counts UTF-8 bytes rather than JavaScript characters in header values', () => {
+    const value = 'München 😀';
+    const bytes = serializedHeaderBytes(cfHeaders({ 'X-Title': value }));
+    expect(bytes).toBe(
+      64 + Buffer.byteLength('X-Title', 'utf8') + Buffer.byteLength(value, 'utf8') + 4
+    );
+    expect(bytes).toBeGreaterThan(64 + 'X-Title'.length + value.length + 4);
+  });
+
+  it('counts an unusually long UTF-8 statusDescription instead of assuming 64 bytes', () => {
+    const description = 'Ü'.repeat(100);
+    const bytes = serializedHeaderBytes({}, '200', description);
+    expect(bytes).toBe(Buffer.byteLength(`HTTP/1.1 200 ${description}\r\n`, 'utf8') + 2);
+    expect(bytes).toBeGreaterThan(64);
+  });
+
   it('is 64 (overhead only) for an empty header map', () => {
     expect(serializedHeaderBytes({})).toBe(64);
   });

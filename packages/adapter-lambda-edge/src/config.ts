@@ -20,7 +20,8 @@
  *      an unbounded SSM hang would ride the first invocation into the Lambda
  *      function timeout, which CloudFront turns into a viewer-facing 502 —
  *      the exact failure the fail-open invariant forbids. A timed-out SSM
- *      resolves to the memoized "no key" → pass-through instead.
+ *      resolves to "no key" → pass-through for a 30-second cooldown, then the
+ *      next invocation retries.
  *
  * Concurrent invocations of one execution environment share a single in-flight
  * resolution (and thus a single SSM call). A SUCCESSFUL result is memoized for
@@ -222,8 +223,8 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
     if (apiKey === undefined) {
       console.error(
         '[enhancely-lambda-edge] NO API KEY: neither a baked connector-config.json apiKey nor a ' +
-          'non-empty SSM parameter was found — every response passes through UNINJECTED until ' +
-          'this execution environment is recycled'
+          'non-empty SSM parameter was found — responses pass through UNINJECTED for 30 seconds, ' +
+          'then config resolution is retried'
       );
       return null;
     }
@@ -251,11 +252,11 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
       ...configOverrides,
     });
   } catch (error) {
-    // SSM unreachable / denied / timed out / SDK missing — fail open, retry
-    // on the next execution environment (cold start).
+    // SSM unreachable / denied / timed out / SDK missing — fail open for the
+    // 30-second negative-result cooldown, then let the next invocation retry.
     console.error(
       '[enhancely-lambda-edge] config resolution FAILED — every response passes through ' +
-        'UNINJECTED until this execution environment is recycled:',
+        'UNINJECTED for 30 seconds, then config resolution is retried:',
       error instanceof Error ? `${error.name}: ${error.message}` : String(error)
     );
     return null;
@@ -283,6 +284,16 @@ export function resolveAdapterConfig(): Promise<InjectorConfig | null> {
     return result;
   });
   return inflight;
+}
+
+/**
+ * Remaining cooldown after a failed config resolution. The handler uses this
+ * to avoid letting CloudFront cache an uninjected pass-through response longer
+ * than the next SSM/key retry. Null means no retry is currently scheduled.
+ */
+export function getConfigRetryInMs(): number | null {
+  if (resolvedConfig !== null || negativeUntil <= Date.now()) return null;
+  return negativeUntil - Date.now();
 }
 
 /**

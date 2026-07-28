@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildScriptTag,
   defineConfig,
+  getJsonLdLookup,
   getJsonLdSnippet,
   handleHtml,
   injectIntoHead,
@@ -224,23 +225,40 @@ describe('autoRegister (self-populating connector)', () => {
         ? Promise.resolve(new Response('{"status":"processing"}', { status: 201 }))
         : notFound();
     });
-    const config = defineConfig({ apiKey: 'k', autoRegister: true, fetchImpl });
+    const config = defineConfig({
+      apiKey: 'k',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+      fetchImpl,
+    });
 
-    expect(await getJsonLdSnippet('https://ex.com/new-page', cache, config)).toBeNull();
+    const first = await getJsonLdLookup('https://ex.com/new-page', cache, config);
+    expect(first.snippet).toBeNull();
+    expect(first.revalidateInMs).toBeGreaterThan(19_000);
+    expect(first.revalidateInMs).toBeLessThanOrEqual(20_000);
     const posts = calls.filter((c) => c.method === 'POST');
     expect(posts).toHaveLength(1);
     expect(posts[0]?.url).toContain('/api/v1/jsonld');
     expect(JSON.parse(String(posts[0]?.body))).toEqual({ url: 'https://ex.com/new-page' });
 
     // Second view within the TTL: negative cache answers, no GET, no POST.
-    await getJsonLdSnippet('https://ex.com/new-page', cache, config);
+    const second = await getJsonLdLookup('https://ex.com/new-page?variant=2', cache, config);
+    expect(second.snippet).toBeNull();
+    expect(second.revalidateInMs).toBeGreaterThan(19_000);
     expect(fetchImpl.mock.calls).toHaveLength(2); // 1 GET + 1 POST only
   });
 
   it('does not POST when autoRegister is off (default)', async () => {
     const cache = new MemoryCache();
     const fetchImpl = vi.fn<Fetcher>(() => notFound());
-    await getJsonLdSnippet('https://ex.com/p', cache, defineConfig({ apiKey: 'k', fetchImpl }));
+    const result = await getJsonLdLookup(
+      'https://ex.com/p',
+      cache,
+      defineConfig({ apiKey: 'k', fetchImpl })
+    );
+    expect(result.snippet).toBeNull();
+    expect(result.revalidateInMs).toBeGreaterThan(299_000);
+    expect(result.revalidateInMs).toBeLessThanOrEqual(300_000);
     expect(fetchImpl.mock.calls.filter(([, i]) => i.method === 'POST')).toHaveLength(0);
   });
 
@@ -253,5 +271,67 @@ describe('autoRegister (self-populating connector)', () => {
     expect(await getJsonLdSnippet('https://ex.com/p', cache, config)).toBeNull();
     const entry = await cache.get('https://ex.com/p');
     expect(entry?.jsonldRaw).toBeNull(); // negative entry still stored
+    expect(entry?.registrationPending).toBe(true);
+  });
+
+  it('extends a stale pending revalidation delay through a temporary upstream backoff', async () => {
+    const cache = new MemoryCache();
+    await cache.set('https://ex.com/p', {
+      jsonldRaw: null,
+      etag: null,
+      storedAt: Date.now() - 2_000,
+      registrationPending: true,
+    });
+    const fetchImpl = vi.fn<Fetcher>(() =>
+      Promise.resolve(new Response(null, { status: 429, headers: { 'retry-after': '30' } }))
+    );
+    const result = await getJsonLdLookup(
+      'https://ex.com/p',
+      cache,
+      defineConfig({ apiKey: 'k', autoRegister: true, cacheTtlMs: 1_000, fetchImpl })
+    );
+
+    expect(result.snippet).toBeNull();
+    expect(result.revalidateInMs).toBeGreaterThan(29_000);
+    expect(result.revalidateInMs).toBeLessThanOrEqual(30_000);
+    expect((await cache.get('https://ex.com/p'))?.registrationPending).toBe(true);
+  });
+
+  it('returns a downstream retry delay for a cold transient API failure', async () => {
+    const cache = new MemoryCache();
+    const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('temporary')));
+    const result = await getJsonLdLookup(
+      'https://ex.com/transient',
+      cache,
+      defineConfig({ apiKey: 'k', fetchImpl })
+    );
+
+    expect(result.snippet).toBeNull();
+    expect(result.revalidateInMs).toBeGreaterThan(9_000);
+    expect(result.revalidateInMs).toBeLessThanOrEqual(10_000);
+  });
+
+  it('clamps the retry delay when its deadline passes between freshness checks', async () => {
+    const cache = new MemoryCache();
+    await cache.set('https://ex.com/deadline', {
+      jsonldRaw: null,
+      etag: null,
+      storedAt: 991,
+    });
+    const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('must not fetch')));
+    const now = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_001);
+
+    try {
+      await expect(
+        getJsonLdLookup(
+          'https://ex.com/deadline',
+          cache,
+          defineConfig({ apiKey: 'k', cacheTtlMs: 10, fetchImpl })
+        )
+      ).resolves.toEqual({ snippet: null, revalidateInMs: 1 });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
   });
 });
