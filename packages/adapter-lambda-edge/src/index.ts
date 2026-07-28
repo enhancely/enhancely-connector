@@ -324,41 +324,50 @@ function normalizedCspStructure(policy: string): string {
  * retry TTL only replaces CloudFront's default when the origin supplied no
  * shorter explicit shared-cache lifetime.
  */
-function retrySharedTtlSeconds(headers: CloudFrontHeaders, revalidateInMs: number): number {
-  let ttl = Math.max(1, Math.ceil(revalidateInMs / 1000));
+/**
+ * Shared-cache TTL to impose on a retryable pass-through, or `null` when the
+ * origin declared NO explicit cache lifetime.
+ *
+ * `null` is load-bearing: without an origin-declared lifetime the response's
+ * cacheability is governed by the distribution's DefaultTTL, which this
+ * function cannot see. Writing an s-maxage there could make an
+ * origin-uncacheable response (DefaultTTL=0) shared-cacheable — the opposite of
+ * the invariant "never make a response more cacheable than it already was". So
+ * we only ever SHORTEN an explicit lifetime (max-age/s-maxage/Expires) and
+ * leave header-less responses untouched.
+ */
+function retrySharedTtlSeconds(headers: CloudFrontHeaders, revalidateInMs: number): number | null {
+  const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1000));
   const policy = cacheControlValue(headers);
-  let hasExplicitLifetime = false;
 
   if (policy !== null) {
     const directiveNames = policy
       .split(',')
       .map((directive) => directive.split('=', 1)[0]?.trim().toLowerCase());
+    // no-cache is an explicit "revalidate every time" — honor it with s-maxage=0.
     if (directiveNames.includes('no-cache')) {
       return 0;
     }
     const originTtl =
       cacheDirectiveSeconds(policy, 's-maxage') ?? cacheDirectiveSeconds(policy, 'max-age');
     if (originTtl !== null) {
-      ttl = Math.min(ttl, originTtl);
-      hasExplicitLifetime = true;
+      return Math.min(retryTtl, originTtl);
     }
   }
 
-  // Expires remains the freshness fallback when Cache-Control exists but
-  // carries no max-age/s-maxage (for example just `public`).
-  if (!hasExplicitLifetime) {
-    const expires = headerValue(headers, 'expires');
-    if (expires !== null) {
-      const expiresAt = Date.parse(expires);
+  // No max-age/s-maxage: Expires is the only other explicit lifetime.
+  const expires = headerValue(headers, 'expires');
+  if (expires !== null) {
+    const expiresAt = Date.parse(expires);
+    if (!Number.isNaN(expiresAt)) {
       const responseDate = Date.parse(headerValue(headers, 'date') ?? '');
-      if (!Number.isNaN(expiresAt)) {
-        const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
-        ttl = Math.min(ttl, Math.max(0, Math.ceil((expiresAt - reference) / 1000)));
-      }
+      const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
+      return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1000)));
     }
   }
 
-  return ttl;
+  // Origin declared no explicit lifetime → do not introduce shared caching.
+  return null;
 }
 
 /**
@@ -382,9 +391,14 @@ function retryablePassThroughResponse(
   }
 
   const originalHeaders = response.headers ?? {};
-  const headers: CloudFrontHeaders = { ...originalHeaders };
   const sharedTtlSeconds = retrySharedTtlSeconds(originalHeaders, revalidateInMs);
+  // The origin declared no explicit cache lifetime → leave the response exactly
+  // as it is (its cacheability is the distribution's DefaultTTL, which we must
+  // not override upward). Adding s-maxage here could cache an
+  // origin-uncacheable response.
+  if (sharedTtlSeconds === null) return response;
 
+  const headers: CloudFrontHeaders = { ...originalHeaders };
   headers['cache-control'] = [
     {
       key: 'Cache-Control',
