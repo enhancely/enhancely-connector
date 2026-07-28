@@ -110,6 +110,23 @@ beforeAll(async () => {
       res.end();
       return;
     }
+    if (path === '/csp') {
+      // Origin mints a per-response CSP nonce that matches THIS body.
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': "script-src 'nonce-ABC'",
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/csp-report-only') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy-report-only': "script-src 'nonce-RO'",
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end(PAGE_HTML);
   });
@@ -312,17 +329,102 @@ describe('handler — happy path', () => {
   });
 });
 
+describe('handler — Content-Encoding on the FIRST response (gzip fix)', () => {
+  it('a gzip/br FIRST response still PROCEEDS to lookup + re-fetch and injects (identity re-fetch)', async () => {
+    // With Compress on, CloudFront forwards Accept-Encoding, so most real-viewer
+    // first responses arrive gzip/br. The first gate ignores content-encoding —
+    // we re-fetch the origin with Accept-Encoding: identity anyway.
+    const event = eventFor('/page', {
+      responseHeaders: { 'content-type': 'text/html; charset=utf-8', 'content-encoding': 'gzip' },
+    });
+    const result = await invoke(event);
+
+    // NOT passed through: the lookup ran, the origin was re-fetched, and the
+    // JSON-LD was injected into the identity body.
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(originHits).toBe(1);
+    expect(result).not.toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toContain(SNIPPET);
+  });
+
+  it('deletes the stale content-encoding header on the generated (identity) response', async () => {
+    // The injected body is the uncompressed re-fetch; keeping the first
+    // response's gzip Content-Encoding would make the viewer gunzip plain HTML.
+    const event = eventFor('/page', {
+      responseHeaders: { 'content-type': 'text/html; charset=utf-8', 'content-encoding': 'br' },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(result?.headers?.['content-encoding']).toBeUndefined();
+  });
+
+  it('but if the ORIGIN RE-FETCH answer carries content-encoding, THAT passes through untouched', async () => {
+    // First response gzip (ignored by the first gate) → proceed → the origin
+    // ignores Accept-Encoding: identity and answers gzip → second gate fails.
+    const event = eventFor('/gzipped', {
+      responseHeaders: { 'content-type': 'text/html; charset=utf-8', 'content-encoding': 'gzip' },
+    });
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1); // snippet fetched → re-fetch reached
+    expect(originHits).toBe(1);
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+});
+
+describe('handler — CSP passthrough from the re-fetch (per-response nonce)', () => {
+  it('copies the re-fetch content-security-policy onto the generated response', async () => {
+    // The first response carries a DIFFERENT nonce; the generated body is the
+    // re-fetch's, so its CSP (with the matching nonce) must win.
+    const event = eventFor('/csp', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': "script-src 'nonce-FIRST'",
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(result?.headers?.['content-security-policy']?.[0]?.value).toBe("script-src 'nonce-ABC'");
+    expect(result?.headers?.['content-security-policy']?.[0]?.key).toBe('Content-Security-Policy');
+  });
+
+  it('copies the re-fetch content-security-policy-report-only onto the generated response', async () => {
+    const event = eventFor('/csp-report-only', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy-report-only': "script-src 'nonce-FIRST-RO'",
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(result?.headers?.['content-security-policy-report-only']?.[0]?.value).toBe(
+      "script-src 'nonce-RO'"
+    );
+    expect(result?.headers?.['content-security-policy-report-only']?.[0]?.key).toBe(
+      'Content-Security-Policy-Report-Only'
+    );
+  });
+
+  it('when the re-fetch has no CSP, the generated response does not gain one', async () => {
+    // Neither the first response nor the /page re-fetch declares a CSP.
+    const event = eventFor('/page');
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(result?.headers?.['content-security-policy']).toBeUndefined();
+    expect(result?.headers?.['content-security-policy-report-only']).toBeUndefined();
+  });
+});
+
 describe('handler — gating pass-through (original response, no origin contact)', () => {
   it.each([
     ['non-GET request', { method: 'POST' as const }],
     ['non-200 status', { status: '404' }],
     ['non-HTML content type', { responseHeaders: { 'content-type': 'application/json' } }],
-    [
-      'Content-Encoding on the CloudFront response',
-      {
-        responseHeaders: { 'content-type': 'text/html', 'content-encoding': 'gzip' },
-      },
-    ],
     [
       'non-UTF-8 charset on the CloudFront response',
       { responseHeaders: { 'content-type': 'text/html; charset=iso-8859-1' } },

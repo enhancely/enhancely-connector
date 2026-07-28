@@ -125,12 +125,16 @@ resource "aws_lambda_function" "injector" {
   filename         = data.archive_file.bundle.output_path
   source_code_hash = data.archive_file.bundle.output_base64sha256
   handler          = "index.handler"
-  runtime          = "nodejs20.x"
+  runtime          = "nodejs22.x"
   role             = aws_iam_role.edge.arn
   memory_size      = var.memory_size
   timeout          = 10
   publish          = true # Lambda@Edge associations require a published version
   tags             = var.tags
+
+  # Publish only after the read policy exists, so a first invocation can never
+  # hit AccessDenied on GetParameter before IAM has propagated.
+  depends_on = [aws_iam_role_policy.edge]
 
   lifecycle {
     precondition {

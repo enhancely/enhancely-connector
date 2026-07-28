@@ -3,17 +3,20 @@
  *
  * THE central CloudFront constraint: origin-response triggers CANNOT read the
  * origin response body — CloudFront only hands the function status + headers.
- * So for eligible responses (GET, status 200, text/html, no Content-Encoding,
- * UTF-8-compatible charset, no Set-Cookie, no private/no-store Cache-Control)
- * this handler RE-FETCHES the page directly from the custom origin (same
+ * So for eligible responses (GET, status 200, text/html, no Set-Cookie, no
+ * private/no-store Cache-Control — Content-Encoding on THIS response is fine,
+ * see below) the handler first asks Enhancely for a snippet (needs no body);
+ * only when there is one does it RE-FETCH the page from the custom origin (same
  * URI + querystring, incoming Host header so vhosts resolve, ALL request
- * headers CloudFront sent to the origin forwarded — except Host,
- * Accept-Encoding and hop-by-hop headers — so the origin serves the same
- * representation, `Accept-Encoding: identity`), runs the core's `handleHtml`
- * over the fetched HTML, and replaces the response body with the injected
- * result. CloudFront then caches the injected page, so the extra origin
- * roundtrip is paid once per CloudFront cache miss — origin-response does not
- * fire on cache hits.
+ * headers CloudFront sent to the origin forwarded — except Host, Accept-Encoding
+ * and hop-by-hop — so the origin serves the same representation, with
+ * `Accept-Encoding: identity` for raw injectable bytes), injects the snippet
+ * before </head> and replaces the body. The first gate IGNORES the CloudFront
+ * response's Content-Encoding (real viewers get gzip/br, but we re-fetch
+ * identity); the identity re-fetch is re-gated on encoding. A per-response CSP
+ * from the re-fetch is copied onto the generated response so header and body
+ * agree. CloudFront then caches the injected page, so the extra origin roundtrip
+ * is paid once per CloudFront cache miss — origin-response does not fire on hits.
  *
  * Fail-open invariant: the whole handler is wrapped in try/catch and ALWAYS
  * returns the original response on any failure — config unresolvable, origin
@@ -155,7 +158,7 @@ const PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i
  * the full request header set, a page that is stamping NEW state into the
  * viewer cannot be re-fetched faithfully — pass it through.
  */
-export function shouldAttempt(input: AttemptInput): boolean {
+export function shouldAttempt(input: AttemptInput, ignoreContentEncoding = false): boolean {
   if (input.method !== 'GET') return false;
   if (input.status !== '200') return false;
 
@@ -173,6 +176,13 @@ export function shouldAttempt(input: AttemptInput): boolean {
     return false;
   }
 
+  // The FIRST gate (on the CloudFront response) IGNORES content-encoding: with
+  // Compress enabled CloudFront forwards Accept-Encoding, so most real-viewer
+  // responses arrive gzip/br — but we re-fetch the origin with
+  // `Accept-Encoding: identity` anyway, so a compressed first response is fine.
+  // The SECOND gate (on that identity re-fetch) enforces it: if the origin
+  // ignored identity and still compressed, we cannot inject → pass through.
+  if (ignoreContentEncoding) return true;
   return input.contentEncoding === null;
 }
 
@@ -298,14 +308,18 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // Cheap gate on what CloudFront already knows — no network work unless
     // this looks like an injectable HTML page.
     if (
-      !shouldAttempt({
-        method: request.method,
-        status: response.status,
-        contentType: headerValue(response.headers, 'content-type'),
-        contentEncoding: headerValue(response.headers, 'content-encoding'),
-        cacheControl: headerValue(response.headers, 'cache-control'),
-        hasSetCookie: response.headers['set-cookie'] !== undefined,
-      })
+      !shouldAttempt(
+        {
+          method: request.method,
+          status: response.status,
+          contentType: headerValue(response.headers, 'content-type'),
+          contentEncoding: headerValue(response.headers, 'content-encoding'),
+          cacheControl: headerValue(response.headers, 'cache-control'),
+          hasSetCookie: response.headers['set-cookie'] !== undefined,
+        },
+        // Ignore the first response's content-encoding — we re-fetch identity.
+        true
+      )
     ) {
       return response;
     }
@@ -389,6 +403,12 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // way to let that happen — a mismatched explicit value risks truncated or
     // hung responses.
     delete headers['content-length'];
+    // The generated body is the identity (uncompressed) re-fetch, but the
+    // original response we cloned these headers from may have been gzip/br
+    // (CloudFront forwards Accept-Encoding when Compress is on). Drop the stale
+    // Content-Encoding so the viewer does not try to gunzip plain HTML;
+    // CloudFront re-compresses the generated response for the viewer.
+    delete headers['content-encoding'];
     // ETag / Last-Modified are validators for the ORIGINAL body; keeping them
     // would let two different bodies circulate under one strong validator
     // (a client holding the uninjected page revalidates → 304 → never sees
@@ -402,6 +422,24 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     delete headers['digest'];
     delete headers['content-digest'];
     delete headers['repr-digest'];
+    // The generated body is the re-fetch's, so the CSP that matches it (an
+    // origin minting a per-response nonce would put a DIFFERENT nonce in each
+    // response) is the re-fetch's — not the first response's. Copy it over so
+    // header and body agree; otherwise the page's own inline scripts would be
+    // CSP-blocked (a page-breaking, fail-CLOSED outcome).
+    if (origin.contentSecurityPolicy !== null) {
+      headers['content-security-policy'] = [
+        { key: 'Content-Security-Policy', value: origin.contentSecurityPolicy },
+      ];
+    }
+    if (origin.contentSecurityPolicyReportOnly !== null) {
+      headers['content-security-policy-report-only'] = [
+        {
+          key: 'Content-Security-Policy-Report-Only',
+          value: origin.contentSecurityPolicyReportOnly,
+        },
+      ];
+    }
 
     // The injected page must fit the 1 MB generated-response quota, which
     // counts headers AND body together. Budget the body against the ACTUAL

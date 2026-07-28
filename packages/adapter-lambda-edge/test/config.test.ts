@@ -49,6 +49,7 @@ beforeEach(() => {
 afterEach(() => {
   __resetAdapterConfigForTests();
   vi.restoreAllMocks();
+  vi.useRealTimers(); // no-op unless a test opted into fake timers
 });
 
 describe('resolveAdapterConfig — baked config', () => {
@@ -183,6 +184,71 @@ describe('resolveAdapterConfig — no key resolvable', () => {
 
     expect(await resolveAdapterConfig()).toBeNull();
     expect(consoleError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('resolveAdapterConfig — negative-result cooldown (failure not cached forever)', () => {
+  it('within the cooldown a failure is NOT retried, but after 30s the next call re-invokes SSM', async () => {
+    vi.useFakeTimers();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    // First resolution throws (SSM error) → null; later the key is available.
+    ssm.send
+      .mockRejectedValueOnce(new Error('AccessDeniedException'))
+      .mockResolvedValue({ Parameter: { Value: 'sk-later' } });
+    __setBakedConfigForTests(null); // no baked key → SSM is the only source
+
+    // First resolution fails → null, exactly one SSM call.
+    expect(await resolveAdapterConfig()).toBeNull();
+    expect(ssm.send).toHaveBeenCalledTimes(1);
+
+    // Second immediate call: inside the cooldown → still null, NO new SSM call.
+    expect(await resolveAdapterConfig()).toBeNull();
+    expect(ssm.send).toHaveBeenCalledTimes(1);
+
+    // Advance past NEGATIVE_TTL_MS (30_000 ms): the next call RE-invokes SSM,
+    // and the key is now available → a real config.
+    vi.advanceTimersByTime(30_001);
+    const config = await resolveAdapterConfig();
+    expect(config?.apiKey).toBe('sk-later');
+    expect(ssm.send).toHaveBeenCalledTimes(2);
+
+    // The now-successful config is memoized: no further SSM reads.
+    expect((await resolveAdapterConfig())?.apiKey).toBe('sk-later');
+    expect(ssm.send).toHaveBeenCalledTimes(2);
+    // Only the single failure was logged (not the cooldown short-circuit).
+    expect(consoleError).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds the cooldown right up to the 30s boundary, then retries', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    ssm.send.mockResolvedValue({ Parameter: { Value: '' } }); // parameter empty → null key
+    __setBakedConfigForTests(null);
+
+    expect(await resolveAdapterConfig()).toBeNull();
+    expect(ssm.send).toHaveBeenCalledTimes(1);
+
+    // One ms before the cooldown expires: still no retry.
+    vi.advanceTimersByTime(29_999);
+    expect(await resolveAdapterConfig()).toBeNull();
+    expect(ssm.send).toHaveBeenCalledTimes(1);
+
+    // Crossing the boundary: SSM is retried (still null — parameter still empty).
+    vi.advanceTimersByTime(2);
+    expect(await resolveAdapterConfig()).toBeNull();
+    expect(ssm.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('a SUCCESSFUL resolution is cached — no cooldown, no second SSM read', async () => {
+    ssm.send.mockResolvedValue({ Parameter: { Value: 'sk-ok' } });
+    __setBakedConfigForTests(null);
+
+    const first = await resolveAdapterConfig();
+    const second = await resolveAdapterConfig();
+
+    expect(first?.apiKey).toBe('sk-ok');
+    expect(second).toBe(first); // same memoized object
+    expect(ssm.send).toHaveBeenCalledTimes(1);
   });
 });
 
