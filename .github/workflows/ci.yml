@@ -32,11 +32,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile || pnpm install
 
-      - name: Typecheck
-        run: pnpm -r typecheck
-
+      # Workspace adapters resolve injector-core through its emitted package
+      # declarations. A clean runner must build the core before typechecking
+      # those consumers; local worktrees can otherwise hide this with stale
+      # dist files.
       - name: Build
         run: pnpm -r build
+
+      - name: Typecheck
+        run: pnpm -r typecheck
 
       - name: Test
         run: pnpm -r test
