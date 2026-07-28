@@ -320,11 +320,6 @@ function normalizedCspStructure(policy: string): string {
 }
 
 /**
- * Never make an origin response more cacheable than it already was. The
- * retry TTL only replaces CloudFront's default when the origin supplied no
- * shorter explicit shared-cache lifetime.
- */
-/**
  * Shared-cache TTL to impose on a retryable pass-through, or `null` when the
  * origin declared NO explicit cache lifetime.
  *

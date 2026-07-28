@@ -1033,7 +1033,7 @@ describe('handler — Enhancely-first reorder (no snippet ⇒ no origin re-fetch
   });
 });
 
-describe('handler — pending auto-registration cache policy', () => {
+describe('handler — retryable pass-through cache policy', () => {
   it('caps CloudFront caching at the core TTL and removes origin validators', async () => {
     __setBakedConfigForTests({
       apiKey: 'sk-test',
@@ -1207,6 +1207,30 @@ describe('handler — pending auto-registration cache policy', () => {
     expect(result).toBe(event.Records[0]?.cf.response);
     expect(result?.headers?.['cache-control']).toBeUndefined();
     // The lookup still ran (GET + registration POST); the origin was not re-fetched.
+    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(originHits).toBe(0);
+  });
+
+  it('preserves Cache-Control directives that declare no freshness lifetime', async () => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const event = eventFor('/public-without-lifetime', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.headers?.['cache-control']?.[0]?.value).toBe('public');
     expect(enhancelyFetch).toHaveBeenCalledTimes(2);
     expect(originHits).toBe(0);
   });
