@@ -22,11 +22,13 @@
  *      the exact failure the fail-open invariant forbids. A timed-out SSM
  *      resolves to the memoized "no key" → pass-through instead.
  *
- * The result is memoized as a module-level PROMISE: all concurrent invocations
- * of one execution environment share a single resolution (and thus a single
- * SSM call). A "no key" outcome is also memoized — it is logged loudly ONCE
- * and every response passes through uninjected; Lambda recycles execution
- * environments regularly, so the next cold start retries.
+ * Concurrent invocations of one execution environment share a single in-flight
+ * resolution (and thus a single SSM call). A SUCCESSFUL result is memoized for
+ * the environment's lifetime; a FAILURE (missing parameter, SSM timeout /
+ * AccessDenied / throttling) is retried after a short cooldown rather than
+ * cached forever — otherwise a key set out-of-band AFTER the first invocation,
+ * or a transient SSM blip, would strand a warm instance in pass-through until
+ * it is recycled. Each failure is logged loudly.
  *
  * Why `fs` instead of `await import('./connector-config.json')`: the deployed
  * bundle is CJS while this source (and vitest) run as ESM — a native dynamic
@@ -92,7 +94,16 @@ export interface BakedConnectorConfig {
 /* Module state (one per Lambda execution environment)                        */
 /* ------------------------------------------------------------------------ */
 
-let memo: Promise<InjectorConfig | null> | null = null;
+// A SUCCESSFUL resolution is memoized for the whole execution environment.
+// A FAILURE (missing parameter, SSM timeout/AccessDenied/throttling) is NOT
+// cached permanently — that would strand a warm instance forever if the key is
+// set out-of-band after the first invocation, or during a transient SSM blip.
+// Instead a failure applies a short cooldown, after which the next invocation
+// retries. Concurrent invocations still share one in-flight resolution.
+let resolvedConfig: InjectorConfig | null = null;
+let negativeUntil = 0;
+let inflight: Promise<InjectorConfig | null> | null = null;
+const NEGATIVE_TTL_MS = 30_000;
 let resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
 
 /** Test seams — `undefined` means "use the real file read". */
@@ -258,8 +269,20 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
  * Never rejects.
  */
 export function resolveAdapterConfig(): Promise<InjectorConfig | null> {
-  memo ??= resolveOnce();
-  return memo;
+  if (resolvedConfig !== null) return Promise.resolve(resolvedConfig);
+  if (Date.now() < negativeUntil) return Promise.resolve(null);
+  if (inflight !== null) return inflight;
+  inflight = resolveOnce().then((result) => {
+    inflight = null;
+    if (result !== null) {
+      resolvedConfig = result;
+    } else {
+      // Missing key / SSM error → retry after the cooldown, not never.
+      negativeUntil = Date.now() + NEGATIVE_TTL_MS;
+    }
+    return result;
+  });
+  return inflight;
 }
 
 /**
@@ -275,22 +298,29 @@ export function getOriginTimeoutMs(): number {
 /* Test seams (no-ops in production — nothing calls them)                     */
 /* ------------------------------------------------------------------------ */
 
+/** Clear the success/cooldown/in-flight memo state. */
+function __resetMemoForTests(): void {
+  resolvedConfig = null;
+  negativeUntil = 0;
+  inflight = null;
+}
+
 /** TEST-ONLY: bypass the connector-config.json file read (`null` = no file). */
 export function __setBakedConfigForTests(baked: BakedConnectorConfig | null): void {
   bakedOverride = baked;
-  memo = null;
+  __resetMemoForTests();
 }
 
 /** TEST-ONLY: extra fields merged into the resolved config (e.g. `fetchImpl`). */
 export function __setConfigOverridesForTests(overrides: Partial<InjectorConfig> | null): void {
   configOverrides = overrides;
-  memo = null;
+  __resetMemoForTests();
 }
 
 /** TEST-ONLY: restore pristine module state. */
 export function __resetAdapterConfigForTests(): void {
   bakedOverride = undefined;
   configOverrides = null;
-  memo = null;
+  __resetMemoForTests();
   resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
 }

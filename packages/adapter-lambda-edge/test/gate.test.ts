@@ -54,9 +54,40 @@ describe('shouldAttempt', () => {
     expect(shouldAttempt(attempt({ contentType: 'text/html; charset=us-ascii' }))).toBe(true);
   });
 
-  it('rejects any Content-Encoding (compressed bodies pass through)', () => {
+  it('rejects any Content-Encoding by default (second-gate: origin re-fetch answer)', () => {
     expect(shouldAttempt(attempt({ contentEncoding: 'gzip' }))).toBe(false);
     expect(shouldAttempt(attempt({ contentEncoding: 'br' }))).toBe(false);
+    // Explicit second param — same behavior as the default.
+    expect(shouldAttempt(attempt({ contentEncoding: 'gzip' }), false)).toBe(false);
+  });
+
+  it('IGNORES Content-Encoding when ignoreContentEncoding=true (first gate on the CloudFront response)', () => {
+    // The first gate re-fetches the origin with Accept-Encoding: identity, so a
+    // gzip/br first response must still PROCEED (it is not the body we inject).
+    expect(shouldAttempt(attempt({ contentEncoding: 'gzip' }), true)).toBe(true);
+    expect(shouldAttempt(attempt({ contentEncoding: 'br' }), true)).toBe(true);
+    expect(shouldAttempt(attempt({ contentEncoding: null }), true)).toBe(true);
+  });
+
+  it('still enforces every OTHER gate even when ignoreContentEncoding=true', () => {
+    // ignoreContentEncoding relaxes ONLY content-encoding — the rest still gate.
+    expect(shouldAttempt(attempt({ method: 'POST', contentEncoding: 'gzip' }), true)).toBe(false);
+    expect(shouldAttempt(attempt({ status: '404', contentEncoding: 'gzip' }), true)).toBe(false);
+    expect(
+      shouldAttempt(attempt({ contentType: 'application/json', contentEncoding: 'gzip' }), true)
+    ).toBe(false);
+    expect(shouldAttempt(attempt({ hasSetCookie: true, contentEncoding: 'gzip' }), true)).toBe(
+      false
+    );
+    expect(
+      shouldAttempt(attempt({ cacheControl: 'no-store', contentEncoding: 'gzip' }), true)
+    ).toBe(false);
+    expect(
+      shouldAttempt(
+        attempt({ contentType: 'text/html; charset=iso-8859-1', contentEncoding: 'gzip' }),
+        true
+      )
+    ).toBe(false);
   });
 
   it('rejects responses carrying Set-Cookie (per-request representation)', () => {

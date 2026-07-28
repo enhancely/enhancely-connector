@@ -3,10 +3,11 @@
  * (Lambda@Edge, sidecar). The Cloudflare adapter uses HTMLRewriter instead —
  * same intent: snippet becomes the last child of <head>. Unlike a real
  * parser, this path scans the raw string, so it explicitly skips `</head>`
- * occurrences inside <script>…</script> elements and <!-- … --> comments:
- * a literal "</head>" in an inline script string or a comment is just text
- * and must not attract the snippet (injecting there would break the page's
- * JavaScript and swallow the JSON-LD).
+ * occurrences that are inert text rather than the real end tag: inside a
+ * raw-text element (script/style/title/textarea/noscript), inside an
+ * `<!-- … -->` comment, or inside a quoted attribute value (e.g.
+ * `<meta content="… </head> …">`). Injecting at any of those would corrupt
+ * valid markup.
  */
 
 /**
@@ -33,37 +34,74 @@ export function buildScriptTag(jsonldRaw: string): string {
  */
 const RAW_TEXT_ELEMENTS = ['script', 'style', 'title', 'textarea', 'noscript'] as const;
 
-/**
- * Tokens that matter while scanning for the real `</head>`: comment
- * open/close, raw-text element open/close, head close. Inside a comment only
- * `-->` matters; inside a raw-text element only its own `</tag` matters.
- */
-const SCAN_TOKEN = new RegExp(
-  ['<!--', '-->', ...RAW_TEXT_ELEMENTS.flatMap((t) => [`<${t}\\b`, `</${t}\\s*>`]), '</head\\s*>']
-    .join('|')
-    .replace(/[/]/g, '\\/'),
-  'gi'
-);
+const HEAD_CLOSE = /^<\/head\s*>/i;
 
-/** Index of the first `</head>` outside raw-text/comment spans, or -1. */
-function findHeadCloseIndex(html: string): number {
-  let inRawText: string | null = null; // tag name whose end tag we await
-  let inComment = false;
-  for (const match of html.matchAll(SCAN_TOKEN)) {
-    const token = match[0].toLowerCase();
-    if (inComment) {
-      if (token === '-->') inComment = false;
-    } else if (inRawText !== null) {
-      if (token.startsWith(`</${inRawText}`)) inRawText = null;
-    } else if (token === '<!--') {
-      inComment = true;
-    } else if (token.startsWith('</head')) {
-      return match.index ?? -1;
-    } else if (!token.startsWith('</')) {
-      const open = RAW_TEXT_ELEMENTS.find((t) => token === `<${t}`);
-      if (open !== undefined) inRawText = open;
+/**
+ * Index just past the `>` that closes the start/end tag beginning at `start`
+ * (which must point at `<`), skipping `>` inside quoted attribute values.
+ * Returns -1 for an unterminated tag.
+ */
+function endOfTag(html: string, start: number): number {
+  let quote = '';
+  for (let i = start + 1; i < html.length; i++) {
+    const c = html[i];
+    if (quote !== '') {
+      if (c === quote) quote = '';
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (c === '>') {
+      return i + 1;
     }
-    // Stray end tags / `-->` outside their span are inert — ignored.
+  }
+  return -1;
+}
+
+/**
+ * Index of the first real `</head>`, or -1. A single left-to-right pass that
+ * treats the markup structurally, so a literal `</head>` is ignored when it is
+ * inert text: inside an HTML comment, inside a raw-text element
+ * (script/style/title/textarea/noscript), OR inside a quoted attribute value of
+ * any tag (e.g. `<meta content="… </head> …">`). Injecting at any of those
+ * would corrupt valid markup.
+ */
+function findHeadCloseIndex(html: string): number {
+  const lower = html.toLowerCase();
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf('<', i);
+    if (lt < 0) return -1;
+
+    if (lower.startsWith('<!--', lt)) {
+      const end = html.indexOf('-->', lt + 4);
+      if (end < 0) return -1; // unterminated comment → no real </head> follows
+      i = end + 3;
+      continue;
+    }
+
+    if (HEAD_CLOSE.test(html.slice(lt, lt + 32))) return lt;
+
+    // Raw-text element open (`<script`, `<style`, …)? Its end tag terminates it.
+    let raw: string | null = null;
+    for (const t of RAW_TEXT_ELEMENTS) {
+      if (lower.startsWith(`<${t}`, lt)) {
+        const after = html[lt + 1 + t.length];
+        if (after === undefined || /[\s/>]/.test(after)) {
+          raw = t;
+          break;
+        }
+      }
+    }
+
+    const tagEnd = endOfTag(html, lt);
+    if (tagEnd < 0) return -1; // unterminated tag
+    if (raw !== null) {
+      const close = lower.indexOf(`</${raw}`, tagEnd);
+      if (close < 0) return -1; // unterminated raw-text span → no real </head>
+      const gt = html.indexOf('>', close);
+      i = gt < 0 ? html.length : gt + 1;
+    } else {
+      i = tagEnd;
+    }
   }
   return -1;
 }

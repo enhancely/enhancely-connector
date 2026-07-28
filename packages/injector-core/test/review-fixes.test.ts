@@ -35,6 +35,43 @@ describe('injectIntoHead — raw-text elements (finding 1)', () => {
   });
 });
 
+describe('injectIntoHead — </head> inside a quoted attribute value (finding: head-scanner hardening)', () => {
+  it('injects before the REAL (last) </head>, not the one in a double-quoted attribute', () => {
+    const html = '<head><meta content="x </head> y"><title>t</title></head><body>';
+    const out = injectIntoHead(html, SNIP);
+    expect(out).toBe(`<head><meta content="x </head> y"><title>t</title>${SNIP}</head><body>`);
+    // Exactly one insertion, before the real closer — the attribute one is inert.
+    expect(out.split(SNIP)).toHaveLength(2);
+    const closer = out.lastIndexOf('</head>');
+    expect(out.slice(closer - SNIP.length, closer)).toBe(SNIP);
+  });
+
+  it('skips a </head> inside a single-quoted attribute value too', () => {
+    const html = "<head><meta content='x </head> y'><title>t</title></head><body>";
+    const out = injectIntoHead(html, SNIP);
+    expect(out).toBe(`<head><meta content='x </head> y'><title>t</title>${SNIP}</head><body>`);
+    expect(out.split(SNIP)).toHaveLength(2);
+  });
+
+  it('still skips a </head> inside a <script> string (raw-text regression)', () => {
+    const html = '<head><script>var t="</head>";</script></head><body>';
+    const out = injectIntoHead(html, SNIP);
+    expect(out).toBe(`<head><script>var t="</head>";</script>${SNIP}</head><body>`);
+    expect(out.split(SNIP)).toHaveLength(2);
+  });
+
+  it('still finds a real </head> when no inert one precedes it', () => {
+    expect(injectIntoHead('<head><meta charset="utf-8"></head><body>', SNIP)).toBe(
+      `<head><meta charset="utf-8">${SNIP}</head><body>`
+    );
+  });
+
+  it('fails open when the ONLY </head> is inside a quoted attribute value', () => {
+    const html = '<head><meta content="</head>"><body>no real head close</body>';
+    expect(injectIntoHead(html, SNIP)).toBe(html);
+  });
+});
+
 describe('parseRetryAfter (finding 10)', () => {
   it('parses delay-seconds', () => {
     expect(parseRetryAfter('30')).toBe(30);

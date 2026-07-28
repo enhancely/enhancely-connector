@@ -30,6 +30,12 @@
 import * as http from 'node:http';
 import * as https from 'node:https';
 
+/** Node http headers are string | string[] | undefined; take the first value. */
+function firstHeaderValue(value: string | string[] | undefined): string | null {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+
 export interface OriginFetchResult {
   status: number;
   contentType: string | null;
@@ -38,6 +44,15 @@ export interface OriginFetchResult {
   cacheControl: string | null;
   /** True when the re-fetched answer carries any Set-Cookie header. */
   hasSetCookie: boolean;
+  /**
+   * Content-Security-Policy of the re-fetched answer. The injected body comes
+   * from THIS response, so if the origin mints a per-response CSP nonce the
+   * matching header is this one — not the first response's. The caller copies
+   * it onto the generated response so header and body stay consistent.
+   */
+  contentSecurityPolicy: string | null;
+  /** CSP report-only variant, copied for the same reason. */
+  contentSecurityPolicyReportOnly: string | null;
   body: Buffer;
   /** True when the body exceeded `maxBytes` and buffering was aborted. */
   truncated: boolean;
@@ -82,6 +97,10 @@ export function fetchOriginHtml(
         const contentEncoding = response.headers['content-encoding'] ?? null;
         const cacheControl = response.headers['cache-control'] ?? null;
         const hasSetCookie = response.headers['set-cookie'] !== undefined;
+        const csp = firstHeaderValue(response.headers['content-security-policy']);
+        const cspReportOnly = firstHeaderValue(
+          response.headers['content-security-policy-report-only']
+        );
 
         const chunks: Buffer[] = [];
         let size = 0;
@@ -98,6 +117,8 @@ export function fetchOriginHtml(
               contentEncoding,
               cacheControl,
               hasSetCookie,
+              contentSecurityPolicy: csp,
+              contentSecurityPolicyReportOnly: cspReportOnly,
               body: Buffer.alloc(0),
               truncated: true,
             });
@@ -116,6 +137,8 @@ export function fetchOriginHtml(
             contentEncoding,
             cacheControl,
             hasSetCookie,
+            contentSecurityPolicy: csp,
+            contentSecurityPolicyReportOnly: cspReportOnly,
             body: Buffer.concat(chunks),
             truncated: false,
           });
