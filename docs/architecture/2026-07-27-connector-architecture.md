@@ -45,6 +45,15 @@ The connector sends the query-stripped `normalizeLite(url)` (4 rules, §2) — t
 
 Any error, timeout, oversized JSON-LD body, missing `</head>`, non-HTML content type, or non-2xx origin status → serve the original response untouched. Every Enhancely call runs under `AbortSignal.timeout` (default 800 ms). Successful JSON-LD responses are streamed with a 256 KiB hard ceiling (configurable downward only) and cancelled immediately when they exceed it; unused error bodies are cancelled as well. After a `429` or an error the core stores a short retry-backoff memo in its cache (`Retry-After`, capped at 60 s; 10 s for plain errors), so consecutive page views serve stale/nothing locally instead of re-hitting a rate-limited or down API and paying the timeout each time. The connector must never be the reason a customer page breaks or slows down materially; missing structured data on one view is an acceptable cost, a broken page is not.
 
+For Lambda@Edge, operator path exclusions are resolved before any config/API
+work. Matching canonicalizes the raw path in the same direction as the
+downstream URL layer: decode RFC 3986 unreserved octets once, convert literal
+backslashes to `/`, then collapse duplicate slashes and dot-segments. Reserved,
+non-ASCII, malformed, and double-encoded octets remain literal. The first
+response and identity re-fetch are both checked for
+`X-Robots-Tag: noindex|none`; either value vetoes injection, and other robots
+metadata must remain stable across both representations.
+
 ## 4. Target → artifact → install
 
 | Target                 | Artifact                                                          | Install / operations                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

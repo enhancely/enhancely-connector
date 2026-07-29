@@ -55,6 +55,12 @@ export interface OriginFetchResult {
   contentSecurityPolicy: string | null;
   /** CSP report-only variant, copied for the same reason. */
   contentSecurityPolicyReportOnly: string | null;
+  /**
+   * X-Robots-Tag of the re-fetched answer (all instances combined). The
+   * injected body comes from THIS response, so the noindex/none gate must
+   * hold for this representation too, not only for the first response.
+   */
+  xRobotsTag: string | null;
   body: Buffer;
   /** True when the body exceeded `maxBytes` and buffering was aborted. */
   truncated: boolean;
@@ -115,6 +121,7 @@ export function fetchOriginHtml(
         const cspReportOnly = combinedHeaderValue(
           response.headers['content-security-policy-report-only']
         );
+        const xRobotsTag = combinedHeaderValue(response.headers['x-robots-tag']);
 
         const chunks: Buffer[] = [];
         let size = 0;
@@ -134,6 +141,7 @@ export function fetchOriginHtml(
               hasSetCookie,
               contentSecurityPolicy: csp,
               contentSecurityPolicyReportOnly: cspReportOnly,
+              xRobotsTag,
               body: Buffer.alloc(0),
               truncated: true,
             });
@@ -155,6 +163,7 @@ export function fetchOriginHtml(
             hasSetCookie,
             contentSecurityPolicy: csp,
             contentSecurityPolicyReportOnly: cspReportOnly,
+            xRobotsTag,
             body: Buffer.concat(chunks),
             truncated: false,
           });
