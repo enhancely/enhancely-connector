@@ -4,6 +4,8 @@
   "timeoutMs": 800,
   "cacheTtlMs": 300000,
   "autoRegister": false,
+  "assertedDefaultTtlSeconds": 0,
+  "excludePaths": [],
   "originTimeoutMs": 2000,
   "ssmParameterName": "/enhancely/connector/api-key",
   "ssmRegion": "us-east-1",

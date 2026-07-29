@@ -15,9 +15,10 @@
  * response's Content-Encoding (real viewers get gzip/br, but we re-fetch
  * identity); the identity re-fetch is re-gated on encoding. Representation
  * headers are handled conservatively: Content-Type becomes explicit UTF-8;
- * Cache-Control/Expires must be stable across both responses; and CSP structure
- * must remain stable except for body-bound nonces/hashes (the accepted
- * re-fetch value matches its body). CloudFront then caches the
+ * Cache-Control/Expires and non-blocking X-Robots-Tag metadata must be stable
+ * across both responses; noindex/none on either response vetoes injection;
+ * and CSP structure must remain stable except for body-bound nonces/hashes
+ * (the accepted re-fetch value matches its body). CloudFront then caches the
  * injected page, so the extra origin roundtrip is paid once per CloudFront
  * cache miss — origin-response does not fire on hits. A retryable no-snippet
  * result receives a short shared-cache TTL aligned with the core/config retry
@@ -334,6 +335,20 @@ function combinedHeaderValue(headers: CloudFrontHeaders, name: string): string |
   return entries === undefined ? null : entries.map((entry) => entry.value).join(', ');
 }
 
+/** `noindex` / `none` as complete X-Robots-Tag directives, not substrings. */
+function blocksIndexing(xRobotsTag: string | null): boolean {
+  return xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag);
+}
+
+/** Ignore casing and harmless comma/whitespace differences for stability checks. */
+function normalizedRobotsTag(xRobotsTag: string | null): string | null {
+  if (xRobotsTag === null) return null;
+  return xRobotsTag
+    .split(',')
+    .map((directive) => directive.trim().replace(/\s+/g, ' ').toLowerCase())
+    .join(',');
+}
+
 /** Numeric Cache-Control directive value, or null when absent/invalid. */
 function cacheDirectiveSeconds(policy: string, wanted: 'max-age' | 's-maxage'): number | null {
   for (const directive of policy.split(',')) {
@@ -614,7 +629,7 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // triggers never see the body, so a `<meta name="robots">` cannot be
     // honored at this layer; use excludePaths for those sections instead.
     const xRobotsTag = combinedHeaderValue(response.headers, 'x-robots-tag');
-    if (xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag)) {
+    if (blocksIndexing(xRobotsTag)) {
       return response;
     }
 
@@ -682,6 +697,20 @@ export const handler: CloudFrontResponseHandler = async (event) => {
         hasSetCookie: origin.hasSetCookie,
       })
     ) {
+      return response;
+    }
+
+    // The generated body comes from the identity re-fetch, so its indexing
+    // policy is authoritative too. A noindex/none that appears only there
+    // must still veto injection; otherwise we would decorate that body and
+    // return it without the re-fetch's X-Robots-Tag.
+    if (blocksIndexing(origin.xRobotsTag)) {
+      return response;
+    }
+    // Non-blocking directives are policy metadata as well. If they differ
+    // between the first answer and the body source, neither response is a
+    // safe substitute for the other, so preserve the first one untouched.
+    if (normalizedRobotsTag(xRobotsTag) !== normalizedRobotsTag(origin.xRobotsTag)) {
       return response;
     }
 

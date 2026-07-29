@@ -417,6 +417,19 @@ function globMatch(pattern, text) {
     p += 1;
   return p === pattern.length;
 }
+function decodeUnreservedOctets(pathname) {
+  return pathname.replace(/%([0-9A-Fa-f]{2})/g, (encoded, hex) => {
+    const code = parseInt(hex, 16);
+    const isUnreserved = code >= 65 && code <= 90 || // A-Z
+    code >= 97 && code <= 122 || // a-z
+    code >= 48 && code <= 57 || // 0-9
+    code === 45 || // -
+    code === 46 || // .
+    code === 95 || // _
+    code === 126;
+    return isUnreserved ? String.fromCharCode(code) : encoded;
+  });
+}
 function normalizePathForMatch(pathname) {
   const segments = [];
   for (const segment of pathname.split("/")) {
@@ -434,7 +447,7 @@ function normalizePathForMatch(pathname) {
   return `/${segments.join("/")}${endsAsDirectory ? "/" : ""}`;
 }
 function matchesExcludedPath(patterns, pathname) {
-  const normalized = normalizePathForMatch(pathname);
+  const normalized = normalizePathForMatch(decodeUnreservedOctets(pathname).replaceAll("\\", "/"));
   for (const pattern of patterns) {
     if (typeof pattern !== "string" || pattern === "" || pattern.length > 255)
       continue;
@@ -755,6 +768,7 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
         const cspReportOnly = combinedHeaderValue(
           response.headers["content-security-policy-report-only"]
         );
+        const xRobotsTag = combinedHeaderValue(response.headers["x-robots-tag"]);
         const chunks = [];
         let size = 0;
         let settled = false;
@@ -772,6 +786,7 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
               hasSetCookie,
               contentSecurityPolicy: csp,
               contentSecurityPolicyReportOnly: cspReportOnly,
+              xRobotsTag,
               body: Buffer.alloc(0),
               truncated: true
             });
@@ -792,6 +807,7 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
             hasSetCookie,
             contentSecurityPolicy: csp,
             contentSecurityPolicyReportOnly: cspReportOnly,
+            xRobotsTag,
             body: Buffer.concat(chunks),
             truncated: false
           });
@@ -901,6 +917,13 @@ function cacheControlValue(headers) {
 function combinedHeaderValue2(headers, name) {
   const entries = headers[name];
   return entries === void 0 ? null : entries.map((entry) => entry.value).join(", ");
+}
+function blocksIndexing(xRobotsTag) {
+  return xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag);
+}
+function normalizedRobotsTag(xRobotsTag) {
+  if (xRobotsTag === null) return null;
+  return xRobotsTag.split(",").map((directive) => directive.trim().replace(/\s+/g, " ").toLowerCase()).join(",");
 }
 function cacheDirectiveSeconds(policy, wanted) {
   for (const directive of policy.split(",")) {
@@ -1030,7 +1053,7 @@ var handler = async (event) => {
       return response;
     }
     const xRobotsTag = combinedHeaderValue2(response.headers, "x-robots-tag");
-    if (xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag)) {
+    if (blocksIndexing(xRobotsTag)) {
       return response;
     }
     const originUrl = buildOriginUrl(request);
@@ -1066,6 +1089,12 @@ var handler = async (event) => {
       cacheControl: origin.cacheControl,
       hasSetCookie: origin.hasSetCookie
     })) {
+      return response;
+    }
+    if (blocksIndexing(origin.xRobotsTag)) {
+      return response;
+    }
+    if (normalizedRobotsTag(xRobotsTag) !== normalizedRobotsTag(origin.xRobotsTag)) {
       return response;
     }
     const firstCacheControl = cacheControlValue(response.headers);

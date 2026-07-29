@@ -238,6 +238,46 @@ beforeAll(async () => {
       res.end(PAGE_HTML);
       return;
     }
+    if (path === '/robots-refetch-noindex') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': ['nofollow', 'googlebot: noindex'],
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/robots-refetch-none') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': 'googlebot: none',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/robots-refetch-nofollow') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': 'nofollow',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/robots-refetch-harmless') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': 'nofollow, noarchive',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/robots-refetch-unavailable') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': 'unavailable_after: 25 Jun 2027 15:00:00 PST',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end(PAGE_HTML);
   });
@@ -1299,6 +1339,29 @@ describe('handler — retryable pass-through cache policy', () => {
   });
 
   it.each([
+    '/%61ccount/orders',
+    '/public/%2e%2e/login',
+    '/.%2e/login',
+    String.raw`/public\..\login`,
+    String.raw`/public/%2e%2e\login`,
+  ])('excludePaths: canonicalized raw path %s is skipped before any work', async (uri) => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      assertedDefaultTtlSeconds: 86_400,
+      excludePaths: ['/account/*', '/login'],
+    });
+    const event = eventFor(uri, {
+      responseHeaders: { 'content-type': 'text/html; charset=utf-8', etag: '"keep"' },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(originHits).toBe(0);
+  });
+
+  it.each([
     'noindex',
     'noindex, nofollow',
     'googlebot: noindex, nofollow',
@@ -1327,21 +1390,59 @@ describe('handler — retryable pass-through cache policy', () => {
     expect(originHits).toBe(0);
   });
 
-  it.each(['nofollow, noarchive', 'unavailable_after: 25 Jun 2027 15:00:00 PST'])(
-    'X-Robots-Tag "%s" does not block injection',
-    async (tagValue) => {
-      __setBakedConfigForTests({ apiKey: 'sk-test', cacheTtlMs: 20_000 });
-      const event = eventFor('/page', {
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          'x-robots-tag': tagValue,
-        },
-      });
+  it.each(['/robots-refetch-noindex', '/robots-refetch-none'])(
+    'X-Robots-Tag on the identity re-fetch (%s) vetoes injection',
+    async (uri) => {
+      const event = eventFor(uri);
       const result = await invoke(event);
 
-      expect(result?.body).toContain(SNIPPET);
+      expect(result).toBe(event.Records[0]?.cf.response);
+      expect(result?.body).toBeUndefined();
+      // The first response had no visible robots policy, so discovery requires
+      // the normal lookup and one identity re-fetch — but never modifies it.
+      expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+      expect(originHits).toBe(1);
     }
   );
+
+  it('fails open when a non-blocking X-Robots-Tag differs on the re-fetch', async () => {
+    const event = eventFor('/robots-refetch-nofollow');
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(originHits).toBe(1);
+  });
+
+  it('accepts equivalent X-Robots-Tag casing and whitespace across both responses', async () => {
+    const event = eventFor('/robots-refetch-nofollow', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': ' NOFOLLOW ',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(originHits).toBe(1);
+  });
+
+  it.each([
+    ['nofollow, noarchive', '/robots-refetch-harmless'],
+    ['unavailable_after: 25 Jun 2027 15:00:00 PST', '/robots-refetch-unavailable'],
+  ])('X-Robots-Tag "%s" does not block injection', async (tagValue, uri) => {
+    __setBakedConfigForTests({ apiKey: 'sk-test', cacheTtlMs: 20_000 });
+    const event = eventFor(uri, {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': tagValue,
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain(SNIPPET);
+  });
 
   it('assertedDefaultTtlSeconds: caps a lifetime-less uninjected pass-through to the retry TTL', async () => {
     // The operator asserted a nonzero DefaultTTL, so this response is already
