@@ -69,7 +69,15 @@ export const DEFAULT_ORIGIN_TIMEOUT_MS = 2000;
  */
 export const DEFAULT_SSM_TIMEOUT_MS = 2000;
 
-/** Shape of the deploy-time generated `connector-config.json` (all optional). */
+/**
+ * Shape of the deploy-time generated `connector-config.json` (all optional).
+ *
+ * NOTE for hand-rolled deployments: `excludePaths` and
+ * `assertedDefaultTtlSeconds` are honored ONLY via this baked file. A
+ * deployment that supplies the key purely through SSM without shipping a
+ * `connector-config.json` silently runs without both controls. The Terraform
+ * module always bakes the file, so the supported path is unaffected.
+ */
 export interface BakedConnectorConfig {
   /** Enhancely API key. When present, SSM is never contacted. */
   apiKey?: string;
@@ -89,6 +97,32 @@ export interface BakedConnectorConfig {
   ssmRegion?: string;
   /** Timeout for the SSM GetParameter call (default: 2000 ms). */
   ssmTimeoutMs?: number;
+  /**
+   * Operator assertion, in seconds: every cache behavior this function is
+   * associated with has a DefaultTTL of AT LEAST this many seconds for the
+   * HTML it serves. When set (> 0), an uninjected pass-through response
+   * WITHOUT an explicit origin lifetime receives the bounded retry
+   * Cache-Control capped at `min(retryTtl, this value)` — such a response is
+   * already shared-cached for at least the asserted lifetime, so the write
+   * can only SHORTEN effective cacheability, never extend it. That unpins
+   * lookup timeouts and 404s after seconds instead of the full DefaultTTL
+   * (often a day). The number form is what makes the invariant arithmetic
+   * instead of trust: even a conservative understatement (e.g. 60) is safe
+   * and effective. Absent/0 = off (v0.5.3 behavior). Never set it higher
+   * than the SMALLEST DefaultTTL among the associated behaviors; leave off
+   * when any of them has DefaultTTL 0. Credentialed requests
+   * (Authorization/Cookie) are never touched either way.
+   */
+  assertedDefaultTtlSeconds?: number;
+  /**
+   * Request paths the connector must not touch AT ALL (login/account areas,
+   * robots.txt-disallowed or noindex-by-policy sections): no Enhancely
+   * lookup, no auto-registration, no cache-TTL rewriting, no origin re-fetch
+   * — the response passes through byte-identical with its normal caching.
+   * CloudFront path-pattern wildcards (`*`), case-sensitive, matched against
+   * the full request path. Checked before config/SSM resolution.
+   */
+  excludePaths?: string[];
 }
 
 /* ------------------------------------------------------------------------ */
@@ -106,6 +140,10 @@ let negativeUntil = 0;
 let inflight: Promise<InjectorConfig | null> | null = null;
 const NEGATIVE_TTL_MS = 30_000;
 let resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
+let resolvedAssertedDefaultTtlSeconds = 0;
+// The baked FILE read is memoized separately from key resolution: exclusion
+// checks must work synchronously before (and without) any SSM call.
+let bakedCache: BakedConnectorConfig | null | undefined;
 
 /** Test seams — `undefined` means "use the real file read". */
 let bakedOverride: BakedConnectorConfig | null | undefined;
@@ -146,6 +184,18 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   if (ssmRegion !== undefined) baked.ssmRegion = ssmRegion;
   const ssmTimeoutMs = positiveNumber(source['ssmTimeoutMs']);
   if (ssmTimeoutMs !== undefined) baked.ssmTimeoutMs = ssmTimeoutMs;
+  const assertedDefaultTtlSeconds = positiveNumber(source['assertedDefaultTtlSeconds']);
+  // Whole seconds only, minimum 1: a fractional assertion below 1 would
+  // floor to s-maxage=0 downstream (safe but surprising) — treat it as off.
+  if (assertedDefaultTtlSeconds !== undefined && assertedDefaultTtlSeconds >= 1) {
+    baked.assertedDefaultTtlSeconds = Math.floor(assertedDefaultTtlSeconds);
+  }
+  if (Array.isArray(source['excludePaths'])) {
+    const patterns = source['excludePaths'].filter(
+      (entry): entry is string => typeof entry === 'string' && entry !== ''
+    );
+    if (patterns.length > 0) baked.excludePaths = patterns;
+  }
 
   return baked;
 }
@@ -205,10 +255,22 @@ async function fetchApiKeyFromSsm(
   return nonEmptyString(result.Parameter?.Value) ?? null;
 }
 
+/** Baked config, read at most once per execution environment (test seam wins). */
+function bakedConfig(): BakedConnectorConfig | null {
+  if (bakedOverride !== undefined) return bakedOverride;
+  if (bakedCache === undefined) bakedCache = readBakedConfig();
+  return bakedCache;
+}
+
 async function resolveOnce(): Promise<InjectorConfig | null> {
   try {
-    const baked = bakedOverride !== undefined ? bakedOverride : readBakedConfig();
+    const baked = bakedConfig();
     resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
+    // Set alongside the origin timeout, BEFORE any key check: the cap must
+    // also govern the pass-through path taken while the key is missing or
+    // SSM is failing (getConfigRetryInMs) — that path caches uninjected
+    // responses too.
+    resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
 
     let apiKey = baked?.apiKey;
     if (apiKey === undefined) {
@@ -305,6 +367,29 @@ export function getOriginTimeoutMs(): number {
   return resolvedOriginTimeoutMs;
 }
 
+/**
+ * The operator's asserted minimum DefaultTTL in seconds (baked config
+ * `assertedDefaultTtlSeconds`), or 0 when the assertion was not made. When
+ * positive, uninjected pass-through responses WITHOUT an explicit origin
+ * lifetime may receive the bounded retry Cache-Control capped at this value;
+ * without the assertion the adapter cannot know the DefaultTTL and must not
+ * add cacheability. Only meaningful after `resolveAdapterConfig()` settled —
+ * exactly the order the handler uses.
+ */
+export function getAssertedDefaultTtlSeconds(): number {
+  return resolvedAssertedDefaultTtlSeconds;
+}
+
+/**
+ * Operator exclude patterns (baked config `excludePaths`). Read directly from
+ * the memoized baked file so the handler can skip excluded requests BEFORE
+ * any config/SSM resolution — an excluded path must not even pay the first
+ * key fetch.
+ */
+export function getExcludePaths(): readonly string[] {
+  return bakedConfig()?.excludePaths ?? [];
+}
+
 /* ------------------------------------------------------------------------ */
 /* Test seams (no-ops in production — nothing calls them)                     */
 /* ------------------------------------------------------------------------ */
@@ -334,4 +419,6 @@ export function __resetAdapterConfigForTests(): void {
   configOverrides = null;
   __resetMemoForTests();
   resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
+  resolvedAssertedDefaultTtlSeconds = 0;
+  bakedCache = undefined;
 }

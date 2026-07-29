@@ -44,12 +44,14 @@ data "archive_file" "bundle" {
   source {
     filename = "connector-config.json"
     content = jsonencode({
-      enhancelyBase    = var.enhancely_base
-      ssmParameterName = var.ssm_parameter_name
-      ssmRegion        = "us-east-1"
-      timeoutMs        = var.timeout_ms
-      cacheTtlMs       = var.cache_ttl_ms
-      autoRegister     = var.auto_register
+      enhancelyBase             = var.enhancely_base
+      ssmParameterName          = var.ssm_parameter_name
+      ssmRegion                 = "us-east-1"
+      timeoutMs                 = var.timeout_ms
+      cacheTtlMs                = var.cache_ttl_ms
+      autoRegister              = var.auto_register
+      assertedDefaultTtlSeconds = var.asserted_default_ttl_seconds
+      excludePaths              = var.exclude_paths
     })
   }
 }

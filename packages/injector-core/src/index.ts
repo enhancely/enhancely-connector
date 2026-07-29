@@ -27,6 +27,7 @@ export { normalizeLite } from './normalize.js';
 export { MemoryCache, isFresh } from './cache.js';
 export { fetchJsonLd, registerJsonLd, parseRetryAfter } from './client.js';
 export { buildScriptTag, injectIntoHead } from './inject.js';
+export { matchesExcludedPath } from './exclude.js';
 
 import type {
   CacheBackend,
