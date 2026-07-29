@@ -42,8 +42,19 @@ import type {
   CloudFrontResponseHandler,
   CloudFrontResultResponse,
 } from 'aws-lambda';
-import { getJsonLdLookup, injectIntoHead, MemoryCache } from '@enhancely/injector-core';
-import { getConfigRetryInMs, getOriginTimeoutMs, resolveAdapterConfig } from './config.js';
+import {
+  getJsonLdLookup,
+  injectIntoHead,
+  matchesExcludedPath,
+  MemoryCache,
+} from '@enhancely/injector-core';
+import {
+  getCapUninjectedTtl,
+  getConfigRetryInMs,
+  getExcludePaths,
+  getOriginTimeoutMs,
+  resolveAdapterConfig,
+} from './config.js';
 import { fetchOriginHtml } from './origin-fetch.js';
 
 export {
@@ -379,8 +390,21 @@ function normalizedCspStructure(policy: string): string {
  * the invariant "never make a response more cacheable than it already was". So
  * we only ever SHORTEN an explicit lifetime (max-age/s-maxage/Expires) and
  * leave header-less responses untouched.
+ *
+ * `capWithoutExplicitLifetime` is the operator's way OUT of that blindness:
+ * the baked config flag `capUninjectedTtl` asserts that the distribution's
+ * DefaultTTL is nonzero for this content, i.e. a lifetime-less pass-through
+ * is ALREADY shared-cached (typically for far longer than the retry TTL).
+ * Under that assertion the cap still only shortens effective cacheability,
+ * so the invariant holds; without it a single lookup timeout pins an
+ * uninjected response in CloudFront for the full DefaultTTL (a day on the
+ * common default) instead of the seconds the retry logic intends.
  */
-function retrySharedTtlSeconds(headers: CloudFrontHeaders, revalidateInMs: number): number | null {
+function retrySharedTtlSeconds(
+  headers: CloudFrontHeaders,
+  revalidateInMs: number,
+  capWithoutExplicitLifetime: boolean
+): number | null {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1000));
   const policy = cacheControlValue(headers);
 
@@ -410,8 +434,10 @@ function retrySharedTtlSeconds(headers: CloudFrontHeaders, revalidateInMs: numbe
     }
   }
 
-  // Origin declared no explicit lifetime → do not introduce shared caching.
-  return null;
+  // Origin declared no explicit lifetime. Without the operator assertion, do
+  // not introduce shared caching; with it, the response is already cached for
+  // the (longer) DefaultTTL, so the retry TTL only shortens it.
+  return capWithoutExplicitLifetime ? retryTtl : null;
 }
 
 /**
@@ -435,7 +461,11 @@ function retryablePassThroughResponse(
   }
 
   const originalHeaders = response.headers ?? {};
-  const sharedTtlSeconds = retrySharedTtlSeconds(originalHeaders, revalidateInMs);
+  const sharedTtlSeconds = retrySharedTtlSeconds(
+    originalHeaders,
+    revalidateInMs,
+    getCapUninjectedTtl()
+  );
   // The origin declared no explicit cache lifetime → leave the response exactly
   // as it is (its cacheability is the distribution's DefaultTTL, which we must
   // not override upward). Adding s-maxage here could cache an
@@ -536,6 +566,15 @@ export const handler: CloudFrontResponseHandler = async (event) => {
   const { request, response } = record.cf;
 
   try {
+    // Operator-excluded paths (login/account areas, robots.txt-disallowed
+    // sections) pay NOTHING: no config/SSM resolution, no lookup, no
+    // auto-registration, no cache rewriting — byte-identical pass-through
+    // with the origin's normal caching. Checked first because it is the
+    // cheapest gate and the only purely policy-driven one.
+    if (matchesExcludedPath(getExcludePaths(), request.uri)) {
+      return response;
+    }
+
     // Cheap gate on what CloudFront already knows — no network work unless
     // this looks like an injectable HTML page.
     if (
@@ -552,6 +591,16 @@ export const handler: CloudFrontResponseHandler = async (event) => {
         true
       )
     ) {
+      return response;
+    }
+
+    // A page the origin itself marks noindex is not schema-markup territory:
+    // pass it through untouched (normal caching, no lookup, no registration).
+    // Only the header form is visible here — origin-response triggers never
+    // see the body, so a `<meta name="robots">` cannot be honored at this
+    // layer; use excludePaths for those sections instead.
+    const xRobotsTag = combinedHeaderValue(response.headers, 'x-robots-tag');
+    if (xRobotsTag !== null && /(?:^|[\s,:])noindex(?:$|[\s,])/i.test(xRobotsTag)) {
       return response;
     }
 

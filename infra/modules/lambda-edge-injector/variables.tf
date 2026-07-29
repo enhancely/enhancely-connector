@@ -33,6 +33,18 @@ variable "auto_register" {
   description = "Self-registration: POST unknown pages to Enhancely on first visit (once per URL per cache TTL) so the catalog fills itself from real traffic."
 }
 
+variable "exclude_paths" {
+  type        = list(string)
+  default     = []
+  description = "Request paths the connector must not touch at all (login/account areas, robots.txt-disallowed sections): no lookup, no auto-registration, no cache rewriting, no added latency. CloudFront path-pattern wildcards (*), case-sensitive, matched against the full request path."
+}
+
+variable "cap_uninjected_ttl" {
+  type        = bool
+  default     = false
+  description = "Operator assertion that the distribution's DefaultTTL is nonzero for this HTML: uninjected pass-through responses WITHOUT an explicit origin cache lifetime then also get the bounded retry Cache-Control (seconds) instead of inheriting the DefaultTTL (often a day). Never enable on a DefaultTTL=0 distribution. Credentialed requests stay untouched."
+}
+
 variable "timeout_ms" {
   type        = number
   default     = 2000

@@ -391,6 +391,21 @@ function injectIntoHead(html, snippet) {
   return html.slice(0, index) + snippet + html.slice(index);
 }
 
+// ../injector-core/dist/exclude.js
+function escapeRegExp(literal) {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function matchesExcludedPath(patterns, pathname) {
+  for (const pattern of patterns) {
+    if (typeof pattern !== "string" || pattern === "")
+      continue;
+    const regex = new RegExp(`^${pattern.split("*").map(escapeRegExp).join(".*")}$`);
+    if (regex.test(pathname))
+      return true;
+  }
+  return false;
+}
+
 // ../injector-core/dist/index.js
 function snippetFromEntry(entry) {
   return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw) : null;
@@ -494,6 +509,8 @@ var negativeUntil = 0;
 var inflight = null;
 var NEGATIVE_TTL_MS = 3e4;
 var resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
+var resolvedCapUninjectedTtl = false;
+var bakedCache;
 var bakedOverride;
 var configOverrides = null;
 function nonEmptyString(value) {
@@ -523,6 +540,15 @@ function parseBaked(raw) {
   if (ssmRegion !== void 0) baked.ssmRegion = ssmRegion;
   const ssmTimeoutMs = positiveNumber(source["ssmTimeoutMs"]);
   if (ssmTimeoutMs !== void 0) baked.ssmTimeoutMs = ssmTimeoutMs;
+  if (typeof source["capUninjectedTtl"] === "boolean") {
+    baked.capUninjectedTtl = source["capUninjectedTtl"];
+  }
+  if (Array.isArray(source["excludePaths"])) {
+    const patterns = source["excludePaths"].filter(
+      (entry) => typeof entry === "string" && entry !== ""
+    );
+    if (patterns.length > 0) baked.excludePaths = patterns;
+  }
   return baked;
 }
 function readBakedConfig() {
@@ -559,10 +585,16 @@ async function fetchApiKeyFromSsm(parameterName, region, timeoutMs) {
   );
   return nonEmptyString(result.Parameter?.Value) ?? null;
 }
+function bakedConfig() {
+  if (bakedOverride !== void 0) return bakedOverride;
+  if (bakedCache === void 0) bakedCache = readBakedConfig();
+  return bakedCache;
+}
 async function resolveOnce() {
   try {
-    const baked = bakedOverride !== void 0 ? bakedOverride : readBakedConfig();
+    const baked = bakedConfig();
     resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
+    resolvedCapUninjectedTtl = baked?.capUninjectedTtl ?? false;
     let apiKey = baked?.apiKey;
     if (apiKey === void 0) {
       apiKey = await fetchApiKeyFromSsm(
@@ -620,6 +652,12 @@ function getConfigRetryInMs() {
 }
 function getOriginTimeoutMs() {
   return resolvedOriginTimeoutMs;
+}
+function getCapUninjectedTtl() {
+  return resolvedCapUninjectedTtl;
+}
+function getExcludePaths() {
+  return bakedConfig()?.excludePaths ?? [];
 }
 
 // src/origin-fetch.ts
@@ -851,7 +889,7 @@ function normalizedCspStructure(policy) {
     return [rawName.toLowerCase(), ...sources].join(" ");
   }).filter((directive) => directive !== "").join(";");
 }
-function retrySharedTtlSeconds(headers, revalidateInMs) {
+function retrySharedTtlSeconds(headers, revalidateInMs, capWithoutExplicitLifetime) {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
   const policy = cacheControlValue(headers);
   if (policy !== null) {
@@ -873,14 +911,18 @@ function retrySharedTtlSeconds(headers, revalidateInMs) {
       return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1e3)));
     }
   }
-  return null;
+  return capWithoutExplicitLifetime ? retryTtl : null;
 }
 function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) {
   if (requestHeaders["authorization"] !== void 0 || requestHeaders["cookie"] !== void 0) {
     return response;
   }
   const originalHeaders = response.headers ?? {};
-  const sharedTtlSeconds = retrySharedTtlSeconds(originalHeaders, revalidateInMs);
+  const sharedTtlSeconds = retrySharedTtlSeconds(
+    originalHeaders,
+    revalidateInMs,
+    getCapUninjectedTtl()
+  );
   if (sharedTtlSeconds === null) return response;
   const headers = { ...originalHeaders };
   headers["cache-control"] = [
@@ -930,6 +972,9 @@ var handler = async (event) => {
   }
   const { request, response } = record.cf;
   try {
+    if (matchesExcludedPath(getExcludePaths(), request.uri)) {
+      return response;
+    }
     if (!shouldAttempt(
       {
         method: request.method,
@@ -942,6 +987,10 @@ var handler = async (event) => {
       // Ignore the first response's content-encoding — we re-fetch identity.
       true
     )) {
+      return response;
+    }
+    const xRobotsTag = combinedHeaderValue2(response.headers, "x-robots-tag");
+    if (xRobotsTag !== null && /(?:^|[\s,:])noindex(?:$|[\s,])/i.test(xRobotsTag)) {
       return response;
     }
     const originUrl = buildOriginUrl(request);

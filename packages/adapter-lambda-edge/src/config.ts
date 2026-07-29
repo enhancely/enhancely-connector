@@ -89,6 +89,27 @@ export interface BakedConnectorConfig {
   ssmRegion?: string;
   /** Timeout for the SSM GetParameter call (default: 2000 ms). */
   ssmTimeoutMs?: number;
+  /**
+   * Operator assertion: the distribution serves public HTML with a NONZERO
+   * DefaultTTL, so an uninjected pass-through response without an explicit
+   * origin lifetime is ALREADY shared-cached — capping it to the retry TTL
+   * can only shorten that, never add cacheability. When true, the adapter
+   * applies its bounded retry Cache-Control to such responses too, so a
+   * lookup timeout or 404 is retried after seconds instead of being pinned
+   * uninjected in CloudFront for the full DefaultTTL. Leave false (default)
+   * on distributions whose DefaultTTL is 0. Credentialed requests
+   * (Authorization/Cookie) are never touched either way.
+   */
+  capUninjectedTtl?: boolean;
+  /**
+   * Request paths the connector must not touch AT ALL (login/account areas,
+   * robots.txt-disallowed or noindex-by-policy sections): no Enhancely
+   * lookup, no auto-registration, no cache-TTL rewriting, no origin re-fetch
+   * — the response passes through byte-identical with its normal caching.
+   * CloudFront path-pattern wildcards (`*`), case-sensitive, matched against
+   * the full request path. Checked before config/SSM resolution.
+   */
+  excludePaths?: string[];
 }
 
 /* ------------------------------------------------------------------------ */
@@ -106,6 +127,10 @@ let negativeUntil = 0;
 let inflight: Promise<InjectorConfig | null> | null = null;
 const NEGATIVE_TTL_MS = 30_000;
 let resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
+let resolvedCapUninjectedTtl = false;
+// The baked FILE read is memoized separately from key resolution: exclusion
+// checks must work synchronously before (and without) any SSM call.
+let bakedCache: BakedConnectorConfig | null | undefined;
 
 /** Test seams — `undefined` means "use the real file read". */
 let bakedOverride: BakedConnectorConfig | null | undefined;
@@ -146,6 +171,15 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   if (ssmRegion !== undefined) baked.ssmRegion = ssmRegion;
   const ssmTimeoutMs = positiveNumber(source['ssmTimeoutMs']);
   if (ssmTimeoutMs !== undefined) baked.ssmTimeoutMs = ssmTimeoutMs;
+  if (typeof source['capUninjectedTtl'] === 'boolean') {
+    baked.capUninjectedTtl = source['capUninjectedTtl'];
+  }
+  if (Array.isArray(source['excludePaths'])) {
+    const patterns = source['excludePaths'].filter(
+      (entry): entry is string => typeof entry === 'string' && entry !== ''
+    );
+    if (patterns.length > 0) baked.excludePaths = patterns;
+  }
 
   return baked;
 }
@@ -205,10 +239,22 @@ async function fetchApiKeyFromSsm(
   return nonEmptyString(result.Parameter?.Value) ?? null;
 }
 
+/** Baked config, read at most once per execution environment (test seam wins). */
+function bakedConfig(): BakedConnectorConfig | null {
+  if (bakedOverride !== undefined) return bakedOverride;
+  if (bakedCache === undefined) bakedCache = readBakedConfig();
+  return bakedCache;
+}
+
 async function resolveOnce(): Promise<InjectorConfig | null> {
   try {
-    const baked = bakedOverride !== undefined ? bakedOverride : readBakedConfig();
+    const baked = bakedConfig();
     resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
+    // Set alongside the origin timeout, BEFORE any key check: the cap must
+    // also govern the pass-through path taken while the key is missing or
+    // SSM is failing (getConfigRetryInMs) — that path caches uninjected
+    // responses too.
+    resolvedCapUninjectedTtl = baked?.capUninjectedTtl ?? false;
 
     let apiKey = baked?.apiKey;
     if (apiKey === undefined) {
@@ -305,6 +351,28 @@ export function getOriginTimeoutMs(): number {
   return resolvedOriginTimeoutMs;
 }
 
+/**
+ * Whether the operator asserted (baked config `capUninjectedTtl`) that
+ * uninjected pass-through responses WITHOUT an explicit origin lifetime may
+ * also receive the bounded retry Cache-Control. False by default: without the
+ * assertion the adapter cannot know the distribution's DefaultTTL and must
+ * not add cacheability. Only meaningful after `resolveAdapterConfig()`
+ * settled — exactly the order the handler uses.
+ */
+export function getCapUninjectedTtl(): boolean {
+  return resolvedCapUninjectedTtl;
+}
+
+/**
+ * Operator exclude patterns (baked config `excludePaths`). Read directly from
+ * the memoized baked file so the handler can skip excluded requests BEFORE
+ * any config/SSM resolution — an excluded path must not even pay the first
+ * key fetch.
+ */
+export function getExcludePaths(): readonly string[] {
+  return bakedConfig()?.excludePaths ?? [];
+}
+
 /* ------------------------------------------------------------------------ */
 /* Test seams (no-ops in production — nothing calls them)                     */
 /* ------------------------------------------------------------------------ */
@@ -334,4 +402,6 @@ export function __resetAdapterConfigForTests(): void {
   configOverrides = null;
   __resetMemoForTests();
   resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
+  resolvedCapUninjectedTtl = false;
+  bakedCache = undefined;
 }

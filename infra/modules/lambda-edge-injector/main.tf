@@ -50,6 +50,8 @@ data "archive_file" "bundle" {
       timeoutMs        = var.timeout_ms
       cacheTtlMs       = var.cache_ttl_ms
       autoRegister     = var.auto_register
+      capUninjectedTtl = var.cap_uninjected_ttl
+      excludePaths     = var.exclude_paths
     })
   }
 }
