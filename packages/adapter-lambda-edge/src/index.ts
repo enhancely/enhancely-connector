@@ -42,8 +42,19 @@ import type {
   CloudFrontResponseHandler,
   CloudFrontResultResponse,
 } from 'aws-lambda';
-import { getJsonLdLookup, injectIntoHead, MemoryCache } from '@enhancely/injector-core';
-import { getConfigRetryInMs, getOriginTimeoutMs, resolveAdapterConfig } from './config.js';
+import {
+  getJsonLdLookup,
+  injectIntoHead,
+  matchesExcludedPath,
+  MemoryCache,
+} from '@enhancely/injector-core';
+import {
+  getAssertedDefaultTtlSeconds,
+  getConfigRetryInMs,
+  getExcludePaths,
+  getOriginTimeoutMs,
+  resolveAdapterConfig,
+} from './config.js';
 import { fetchOriginHtml } from './origin-fetch.js';
 
 export {
@@ -379,8 +390,27 @@ function normalizedCspStructure(policy: string): string {
  * the invariant "never make a response more cacheable than it already was". So
  * we only ever SHORTEN an explicit lifetime (max-age/s-maxage/Expires) and
  * leave header-less responses untouched.
+ *
+ * `assertedDefaultTtlSeconds` is the operator's way OUT of that blindness:
+ * the baked config asserts that every associated cache behavior's DefaultTTL
+ * is AT LEAST that many seconds for this content, i.e. a lifetime-less
+ * pass-through is ALREADY shared-cached for at least that long. The written
+ * TTL is `min(retryTtl, asserted)`, so the write can only SHORTEN effective
+ * cacheability — the invariant is enforced arithmetically rather than
+ * trusted (an assertion of "nonzero" alone would let retryTtl EXTEND a
+ * DefaultTTL of one second). Without the assertion a single lookup timeout
+ * pins an uninjected response in CloudFront for the full DefaultTTL (a day
+ * on the common default) instead of the seconds the retry logic intends.
+ * Note: applying the cap REPLACES the whole Cache-Control value, so
+ * non-freshness directives on a lifetime-less response (`no-transform`,
+ * `stale-while-revalidate`) are dropped for the capped copy — bounded by the
+ * short TTL, and only under the assertion.
  */
-function retrySharedTtlSeconds(headers: CloudFrontHeaders, revalidateInMs: number): number | null {
+function retrySharedTtlSeconds(
+  headers: CloudFrontHeaders,
+  revalidateInMs: number,
+  assertedDefaultTtlSeconds: number
+): number | null {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1000));
   const policy = cacheControlValue(headers);
 
@@ -410,8 +440,13 @@ function retrySharedTtlSeconds(headers: CloudFrontHeaders, revalidateInMs: numbe
     }
   }
 
-  // Origin declared no explicit lifetime → do not introduce shared caching.
-  return null;
+  // Origin declared no explicit lifetime. Without the operator assertion, do
+  // not introduce shared caching; with it, the response is already cached
+  // for at least the asserted DefaultTTL, and min() guarantees the written
+  // value never exceeds what the operator vouched for.
+  return assertedDefaultTtlSeconds > 0
+    ? Math.min(retryTtl, Math.floor(assertedDefaultTtlSeconds))
+    : null;
 }
 
 /**
@@ -435,7 +470,11 @@ function retryablePassThroughResponse(
   }
 
   const originalHeaders = response.headers ?? {};
-  const sharedTtlSeconds = retrySharedTtlSeconds(originalHeaders, revalidateInMs);
+  const sharedTtlSeconds = retrySharedTtlSeconds(
+    originalHeaders,
+    revalidateInMs,
+    getAssertedDefaultTtlSeconds()
+  );
   // The origin declared no explicit cache lifetime → leave the response exactly
   // as it is (its cacheability is the distribution's DefaultTTL, which we must
   // not override upward). Adding s-maxage here could cache an
@@ -536,6 +575,15 @@ export const handler: CloudFrontResponseHandler = async (event) => {
   const { request, response } = record.cf;
 
   try {
+    // Operator-excluded paths (login/account areas, robots.txt-disallowed
+    // sections) pay NOTHING: no config/SSM resolution, no lookup, no
+    // auto-registration, no cache rewriting — byte-identical pass-through
+    // with the origin's normal caching. Checked first because it is the
+    // cheapest gate and the only purely policy-driven one.
+    if (matchesExcludedPath(getExcludePaths(), request.uri)) {
+      return response;
+    }
+
     // Cheap gate on what CloudFront already knows — no network work unless
     // this looks like an injectable HTML page.
     if (
@@ -552,6 +600,21 @@ export const handler: CloudFrontResponseHandler = async (event) => {
         true
       )
     ) {
+      return response;
+    }
+
+    // A page the origin itself marks noindex is not schema-markup territory:
+    // pass it through untouched (normal caching, no lookup, no registration).
+    // `none` is the documented equivalent of `noindex, nofollow`. A
+    // bot-scoped directive (`somebot: noindex`) also skips — deliberately
+    // conservative (the only cost is a skipped injection). This gate is a
+    // DELIBERATE default-behavior change vs v0.5.3 (which injected such
+    // pages); the fail direction is under-injection, never a modified
+    // response. Only the header form is visible here — origin-response
+    // triggers never see the body, so a `<meta name="robots">` cannot be
+    // honored at this layer; use excludePaths for those sections instead.
+    const xRobotsTag = combinedHeaderValue(response.headers, 'x-robots-tag');
+    if (xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag)) {
       return response;
     }
 

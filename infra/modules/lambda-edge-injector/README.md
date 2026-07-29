@@ -25,7 +25,22 @@ module "enhancely_injector" {
   name           = "acme-enhancely-injector"
   enhancely_base = "https://app.enhancely.ai"
   auto_register  = true # pages self-register from real traffic
-  tags           = { managed-by = "terraform" }
+  # OPTIONAL, default 0 (off). Read the description in variables.tf BEFORE
+  # setting this: it is an assertion about YOUR distribution. If every cache
+  # behavior this function serves has DefaultTTL >= the value, uninjected
+  # responses without an explicit origin cache lifetime get the short retry
+  # Cache-Control (never longer than min(retry, asserted)) instead of
+  # inheriting the DefaultTTL, so a transient lookup failure is retried
+  # after seconds instead of being pinned uninjected for a day. Keep it off
+  # when any associated behavior has DefaultTTL 0.
+  # asserted_default_ttl_seconds = 3600
+  #
+  # OPTIONAL escape hatch, default []. Enhancely already refuses to generate
+  # for pages its crawler cannot publicly reach (login areas) or that
+  # robots.txt disallows (fail-closed pipeline gate), so unregistered pages
+  # are never injected. List paths here only when a section should not even
+  # pay the lookup, e.g. exclude_paths = ["/account/*"].
+  tags = { managed-by = "terraform" }
 }
 ```
 
