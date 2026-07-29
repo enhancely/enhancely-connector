@@ -19,7 +19,7 @@ provider "aws" {
 }
 
 module "enhancely_injector" {
-  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.2.0"
+  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.6.1"
   providers = { aws = aws.us_east_1 }
 
   name           = "acme-enhancely-injector"
@@ -39,10 +39,17 @@ module "enhancely_injector" {
   # for pages its crawler cannot publicly reach (login areas) or that
   # robots.txt disallows (fail-closed pipeline gate), so unregistered pages
   # are never injected. List paths here only when a section should not even
-  # pay the lookup, e.g. exclude_paths = ["/account/*"].
+  # pay the lookup, e.g. exclude_paths = ["/account/*"]. Match against the
+  # canonical literal spelling: unreserved percent escapes, backslashes,
+  # duplicate slashes and dot-segments are normalized before matching.
   tags = { managed-by = "terraform" }
 }
 ```
+
+`exclude_paths` is a conservative operational gate, not a standalone privacy
+boundary: reserved, non-ASCII, malformed, and double-encoded octets remain
+literal because decoding them could change path structure. Keep origin access
+controls and crawler policy authoritative for sensitive sections.
 
 Attach to your distribution (works with plain resources or
 terraform-aws-modules/cloudfront):

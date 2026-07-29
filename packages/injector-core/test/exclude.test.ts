@@ -42,8 +42,29 @@ describe('matchesExcludedPath', () => {
     expect(matchesExcludedPath(['/account/'], '/account/x/..')).toBe(true);
   });
 
-  it('does NOT decode percent-encoding (documented under-exclusion)', () => {
-    expect(matchesExcludedPath(['/account/*'], '/%61ccount/orders')).toBe(false);
+  it('decodes RFC 3986 unreserved octets before structural normalization', () => {
+    expect(matchesExcludedPath(['/account/*'], '/%61ccount/orders')).toBe(true);
+    expect(matchesExcludedPath(['/login'], '/%2e%2e/login')).toBe(true);
+    expect(matchesExcludedPath(['/login'], '/%2E%2e/login')).toBe(true);
+    expect(matchesExcludedPath(['/login'], '/public/.%2e/login')).toBe(true);
+    expect(matchesExcludedPath(['/login'], '/public/%2e./login')).toBe(true);
+    expect(matchesExcludedPath(['/A-._~9'], '/%41%2D%2e%5f%7E%39')).toBe(true);
+  });
+
+  it('normalizes literal backslashes like the downstream WHATWG URL parser', () => {
+    expect(matchesExcludedPath(['/login'], String.raw`/public\..\login`)).toBe(true);
+    expect(matchesExcludedPath(['/login'], String.raw`/public/%2e%2e\login`)).toBe(true);
+    expect(matchesExcludedPath(['/account/*'], String.raw`\account\orders`)).toBe(true);
+  });
+
+  it('leaves reserved, non-ASCII, malformed and double-encoded octets literal', () => {
+    expect(matchesExcludedPath(['/account/orders'], '/account%2Forders')).toBe(false);
+    expect(matchesExcludedPath(['/account?tab'], '/account%3Ftab')).toBe(false);
+    expect(matchesExcludedPath(['/ärzte'], '/%C3%A4rzte')).toBe(false);
+    expect(matchesExcludedPath(['/login'], '/%2/login')).toBe(false);
+    expect(matchesExcludedPath(['/login'], '/%GG/login')).toBe(false);
+    expect(matchesExcludedPath(['/login'], '/%252e%252e/login')).toBe(false);
+    expect(matchesExcludedPath(['/account/*'], '/%2561ccount/orders')).toBe(false);
   });
 
   it('treats regex metacharacters as literals', () => {

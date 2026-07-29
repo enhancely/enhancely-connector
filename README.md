@@ -49,14 +49,24 @@ The API key is a secret — it must never be exposed client-side or committed. `
 
 ## Configuration
 
-| Setting             | Default                    | Notes                                                                   |
-| ------------------- | -------------------------- | ----------------------------------------------------------------------- |
-| `ENHANCELY_API_KEY` | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.      |
-| `ENHANCELY_BASE`    | `https://app.enhancely.ai` | **TODO: confirm** final production API base URL.                        |
-| `timeoutMs`         | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call.              |
-| `cacheTtlMs`        | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry. |
-| `maxJsonLdBytes`    | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                 |
-| `autoRegister`      | `false`                    | Register unknown pages after a 404; adapters still fail open.           |
+| Setting                     | Default                    | Notes                                                                   |
+| --------------------------- | -------------------------- | ----------------------------------------------------------------------- |
+| `ENHANCELY_API_KEY`         | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.      |
+| `ENHANCELY_BASE`            | `https://app.enhancely.ai` | **TODO: confirm** final production API base URL.                        |
+| `timeoutMs`                 | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call.              |
+| `cacheTtlMs`                | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry. |
+| `maxJsonLdBytes`            | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                 |
+| `autoRegister`              | `false`                    | Register unknown pages after a 404; adapters still fail open.           |
+| `excludePaths`              | `[]`                       | Lambda@Edge-only path exclusions, checked before config/API work.       |
+| `assertedDefaultTtlSeconds` | `0` (off)                  | Lambda@Edge-only asserted minimum DefaultTTL for bounded retry caching. |
+
+Lambda@Edge path exclusions use CloudFront-style `*`/`?` patterns. Before
+matching, the raw path is canonicalized once: RFC 3986 unreserved escapes are
+decoded, literal backslashes become `/`, and duplicate slashes/dot-segments
+collapse. Reserved, non-ASCII, malformed, and double-encoded octets stay
+literal, so configure patterns in canonical literal form. A response carrying
+`X-Robots-Tag: noindex` or `none` is never injected; the same veto is applied
+to the identity re-fetch that supplies the replacement body.
 
 ## Documentation
 
@@ -70,7 +80,7 @@ see [`infra/modules/lambda-edge-injector/`](infra/modules/lambda-edge-injector/)
 
 ```hcl
 module "enhancely_injector" {
-  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.5.1"
+  source    = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=v0.6.1"
   providers = { aws = aws.us_east_1 }
   auto_register = true
 }
@@ -92,7 +102,7 @@ Every tag `vX.Y.Z` publishes a [GitHub Release](https://github.com/enhancely/enh
 Recommended vendoring flow (Terraform, as used in the KWS pilot):
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.6.1
 curl -fsSLO "https://github.com/enhancely/enhancely-connector/releases/download/${VERSION}/lambda-edge-index.js"
 curl -fsSL  "https://github.com/enhancely/enhancely-connector/releases/download/${VERSION}/SHA256SUMS" | sha256sum -c --ignore-missing
 # commit index.js into your infra repo; note ${VERSION} in the commit message
