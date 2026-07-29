@@ -759,6 +759,28 @@ function containsOnlyAscii(body) {
 function hasUtf8Bom(body) {
   return body.length >= 3 && body[0] === 239 && body[1] === 187 && body[2] === 191;
 }
+function declaresUtf8MetaInPrescan(body) {
+  let window = body.subarray(0, 1024).toString("latin1");
+  window = window.replace(/<!--[\s\S]*?-->/g, " ");
+  const openComment = window.indexOf("<!--");
+  if (openComment !== -1) window = window.slice(0, openComment);
+  const metaRe = /<meta\b([^>]*)>/gi;
+  const attrRe = /([^\s"'>/=]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]*))/g;
+  let tag;
+  while ((tag = metaRe.exec(window)) !== null) {
+    const attrs = /* @__PURE__ */ new Map();
+    attrRe.lastIndex = 0;
+    let attr;
+    while ((attr = attrRe.exec(tag[1] ?? "")) !== null) {
+      const name = attr[1]?.toLowerCase() ?? "";
+      if (!attrs.has(name)) attrs.set(name, attr[2] ?? attr[3] ?? attr[4] ?? "");
+    }
+    const direct = attrs.get("charset");
+    const declared = direct !== void 0 ? direct.trim().toLowerCase() : attrs.get("http-equiv")?.trim().toLowerCase() === "content-type" ? charsetOf(attrs.get("content") ?? "") : null;
+    if (declared === "utf-8" || declared === "utf8") return true;
+  }
+  return false;
+}
 var PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
 function shouldAttempt(input, ignoreContentEncoding = false) {
   if (input.method !== "GET") return false;
@@ -979,7 +1001,7 @@ var handler = async (event) => {
     if ((originCharset === "ascii" || originCharset === "us-ascii") && !asciiBody) {
       return response;
     }
-    if (originCharset === null && !asciiBody && !hasUtf8Bom(origin.body)) {
+    if (originCharset === null && !asciiBody && !hasUtf8Bom(origin.body) && !declaresUtf8MetaInPrescan(origin.body)) {
       return response;
     }
     const injected = injectIntoHead(originalHtml, lookup.snippet);

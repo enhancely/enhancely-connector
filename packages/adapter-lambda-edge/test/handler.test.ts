@@ -124,6 +124,37 @@ beforeAll(async () => {
       );
       return;
     }
+    if (path === '/charsetless-http-equiv-meta') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(
+        '<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"></head><body>München</body></html>'
+      );
+      return;
+    }
+    if (path === '/charsetless-http-equiv-other') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(
+        '<html><head><meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1"></head><body>München</body></html>'
+      );
+      return;
+    }
+    if (path === '/charsetless-late-meta') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      // The meta sits beyond the 1024-byte prescan window browsers (and the
+      // connector) look at, so it does not count as a declaration.
+      res.end(
+        `<html><head><style>/*${'x'.repeat(1100)}*/</style><meta charset="utf-8"></head><body>München</body></html>`
+      );
+      return;
+    }
+    if (path === '/charsetless-content-lookalike') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      // charset=utf-8 only as TEXT inside an unrelated meta content value.
+      res.end(
+        '<html><head><meta name="description" content="how to send charset=utf-8 headers"></head><body>München</body></html>'
+      );
+      return;
+    }
     if (path === '/charsetless-comment-meta') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end('<html><head><!-- <meta charset="utf-8"> --></head><body>München</body></html>');
@@ -574,12 +605,28 @@ describe('handler — representation headers follow the re-fetch body', () => {
     expect(result?.headers?.['content-type']?.[0]?.value).toBe('text/html; charset=utf-8');
   });
 
+  it.each(['/charsetless-utf8-meta', '/charsetless-http-equiv-meta'])(
+    'injects charset-less non-ASCII HTML that declares UTF-8 in the prescan window at %s',
+    async (uri) => {
+      const event = eventFor(uri, {
+        responseHeaders: { 'content-type': 'text/html' },
+      });
+      const result = await invoke(event);
+
+      expect(result?.body).toContain('München');
+      expect(result?.body).toContain(SNIPPET);
+      expect(result?.headers?.['content-type']?.[0]?.value).toBe('text/html; charset=utf-8');
+    }
+  );
+
   it.each([
-    '/charsetless-utf8-meta',
     '/charsetless-windows-meta',
     '/charsetless-no-meta',
     '/charsetless-comment-meta',
     '/charsetless-data-charset',
+    '/charsetless-http-equiv-other',
+    '/charsetless-late-meta',
+    '/charsetless-content-lookalike',
   ])('fails open for ambiguous charset-less non-ASCII HTML at %s', async (uri) => {
     const event = eventFor(uri, {
       responseHeaders: { 'content-type': 'text/html' },
