@@ -156,6 +156,55 @@ function hasUtf8Bom(body: Buffer): boolean {
   return body.length >= 3 && body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf;
 }
 
+/**
+ * Positive-only slice of the WHATWG encoding prescan, for the one case that
+ * is unambiguous: a meta tag inside the first 1024 bytes (the same window
+ * browsers prescan) that declares UTF-8, either as `<meta charset="utf-8">`
+ * or as `<meta http-equiv="Content-Type" content="text/html; charset=utf-8">`.
+ *
+ * Deliberately narrow. HTML comments are skipped (a commented-out meta is not
+ * a declaration), the attribute must literally be `charset` (`data-charset`
+ * and lookalikes do not count), the http-equiv form only counts for
+ * Content-Type, and only UTF-8 answers true. A declaration of any OTHER
+ * encoding, a meta beyond the window, or anything malformed stays ambiguous
+ * and the caller fails open, exactly as before. False negatives are safe
+ * (pass-through); the shape of the check makes false positives require a page
+ * that literally declares UTF-8 while meaning something else, at which point
+ * browsers decode it as UTF-8 too.
+ */
+function declaresUtf8MetaInPrescan(body: Buffer): boolean {
+  // The prescan window is byte-based; latin1 maps every byte 1:1 to a code
+  // point, so string offsets stay byte offsets.
+  let window = body.subarray(0, 1024).toString('latin1');
+  // Drop complete comments, then everything after an unterminated opener.
+  window = window.replace(/<!--[\s\S]*?-->/g, ' ');
+  const openComment = window.indexOf('<!--');
+  if (openComment !== -1) window = window.slice(0, openComment);
+
+  const metaRe = /<meta\b([^>]*)>/gi;
+  const attrRe = /([^\s"'>/=]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]*))/g;
+  let tag: RegExpExecArray | null;
+  while ((tag = metaRe.exec(window)) !== null) {
+    const attrs = new Map<string, string>();
+    attrRe.lastIndex = 0;
+    let attr: RegExpExecArray | null;
+    while ((attr = attrRe.exec(tag[1] ?? '')) !== null) {
+      const name = attr[1]?.toLowerCase() ?? '';
+      // First occurrence wins, matching how browsers treat duplicates.
+      if (!attrs.has(name)) attrs.set(name, attr[2] ?? attr[3] ?? attr[4] ?? '');
+    }
+    const direct = attrs.get('charset');
+    const declared =
+      direct !== undefined
+        ? direct.trim().toLowerCase()
+        : attrs.get('http-equiv')?.trim().toLowerCase() === 'content-type'
+          ? charsetOf(attrs.get('content') ?? '')
+          : null;
+    if (declared === 'utf-8' || declared === 'utf8') return true;
+  }
+  return false;
+}
+
 export interface AttemptInput {
   /** Method of the request CloudFront sent to the origin. */
   method: string;
@@ -626,10 +675,20 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     }
     // With no header charset, valid UTF-8 bytes are not proof of UTF-8 intent:
     // browsers perform a context-sensitive HTML encoding prescan and might
-    // interpret the same bytes as windows-1252. Without implementing that
-    // complete algorithm, only ASCII bytes or an unambiguous UTF-8 BOM are
-    // safe to relabel.
-    if (originCharset === null && !asciiBody && !hasUtf8Bom(origin.body)) {
+    // interpret the same bytes as windows-1252. Safe to relabel are ASCII
+    // bytes, an unambiguous UTF-8 BOM, or a meta tag in the prescan window
+    // that itself declares UTF-8 (then the browser decodes it as UTF-8 too,
+    // and the lossless-decode proof above already showed the bytes ARE valid
+    // UTF-8). Everything else stays ambiguous and passes through. In the
+    // field this matters for origins that send a bare `text/html` for German
+    // pages carrying umlauts plus `<meta charset="utf-8">`: before this
+    // prescan every such page silently failed open.
+    if (
+      originCharset === null &&
+      !asciiBody &&
+      !hasUtf8Bom(origin.body) &&
+      !declaresUtf8MetaInPrescan(origin.body)
+    ) {
       return response;
     }
     // We already hold the snippet — inject it directly. injectIntoHead returns
