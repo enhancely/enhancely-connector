@@ -36,7 +36,7 @@ variable "auto_register" {
 variable "exclude_paths" {
   type        = list(string)
   default     = []
-  description = "Request paths the connector must not touch at all (login/account areas, robots.txt-disallowed sections): no lookup, no auto-registration, no cache rewriting, no added latency. CloudFront path-pattern wildcards (*), case-sensitive, matched against the full request path."
+  description = "Request paths the connector must not touch at all (login/account areas, robots.txt-disallowed sections): no lookup, no auto-registration, no cache rewriting, no added latency. CloudFront path-pattern wildcards (*), case-sensitive, matched against the full canonicalized path. RFC 3986 unreserved escapes are decoded once, literal backslashes become slashes, and duplicate slashes/dot-segments collapse; write patterns in canonical literal form."
 }
 
 variable "asserted_default_ttl_seconds" {

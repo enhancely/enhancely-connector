@@ -16,7 +16,8 @@ viewer ──> CloudFront ──(cache miss)──> origin
                 │<───── origin response ───┘   status + headers ONLY
                 │
                 ├─ origin-response trigger: this handler
-                │    1. gate: GET + status "200" + text/html +
+                │    1. policy/response gate: excludePaths, noindex/none,
+                │       GET + status "200" + text/html +
                 │       UTF-8-compatible charset + no Set-Cookie +
                 │       no private/no-store Cache-Control (the first
                 │       response may be gzip/br; it is not the body used)
@@ -27,7 +28,8 @@ viewer ──> CloudFront ──(cache miss)──> origin
                 │        origin-request headers forwarded — except
                 │        Accept-Encoding and hop-by-hop headers —
                 │        Accept-Encoding: identity)
-                │    5. replace the response body (within the 1 MB
+                │    5. re-gate the body source, including X-Robots-Tag
+                │    6. replace the response body (within the 1 MB
                 │       generated-response quota), synchronize its
                 │       representation headers — or fail open
                 │
@@ -65,10 +67,21 @@ only when the origin declares an explicit cache lifetime (`max-age`,
 `max-age=0`, caps CloudFront `s-maxage` at the next meaningful retry (404 cache
 TTL, `Retry-After`/error backoff, or config cooldown), and removes `ETag`,
 `Last-Modified`, and `Expires`. It never exceeds the origin lifetime. When the
-origin declares no lifetime, the response remains byte-for-byte untouched:
-the adapter cannot see the distribution's DefaultTTL and must not accidentally
-turn a DefaultTTL=0 response into a shared-cacheable one. Credentialed requests
-also remain byte-for-byte pass-through.
+origin declares no lifetime, the response remains byte-for-byte untouched by
+default: the adapter cannot see the distribution's DefaultTTL and must not
+accidentally turn a DefaultTTL=0 response into a shared-cacheable one. The
+optional `assertedDefaultTtlSeconds` lets the operator assert a minimum
+DefaultTTL across every associated behavior; only then is a lifetime-less
+response capped at `min(retry, asserted)`. Credentialed requests always remain
+byte-for-byte pass-through.
+
+`excludePaths` is evaluated before config resolution, lookup, registration, or
+cache rewriting. The raw path is canonicalized once before matching: RFC 3986
+unreserved escapes are decoded, literal backslashes become `/`, and duplicate
+slashes/dot-segments collapse. Reserved, non-ASCII, malformed, and
+double-encoded octets remain literal. An `X-Robots-Tag: noindex` or `none` on
+either the first response or the identity re-fetch vetoes injection. Other
+robots metadata must be stable across both responses.
 
 **Fail-open invariant:** the whole handler is wrapped in try/catch and always
 returns the original response — config unresolvable, re-fetch error/timeout/
@@ -115,6 +128,8 @@ SSM failure does not strand a warm execution environment.
 | `ssmParameterName`          | `/enhancely/connector/api-key` | Only used when `apiKey` is absent.                                |
 | `ssmRegion`                 | `us-east-1`                    | Region of the SSM parameter.                                      |
 | `ssmTimeoutMs`              | `2000`                         | Bound on the SSM `GetParameter` call (fail-open on expiry).       |
+| `excludePaths`              | `[]`                           | Paths skipped before config/API work; CloudFront-style `*`/`?`.   |
+| `assertedDefaultTtlSeconds` | `0` (off)                      | Asserted minimum DefaultTTL used to cap lifetime-less retries.    |
 
 ### Key source trade-offs
 
@@ -157,9 +172,9 @@ to the browser (non-negotiable rule #1 of this repo).
   same gate as the sidecar adapter; transcoding is not supported. Pages with
   an ASCII header label must contain ASCII bytes only. Pages with **no** charset
   parameter may contain non-ASCII only when the lossless UTF-8 bytes carry an
-  unambiguous UTF-8 BOM; safely emulating the browser's context-sensitive HTML
-  meta prescan is out of scope, so non-ASCII meta/no-meta pages pass through.
-  Generated HTML is always advertised explicitly as
+  unambiguous UTF-8 BOM or declare UTF-8 in a supported `<meta charset>` /
+  `http-equiv` form inside the browser's 1024-byte prescan window. Other
+  ambiguous charset-less pages pass through. Generated HTML is always advertised explicitly as
   `text/html; charset=utf-8`, so Unicode JSON-LD cannot be mislabeled.
 - **Per-request responses pass through**: `Set-Cookie` on the response, or
   `Cache-Control: private`/`no-store`, marks a representation that a
@@ -181,6 +196,9 @@ to the browser (non-negotiable rule #1 of this repo).
   stable, except that per-response nonces and body hashes may rotate. The
   accepted re-fetch CSP is copied so those values match the generated body;
   disappearance or any other policy change passes through.
+- `X-Robots-Tag: noindex`/`none` on either response vetoes injection.
+  Non-blocking robots metadata must be stable across both responses; a mismatch
+  passes through rather than dropping or changing crawler policy.
 - Best results when the origin request policy **forwards the viewer `Host`
   header** — it is used both for the re-fetch vhost and for the page URL sent
   to Enhancely. Without it, the origin domain is used instead.
