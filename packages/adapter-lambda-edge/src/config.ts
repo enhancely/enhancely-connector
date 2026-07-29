@@ -69,7 +69,15 @@ export const DEFAULT_ORIGIN_TIMEOUT_MS = 2000;
  */
 export const DEFAULT_SSM_TIMEOUT_MS = 2000;
 
-/** Shape of the deploy-time generated `connector-config.json` (all optional). */
+/**
+ * Shape of the deploy-time generated `connector-config.json` (all optional).
+ *
+ * NOTE for hand-rolled deployments: `excludePaths` and
+ * `assertedDefaultTtlSeconds` are honored ONLY via this baked file. A
+ * deployment that supplies the key purely through SSM without shipping a
+ * `connector-config.json` silently runs without both controls. The Terraform
+ * module always bakes the file, so the supported path is unaffected.
+ */
 export interface BakedConnectorConfig {
   /** Enhancely API key. When present, SSM is never contacted. */
   apiKey?: string;
