@@ -79,6 +79,17 @@ export function fetchOriginHtml(
         path: `${url.pathname}${url.search}`,
         method: 'GET',
         agent: false,
+        // TLS SNI (and cert-hostname verification) must present the PUBLIC
+        // host, not the origin's own DNS name. A CloudFront custom origin is
+        // usually addressed by an internal name (for example an ALB under
+        // `elb.amazonaws.com`) whose certificate is issued for the public
+        // domain, and the origin selects the right cert by SNI. Node would
+        // otherwise default SNI to the origin hostname, the cert fails
+        // verification, the re-fetch rejects and the handler fails open (no
+        // injection). Using the same value as the Host header is correct for
+        // every name-based vhosted origin and needs no per-site configuration.
+        // Ignored for plain-http origins.
+        servername: hostHeader,
         headers: {
           // Fallback identity — a forwarded viewer User-Agent (in
           // extraHeaders) overrides it, so the origin sees the same UA it
