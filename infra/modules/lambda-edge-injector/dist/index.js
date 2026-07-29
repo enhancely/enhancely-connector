@@ -392,15 +392,54 @@ function injectIntoHead(html, snippet) {
 }
 
 // ../injector-core/dist/exclude.js
-function escapeRegExp(literal) {
-  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function globMatch(pattern, text) {
+  let p = 0;
+  let t = 0;
+  let star = -1;
+  let mark = 0;
+  while (t < text.length) {
+    if (p < pattern.length && (pattern[p] === "?" || pattern[p] === text[t])) {
+      p += 1;
+      t += 1;
+    } else if (p < pattern.length && pattern[p] === "*") {
+      star = p;
+      p += 1;
+      mark = t;
+    } else if (star !== -1) {
+      p = star + 1;
+      mark += 1;
+      t = mark;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.length && pattern[p] === "*")
+    p += 1;
+  return p === pattern.length;
+}
+function normalizePathForMatch(pathname) {
+  const segments = [];
+  for (const segment of pathname.split("/")) {
+    if (segment === "" || segment === ".")
+      continue;
+    if (segment === "..") {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  const endsAsDirectory = /\/\.{0,2}$/.test(pathname);
+  if (segments.length === 0)
+    return "/";
+  return `/${segments.join("/")}${endsAsDirectory ? "/" : ""}`;
 }
 function matchesExcludedPath(patterns, pathname) {
+  const normalized = normalizePathForMatch(pathname);
   for (const pattern of patterns) {
     if (typeof pattern !== "string" || pattern === "")
       continue;
-    const regex = new RegExp(`^${pattern.split("*").map(escapeRegExp).join(".*")}$`);
-    if (regex.test(pathname))
+    const anchored = pattern.startsWith("/") || pattern.startsWith("*") ? pattern : `/${pattern}`;
+    if (globMatch(anchored, normalized))
       return true;
   }
   return false;
@@ -509,7 +548,7 @@ var negativeUntil = 0;
 var inflight = null;
 var NEGATIVE_TTL_MS = 3e4;
 var resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-var resolvedCapUninjectedTtl = false;
+var resolvedAssertedDefaultTtlSeconds = 0;
 var bakedCache;
 var bakedOverride;
 var configOverrides = null;
@@ -540,8 +579,9 @@ function parseBaked(raw) {
   if (ssmRegion !== void 0) baked.ssmRegion = ssmRegion;
   const ssmTimeoutMs = positiveNumber(source["ssmTimeoutMs"]);
   if (ssmTimeoutMs !== void 0) baked.ssmTimeoutMs = ssmTimeoutMs;
-  if (typeof source["capUninjectedTtl"] === "boolean") {
-    baked.capUninjectedTtl = source["capUninjectedTtl"];
+  const assertedDefaultTtlSeconds = positiveNumber(source["assertedDefaultTtlSeconds"]);
+  if (assertedDefaultTtlSeconds !== void 0) {
+    baked.assertedDefaultTtlSeconds = assertedDefaultTtlSeconds;
   }
   if (Array.isArray(source["excludePaths"])) {
     const patterns = source["excludePaths"].filter(
@@ -594,7 +634,7 @@ async function resolveOnce() {
   try {
     const baked = bakedConfig();
     resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
-    resolvedCapUninjectedTtl = baked?.capUninjectedTtl ?? false;
+    resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
     let apiKey = baked?.apiKey;
     if (apiKey === void 0) {
       apiKey = await fetchApiKeyFromSsm(
@@ -653,8 +693,8 @@ function getConfigRetryInMs() {
 function getOriginTimeoutMs() {
   return resolvedOriginTimeoutMs;
 }
-function getCapUninjectedTtl() {
-  return resolvedCapUninjectedTtl;
+function getAssertedDefaultTtlSeconds() {
+  return resolvedAssertedDefaultTtlSeconds;
 }
 function getExcludePaths() {
   return bakedConfig()?.excludePaths ?? [];
@@ -889,7 +929,7 @@ function normalizedCspStructure(policy) {
     return [rawName.toLowerCase(), ...sources].join(" ");
   }).filter((directive) => directive !== "").join(";");
 }
-function retrySharedTtlSeconds(headers, revalidateInMs, capWithoutExplicitLifetime) {
+function retrySharedTtlSeconds(headers, revalidateInMs, assertedDefaultTtlSeconds) {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
   const policy = cacheControlValue(headers);
   if (policy !== null) {
@@ -911,7 +951,7 @@ function retrySharedTtlSeconds(headers, revalidateInMs, capWithoutExplicitLifeti
       return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1e3)));
     }
   }
-  return capWithoutExplicitLifetime ? retryTtl : null;
+  return assertedDefaultTtlSeconds > 0 ? Math.min(retryTtl, Math.floor(assertedDefaultTtlSeconds)) : null;
 }
 function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) {
   if (requestHeaders["authorization"] !== void 0 || requestHeaders["cookie"] !== void 0) {
@@ -921,7 +961,7 @@ function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) 
   const sharedTtlSeconds = retrySharedTtlSeconds(
     originalHeaders,
     revalidateInMs,
-    getCapUninjectedTtl()
+    getAssertedDefaultTtlSeconds()
   );
   if (sharedTtlSeconds === null) return response;
   const headers = { ...originalHeaders };
@@ -990,7 +1030,7 @@ var handler = async (event) => {
       return response;
     }
     const xRobotsTag = combinedHeaderValue2(response.headers, "x-robots-tag");
-    if (xRobotsTag !== null && /(?:^|[\s,:])noindex(?:$|[\s,])/i.test(xRobotsTag)) {
+    if (xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag)) {
       return response;
     }
     const originUrl = buildOriginUrl(request);

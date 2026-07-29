@@ -90,17 +90,22 @@ export interface BakedConnectorConfig {
   /** Timeout for the SSM GetParameter call (default: 2000 ms). */
   ssmTimeoutMs?: number;
   /**
-   * Operator assertion: the distribution serves public HTML with a NONZERO
-   * DefaultTTL, so an uninjected pass-through response without an explicit
-   * origin lifetime is ALREADY shared-cached — capping it to the retry TTL
-   * can only shorten that, never add cacheability. When true, the adapter
-   * applies its bounded retry Cache-Control to such responses too, so a
-   * lookup timeout or 404 is retried after seconds instead of being pinned
-   * uninjected in CloudFront for the full DefaultTTL. Leave false (default)
-   * on distributions whose DefaultTTL is 0. Credentialed requests
+   * Operator assertion, in seconds: every cache behavior this function is
+   * associated with has a DefaultTTL of AT LEAST this many seconds for the
+   * HTML it serves. When set (> 0), an uninjected pass-through response
+   * WITHOUT an explicit origin lifetime receives the bounded retry
+   * Cache-Control capped at `min(retryTtl, this value)` — such a response is
+   * already shared-cached for at least the asserted lifetime, so the write
+   * can only SHORTEN effective cacheability, never extend it. That unpins
+   * lookup timeouts and 404s after seconds instead of the full DefaultTTL
+   * (often a day). The number form is what makes the invariant arithmetic
+   * instead of trust: even a conservative understatement (e.g. 60) is safe
+   * and effective. Absent/0 = off (v0.5.3 behavior). Never set it higher
+   * than the SMALLEST DefaultTTL among the associated behaviors; leave off
+   * when any of them has DefaultTTL 0. Credentialed requests
    * (Authorization/Cookie) are never touched either way.
    */
-  capUninjectedTtl?: boolean;
+  assertedDefaultTtlSeconds?: number;
   /**
    * Request paths the connector must not touch AT ALL (login/account areas,
    * robots.txt-disallowed or noindex-by-policy sections): no Enhancely
@@ -127,7 +132,7 @@ let negativeUntil = 0;
 let inflight: Promise<InjectorConfig | null> | null = null;
 const NEGATIVE_TTL_MS = 30_000;
 let resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-let resolvedCapUninjectedTtl = false;
+let resolvedAssertedDefaultTtlSeconds = 0;
 // The baked FILE read is memoized separately from key resolution: exclusion
 // checks must work synchronously before (and without) any SSM call.
 let bakedCache: BakedConnectorConfig | null | undefined;
@@ -171,8 +176,9 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   if (ssmRegion !== undefined) baked.ssmRegion = ssmRegion;
   const ssmTimeoutMs = positiveNumber(source['ssmTimeoutMs']);
   if (ssmTimeoutMs !== undefined) baked.ssmTimeoutMs = ssmTimeoutMs;
-  if (typeof source['capUninjectedTtl'] === 'boolean') {
-    baked.capUninjectedTtl = source['capUninjectedTtl'];
+  const assertedDefaultTtlSeconds = positiveNumber(source['assertedDefaultTtlSeconds']);
+  if (assertedDefaultTtlSeconds !== undefined) {
+    baked.assertedDefaultTtlSeconds = assertedDefaultTtlSeconds;
   }
   if (Array.isArray(source['excludePaths'])) {
     const patterns = source['excludePaths'].filter(
@@ -254,7 +260,7 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
     // also govern the pass-through path taken while the key is missing or
     // SSM is failing (getConfigRetryInMs) — that path caches uninjected
     // responses too.
-    resolvedCapUninjectedTtl = baked?.capUninjectedTtl ?? false;
+    resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
 
     let apiKey = baked?.apiKey;
     if (apiKey === undefined) {
@@ -352,15 +358,16 @@ export function getOriginTimeoutMs(): number {
 }
 
 /**
- * Whether the operator asserted (baked config `capUninjectedTtl`) that
- * uninjected pass-through responses WITHOUT an explicit origin lifetime may
- * also receive the bounded retry Cache-Control. False by default: without the
- * assertion the adapter cannot know the distribution's DefaultTTL and must
- * not add cacheability. Only meaningful after `resolveAdapterConfig()`
- * settled — exactly the order the handler uses.
+ * The operator's asserted minimum DefaultTTL in seconds (baked config
+ * `assertedDefaultTtlSeconds`), or 0 when the assertion was not made. When
+ * positive, uninjected pass-through responses WITHOUT an explicit origin
+ * lifetime may receive the bounded retry Cache-Control capped at this value;
+ * without the assertion the adapter cannot know the DefaultTTL and must not
+ * add cacheability. Only meaningful after `resolveAdapterConfig()` settled —
+ * exactly the order the handler uses.
  */
-export function getCapUninjectedTtl(): boolean {
-  return resolvedCapUninjectedTtl;
+export function getAssertedDefaultTtlSeconds(): number {
+  return resolvedAssertedDefaultTtlSeconds;
 }
 
 /**
@@ -402,6 +409,6 @@ export function __resetAdapterConfigForTests(): void {
   configOverrides = null;
   __resetMemoForTests();
   resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-  resolvedCapUninjectedTtl = false;
+  resolvedAssertedDefaultTtlSeconds = 0;
   bakedCache = undefined;
 }

@@ -1263,13 +1263,13 @@ describe('handler — retryable pass-through cache policy', () => {
     ['/login', ['/login']],
     ['/intern/seite', ['/intern*']],
   ])('excludePaths: %s passes through untouched, paying nothing', async (uri, excludePaths) => {
-    // Even with capUninjectedTtl the excluded response keeps its normal
+    // Even with assertedDefaultTtlSeconds the excluded response keeps its normal
     // caching: no lookup, no registration, no origin hit, no header rewrite.
     __setBakedConfigForTests({
       apiKey: 'sk-test',
       autoRegister: true,
       cacheTtlMs: 20_000,
-      capUninjectedTtl: true,
+      assertedDefaultTtlSeconds: 86_400,
       excludePaths,
     });
     const event = eventFor(uri, {
@@ -1298,45 +1298,52 @@ describe('handler — retryable pass-through cache policy', () => {
     expect(result?.body).toContain(SNIPPET);
   });
 
-  it.each(['noindex', 'noindex, nofollow', 'googlebot: noindex, nofollow', 'NOINDEX'])(
-    'X-Robots-Tag "%s": response passes through untouched, paying nothing',
-    async (tagValue) => {
-      __setBakedConfigForTests({
-        apiKey: 'sk-test',
-        autoRegister: true,
-        cacheTtlMs: 20_000,
-        capUninjectedTtl: true,
-      });
-      const event = eventFor('/robots-header', {
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          'x-robots-tag': tagValue,
-          etag: '"keep"',
-        },
-      });
-      const result = await invoke(event);
-
-      expect(result).toBe(event.Records[0]?.cf.response);
-      expect(result?.headers?.['etag']?.[0]?.value).toBe('"keep"');
-      expect(enhancelyFetch).not.toHaveBeenCalled();
-      expect(originHits).toBe(0);
-    }
-  );
-
-  it('X-Robots-Tag without noindex does not block injection', async () => {
-    __setBakedConfigForTests({ apiKey: 'sk-test', cacheTtlMs: 20_000 });
-    const event = eventFor('/page', {
+  it.each([
+    'noindex',
+    'noindex, nofollow',
+    'googlebot: noindex, nofollow',
+    'NOINDEX',
+    'none',
+    'googlebot: none',
+  ])('X-Robots-Tag "%s": response passes through untouched, paying nothing', async (tagValue) => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+      assertedDefaultTtlSeconds: 86_400,
+    });
+    const event = eventFor('/robots-header', {
       responseHeaders: {
         'content-type': 'text/html; charset=utf-8',
-        'x-robots-tag': 'nofollow, noarchive',
+        'x-robots-tag': tagValue,
+        etag: '"keep"',
       },
     });
     const result = await invoke(event);
 
-    expect(result?.body).toContain(SNIPPET);
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.headers?.['etag']?.[0]?.value).toBe('"keep"');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(originHits).toBe(0);
   });
 
-  it('capUninjectedTtl: caps a lifetime-less uninjected pass-through to the retry TTL', async () => {
+  it.each(['nofollow, noarchive', 'unavailable_after: 25 Jun 2027 15:00:00 PST'])(
+    'X-Robots-Tag "%s" does not block injection',
+    async (tagValue) => {
+      __setBakedConfigForTests({ apiKey: 'sk-test', cacheTtlMs: 20_000 });
+      const event = eventFor('/page', {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'x-robots-tag': tagValue,
+        },
+      });
+      const result = await invoke(event);
+
+      expect(result?.body).toContain(SNIPPET);
+    }
+  );
+
+  it('assertedDefaultTtlSeconds: caps a lifetime-less uninjected pass-through to the retry TTL', async () => {
     // The operator asserted a nonzero DefaultTTL, so this response is already
     // shared-cached; the cap can only SHORTEN that. Without the flag the same
     // response is pinned uninjected for the full DefaultTTL (see the test
@@ -1345,7 +1352,7 @@ describe('handler — retryable pass-through cache policy', () => {
       apiKey: 'sk-test',
       autoRegister: true,
       cacheTtlMs: 20_000,
-      capUninjectedTtl: true,
+      assertedDefaultTtlSeconds: 86_400,
     });
     enhancelyFetch
       .mockResolvedValueOnce(new Response(null, { status: 404 }))
@@ -1374,12 +1381,12 @@ describe('handler — retryable pass-through cache policy', () => {
     expect(result?.body).toBeUndefined(); // body untouched, headers only
   });
 
-  it('capUninjectedTtl: never touches credentialed requests', async () => {
+  it('assertedDefaultTtlSeconds: never touches credentialed requests', async () => {
     __setBakedConfigForTests({
       apiKey: 'sk-test',
       autoRegister: true,
       cacheTtlMs: 20_000,
-      capUninjectedTtl: true,
+      assertedDefaultTtlSeconds: 86_400,
     });
     enhancelyFetch
       .mockResolvedValueOnce(new Response(null, { status: 404 }))
@@ -1396,12 +1403,12 @@ describe('handler — retryable pass-through cache policy', () => {
     expect(result?.headers?.['etag']?.[0]?.value).toBe('"keep"');
   });
 
-  it('capUninjectedTtl: explicit origin lifetimes keep the existing min() behavior', async () => {
+  it('assertedDefaultTtlSeconds: explicit origin lifetimes keep the existing min() behavior', async () => {
     __setBakedConfigForTests({
       apiKey: 'sk-test',
       autoRegister: true,
       cacheTtlMs: 20_000,
-      capUninjectedTtl: true,
+      assertedDefaultTtlSeconds: 86_400,
     });
     enhancelyFetch
       .mockResolvedValueOnce(new Response(null, { status: 404 }))
@@ -1421,11 +1428,76 @@ describe('handler — retryable pass-through cache policy', () => {
     );
   });
 
-  it('capUninjectedTtl: also bounds the missing-key pass-through path', async () => {
+  it('assertedDefaultTtlSeconds: an assertion SMALLER than the retry TTL wins (min enforced)', async () => {
+    // DefaultTTL=5s asserted, negative-cache retry would be 20s: the written
+    // s-maxage must be 5 — the arithmetic guarantee that the cap can never
+    // make the response more cacheable than the operator vouched for.
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+      assertedDefaultTtlSeconds: 5,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const event = eventFor('/cap-small-assertion-miss', {
+      responseHeaders: { 'content-type': 'text/html; charset=utf-8' },
+    });
+    const result = await invoke(event);
+
+    expect(result?.headers?.['cache-control']?.[0]?.value).toBe(
+      'max-age=0, s-maxage=5, must-revalidate'
+    );
+  });
+
+  it('assertedDefaultTtlSeconds: caps a response whose Cache-Control has no freshness lifetime', async () => {
+    // `Cache-Control: public` declares no lifetime, so such a response is
+    // governed by the DefaultTTL exactly like a header-less one — under the
+    // assertion it must be capped too (this was an untested branch).
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      autoRegister: true,
+      cacheTtlMs: 20_000,
+      assertedDefaultTtlSeconds: 86_400,
+    });
+    enhancelyFetch
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+
+    const event = eventFor('/cap-public-miss', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'public',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result?.headers?.['cache-control']?.[0]?.value).toMatch(
+      /^max-age=0, s-maxage=\d+, must-revalidate$/
+    );
+  });
+
+  it('excludePaths: also skips on the missing-key path (no SSM, no log, byte-identical)', async () => {
+    __setBakedConfigForTests({ excludePaths: ['/account/*'], assertedDefaultTtlSeconds: 86_400 });
+    const event = eventFor('/account/orders', {
+      responseHeaders: { 'content-type': 'text/html; charset=utf-8', etag: '"keep"' },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.headers?.['cache-control']).toBeUndefined();
+    expect(result?.headers?.['etag']?.[0]?.value).toBe('"keep"');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(originHits).toBe(0);
+  });
+
+  it('assertedDefaultTtlSeconds: also bounds the missing-key pass-through path', async () => {
     // Config resolution fails (no key anywhere), the flag from the SAME baked
     // file must still govern the pass-through: this path caches uninjected
     // responses too.
-    __setBakedConfigForTests({ capUninjectedTtl: true });
+    __setBakedConfigForTests({ assertedDefaultTtlSeconds: 86_400 });
     const event = eventFor('/cap-no-key', {
       responseHeaders: { 'content-type': 'text/html; charset=utf-8', etag: '"nokey"' },
     });
@@ -1439,11 +1511,11 @@ describe('handler — retryable pass-through cache policy', () => {
     expect(originHits).toBe(0);
   });
 
-  it('capUninjectedTtl: leaves the injected path completely unaffected', async () => {
+  it('assertedDefaultTtlSeconds: leaves the injected path completely unaffected', async () => {
     __setBakedConfigForTests({
       apiKey: 'sk-test',
       cacheTtlMs: 20_000,
-      capUninjectedTtl: true,
+      assertedDefaultTtlSeconds: 86_400,
     });
     const event = eventFor('/page', {
       responseHeaders: { 'content-type': 'text/html; charset=utf-8' },
