@@ -185,8 +185,10 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   const ssmTimeoutMs = positiveNumber(source['ssmTimeoutMs']);
   if (ssmTimeoutMs !== undefined) baked.ssmTimeoutMs = ssmTimeoutMs;
   const assertedDefaultTtlSeconds = positiveNumber(source['assertedDefaultTtlSeconds']);
-  if (assertedDefaultTtlSeconds !== undefined) {
-    baked.assertedDefaultTtlSeconds = assertedDefaultTtlSeconds;
+  // Whole seconds only, minimum 1: a fractional assertion below 1 would
+  // floor to s-maxage=0 downstream (safe but surprising) — treat it as off.
+  if (assertedDefaultTtlSeconds !== undefined && assertedDefaultTtlSeconds >= 1) {
+    baked.assertedDefaultTtlSeconds = Math.floor(assertedDefaultTtlSeconds);
   }
   if (Array.isArray(source['excludePaths'])) {
     const patterns = source['excludePaths'].filter(

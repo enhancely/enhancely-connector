@@ -45,8 +45,8 @@ variable "asserted_default_ttl_seconds" {
   description = "Operator assertion in seconds: every cache behavior this function is associated with has a DefaultTTL of AT LEAST this value for its HTML. When > 0, uninjected pass-through responses WITHOUT an explicit origin cache lifetime get the bounded retry Cache-Control capped at min(retry, this) instead of inheriting the DefaultTTL (often a day) - the min() keeps the write strictly shorter than what was asserted. Use the SMALLEST DefaultTTL among associated behaviors; a conservative understatement (e.g. 60) is safe. 0 (default) = off; keep off when any behavior has DefaultTTL 0. Credentialed requests stay untouched."
 
   validation {
-    condition     = var.asserted_default_ttl_seconds >= 0
-    error_message = "asserted_default_ttl_seconds must be >= 0."
+    condition     = var.asserted_default_ttl_seconds >= 0 && floor(var.asserted_default_ttl_seconds) == var.asserted_default_ttl_seconds
+    error_message = "asserted_default_ttl_seconds must be a whole number of seconds (0 = off)."
   }
 }
 

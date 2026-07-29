@@ -436,7 +436,7 @@ function normalizePathForMatch(pathname) {
 function matchesExcludedPath(patterns, pathname) {
   const normalized = normalizePathForMatch(pathname);
   for (const pattern of patterns) {
-    if (typeof pattern !== "string" || pattern === "")
+    if (typeof pattern !== "string" || pattern === "" || pattern.length > 255)
       continue;
     const anchored = pattern.startsWith("/") || pattern.startsWith("*") ? pattern : `/${pattern}`;
     if (globMatch(anchored, normalized))
@@ -580,8 +580,8 @@ function parseBaked(raw) {
   const ssmTimeoutMs = positiveNumber(source["ssmTimeoutMs"]);
   if (ssmTimeoutMs !== void 0) baked.ssmTimeoutMs = ssmTimeoutMs;
   const assertedDefaultTtlSeconds = positiveNumber(source["assertedDefaultTtlSeconds"]);
-  if (assertedDefaultTtlSeconds !== void 0) {
-    baked.assertedDefaultTtlSeconds = assertedDefaultTtlSeconds;
+  if (assertedDefaultTtlSeconds !== void 0 && assertedDefaultTtlSeconds >= 1) {
+    baked.assertedDefaultTtlSeconds = Math.floor(assertedDefaultTtlSeconds);
   }
   if (Array.isArray(source["excludePaths"])) {
     const patterns = source["excludePaths"].filter(

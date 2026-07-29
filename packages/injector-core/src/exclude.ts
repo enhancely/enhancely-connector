@@ -25,10 +25,13 @@
  * over-exclusion skips an injection.
  *
  * Deliberately NOT a regex: patterns are operator config and paths are
- * viewer-controlled, so matching must stay linear. The two-pointer glob
- * below is O(path × pattern) in the worst case with no backtracking blowup
- * (a naive `*`→`.*` regex translation goes super-linear on multi-wildcard
- * patterns and can hang an edge function on a crafted URL).
+ * viewer-controlled, so matching cost must stay bounded. The two-pointer
+ * glob below is O(path × pattern) in the worst case — quadratic at the
+ * theoretical extreme, but never the exponential backtracking blowup a
+ * naive `*`→`.*` regex translation exhibits on multi-wildcard patterns
+ * (which can hang an edge function on a crafted URL). Patterns longer than
+ * CloudFront's own 255-character path-pattern limit are ignored, which
+ * bounds the quadratic term to ~255 × path.
  */
 
 /** Classic iterative glob match: `*` = any run, `?` = exactly one char. */
@@ -87,7 +90,7 @@ function normalizePathForMatch(pathname: string): string {
 export function matchesExcludedPath(patterns: readonly string[], pathname: string): boolean {
   const normalized = normalizePathForMatch(pathname);
   for (const pattern of patterns) {
-    if (typeof pattern !== 'string' || pattern === '') continue;
+    if (typeof pattern !== 'string' || pattern === '' || pattern.length > 255) continue;
     // CloudFront parity: a pattern without a leading slash or wildcard is
     // matched as if it had the slash (request paths always start with `/`).
     const anchored = pattern.startsWith('/') || pattern.startsWith('*') ? pattern : `/${pattern}`;
