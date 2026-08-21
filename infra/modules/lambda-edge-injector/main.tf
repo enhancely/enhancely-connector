@@ -51,6 +51,7 @@ data "archive_file" "bundle" {
       cacheTtlMs                = var.cache_ttl_ms
       autoRegister              = var.auto_register
       assertedDefaultTtlSeconds = var.asserted_default_ttl_seconds
+      capSetCookieResponses     = var.cap_set_cookie_responses
       excludePaths              = var.exclude_paths
     })
   }

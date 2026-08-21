@@ -50,6 +50,12 @@ variable "asserted_default_ttl_seconds" {
   }
 }
 
+variable "cap_set_cookie_responses" {
+  type        = bool
+  default     = false
+  description = "Operator assertion for the COMPANION entrypoint only: on this origin, Set-Cookie on responses to credential-less requests is load-balancer plumbing (e.g. ALB stickiness stamped on every response), not session material. When true, the retry cache-lifetime cap also applies to such responses; requests carrying Cookie/Authorization stay untouched regardless, and private/no-store responses are never capped. DO NOT enable on an origin that mints session cookies (JSESSIONID & co.) for anonymous requests - the written s-maxage would license downstream shared caches to replay that Set-Cookie across users (session-fixation pattern). Default false."
+}
+
 variable "timeout_ms" {
   type        = number
   default     = 2000

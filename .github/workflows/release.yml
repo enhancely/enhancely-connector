@@ -55,6 +55,18 @@ jobs:
           cd packages/adapter-lambda-edge/dist/.rel-or && zip -q -X ../release-or.zip index.js && cd -
           cp packages/adapter-lambda-edge/dist/release-or.zip \
              release-assets/lambda-edge-origin-request-bundle.zip
+          # companion entrypoint (origin-response, pairs WITH origin-request:
+          # register + cache-lifetime cap only, never injects). Same
+          # index.js-inside-zip convention so the handler stays index.handler.
+          cp packages/adapter-lambda-edge/dist/companion.js \
+             release-assets/lambda-edge-companion-index.js
+          rm -rf packages/adapter-lambda-edge/dist/.rel-comp
+          mkdir -p packages/adapter-lambda-edge/dist/.rel-comp
+          cp packages/adapter-lambda-edge/dist/companion.js \
+             packages/adapter-lambda-edge/dist/.rel-comp/index.js
+          cd packages/adapter-lambda-edge/dist/.rel-comp && zip -q -X ../release-comp.zip index.js && cd -
+          cp packages/adapter-lambda-edge/dist/release-comp.zip \
+             release-assets/lambda-edge-companion-bundle.zip
 
       - name: Verify Terraform module bundle is in sync
         run: |
@@ -68,6 +80,8 @@ jobs:
           cd release-assets
           sha256sum lambda-edge-origin-request-index.js \
                     lambda-edge-origin-request-bundle.zip \
+                    lambda-edge-companion-index.js \
+                    lambda-edge-companion-bundle.zip \
                     lambda-edge-index.js lambda-edge-bundle.zip > SHA256SUMS
           cat SHA256SUMS
 
@@ -80,6 +94,8 @@ jobs:
             --generate-notes \
             release-assets/lambda-edge-origin-request-index.js \
             release-assets/lambda-edge-origin-request-bundle.zip \
+            release-assets/lambda-edge-companion-index.js \
+            release-assets/lambda-edge-companion-bundle.zip \
             release-assets/lambda-edge-index.js \
             release-assets/lambda-edge-bundle.zip \
             release-assets/SHA256SUMS

@@ -43,12 +43,15 @@ __export(index_exports, {
   __resetHandlerStateForTests: () => __resetHandlerStateForTests,
   buildOriginUrl: () => buildOriginUrl,
   buildPageUrl: () => buildPageUrl,
+  cacheDirectiveSeconds: () => cacheDirectiveSeconds,
   charsetOf: () => charsetOf,
   fetchOriginHtml: () => fetchOriginHtml,
   forwardedHeaders: () => forwardedHeaders,
   getConfigRetryInMs: () => getConfigRetryInMs,
   handler: () => handler,
   resolveAdapterConfig: () => resolveAdapterConfig,
+  retrySharedTtlSeconds: () => retrySharedTtlSeconds,
+  retryablePassThroughResponse: () => retryablePassThroughResponse,
   serializedHeaderBytes: () => serializedHeaderBytes,
   shouldAttempt: () => shouldAttempt
 });
@@ -234,6 +237,35 @@ function parseRetryAfter(value, now = Date.now()) {
     return null;
   return Math.max(0, Math.ceil((date - now) / 1e3));
 }
+function rateLimitBackoffSeconds(response) {
+  const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+  if (retryAfter !== null)
+    return retryAfter;
+  const reset = response.headers.get("ratelimit-reset");
+  if (reset !== null && /^\d+$/.test(reset.trim()))
+    return Number.parseInt(reset, 10);
+  return null;
+}
+async function evaluateOkResponse(response, maxBytes, signal) {
+  if (response.headers.get("x-jsonld-status")?.trim().toLowerCase() === "ignored") {
+    cancelResponseBody(response, "ignored-record");
+    return { status: "terminal-negative", reason: "ignored" };
+  }
+  let body;
+  try {
+    body = await readJsonLdBody(response, maxBytes, signal);
+  } catch {
+    return { status: "error", reason: "body-read-failed" };
+  }
+  if (body.status === "error")
+    return body;
+  const trimmed = body.text.trim();
+  if (trimmed === "")
+    return { status: "error", reason: "empty-body" };
+  if (trimmed === "{}")
+    return { status: "terminal-negative", reason: "empty-record" };
+  return { status: "ok", jsonldRaw: body.text, etag: response.headers.get("etag") };
+}
 async function fetchJsonLd(config, pageUrl, etag) {
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
   const endpoint = `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(pageUrl)}`;
@@ -263,29 +295,24 @@ async function fetchJsonLd(config, pageUrl, etag) {
     cancelResponseBody(response, "not-found");
     return { status: "not-found" };
   }
-  if (response.status === 429) {
+  if (response.status === 202) {
     const retryAfterSeconds = parseRetryAfter(response.headers.get("retry-after"));
+    cancelResponseBody(response, "pending");
+    return { status: "pending", retryAfterSeconds };
+  }
+  if (response.status === 429) {
+    const retryAfterSeconds = rateLimitBackoffSeconds(response);
     cancelResponseBody(response, "rate-limited");
     return {
       status: "rate-limited",
       retryAfterSeconds
     };
   }
-  if (!response.ok) {
+  if (response.status !== 200) {
     cancelResponseBody(response, `http-${response.status}`);
     return { status: "error", reason: `http-${response.status}` };
   }
-  let body;
-  try {
-    body = await readJsonLdBody(response, config.maxJsonLdBytes, signal);
-  } catch {
-    return { status: "error", reason: "body-read-failed" };
-  }
-  if (body.status === "error")
-    return body;
-  if (body.text.trim() === "")
-    return { status: "error", reason: "empty-body" };
-  return { status: "ok", jsonldRaw: body.text, etag: response.headers.get("etag") };
+  return evaluateOkResponse(response, config.maxJsonLdBytes, signal);
 }
 async function registerJsonLd(config, pageUrl) {
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
@@ -308,9 +335,13 @@ async function registerJsonLd(config, pageUrl) {
 }
 
 // ../injector-core/dist/inject.js
-function buildScriptTag(jsonldRaw) {
+function etagAttributeValue(etag) {
+  return etag.replace(/^W\//i, "").replace(/^"|"$/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+}
+function buildScriptTag(jsonldRaw, etag) {
   const safe = jsonldRaw.replace(/</g, "\\u003c");
-  return `<script type="application/ld+json">${safe}</script>`;
+  const etagAttr = etag ? ` data-etag="${etagAttributeValue(etag)}"` : "";
+  return `<script type="application/ld+json" data-source="Enhancely.ai"${etagAttr}>${safe}</script>`;
 }
 var RAW_TEXT_ELEMENTS = ["script", "style", "title", "textarea", "noscript"];
 var HEAD_CLOSE = /^<\/head\s*>/i;
@@ -460,7 +491,7 @@ function matchesExcludedPath(patterns, pathname) {
 
 // ../injector-core/dist/index.js
 function snippetFromEntry(entry) {
-  return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw) : null;
+  return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw, entry.etag) : null;
 }
 function lookupFromEntry(entry, cacheTtlMs, now = Date.now()) {
   if (entry.jsonldRaw !== null) {
@@ -475,7 +506,7 @@ function lookupFromEntry(entry, cacheTtlMs, now = Date.now()) {
 }
 var DEFAULT_RETRY_BACKOFF_MS = 1e4;
 var MAX_RETRY_BACKOFF_MS = 6e4;
-async function getJsonLdLookup(url, cache2, config) {
+async function resolveLookup(url, cache2, config, call, opts) {
   try {
     const key = normalizeLite(url);
     const cached = await cache2.get(key);
@@ -485,7 +516,7 @@ async function getJsonLdLookup(url, cache2, config) {
     if (cached?.retryNotBefore !== void 0 && Date.now() < cached.retryNotBefore) {
       return lookupFromEntry(cached, config.cacheTtlMs);
     }
-    const result = await fetchJsonLd(config, key, cached?.etag);
+    const result = await call(key, cached?.etag);
     switch (result.status) {
       case "ok": {
         await cache2.set(key, {
@@ -493,7 +524,7 @@ async function getJsonLdLookup(url, cache2, config) {
           etag: result.etag,
           storedAt: Date.now()
         });
-        return { snippet: buildScriptTag(result.jsonldRaw), revalidateInMs: null };
+        return { snippet: buildScriptTag(result.jsonldRaw, result.etag), revalidateInMs: null };
       }
       case "not-modified": {
         if (!cached)
@@ -507,22 +538,37 @@ async function getJsonLdLookup(url, cache2, config) {
         await cache2.set(key, refreshed);
         return lookupFromEntry(refreshed, config.cacheTtlMs);
       }
+      case "pending": {
+        const entry = result.retryAfterSeconds !== null ? {
+          jsonldRaw: null,
+          etag: null,
+          storedAt: 0,
+          retryNotBefore: Date.now() + Math.min(Math.max(result.retryAfterSeconds, 1) * 1e3, config.cacheTtlMs)
+        } : { jsonldRaw: null, etag: null, storedAt: Date.now() };
+        await cache2.set(key, entry);
+        return lookupFromEntry(entry, config.cacheTtlMs);
+      }
+      case "terminal-negative": {
+        const negative = { jsonldRaw: null, etag: null, storedAt: Date.now() };
+        await cache2.set(key, negative);
+        return lookupFromEntry(negative, config.cacheTtlMs);
+      }
       case "not-found": {
-        if (config.autoRegister) {
+        if (opts.registerOnNotFound && config.autoRegister) {
           await registerJsonLd(config, key);
         }
         const negative = {
           jsonldRaw: null,
           etag: null,
           storedAt: Date.now(),
-          ...config.autoRegister && { registrationPending: true }
+          ...opts.registerOnNotFound && config.autoRegister && { registrationPending: true }
         };
         await cache2.set(key, negative);
         return lookupFromEntry(negative, config.cacheTtlMs);
       }
       case "rate-limited":
       case "error": {
-        const backoffMs = result.status === "rate-limited" && result.retryAfterSeconds !== null ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1e3, MAX_RETRY_BACKOFF_MS) : DEFAULT_RETRY_BACKOFF_MS;
+        const backoffMs = result.status === "rate-limited" && result.retryAfterSeconds !== null ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1e3, opts.maxBackoffMs) : DEFAULT_RETRY_BACKOFF_MS;
         const memo = {
           jsonldRaw: cached?.jsonldRaw ?? null,
           etag: cached?.etag ?? null,
@@ -547,6 +593,12 @@ async function getJsonLdLookup(url, cache2, config) {
     return { snippet: null, revalidateInMs: null };
   }
 }
+async function getJsonLdLookup(url, cache2, config) {
+  return resolveLookup(url, cache2, config, (key, etag) => fetchJsonLd(config, key, etag), {
+    registerOnNotFound: true,
+    maxBackoffMs: MAX_RETRY_BACKOFF_MS
+  });
+}
 
 // src/config.ts
 var import_node_fs = require("node:fs");
@@ -562,6 +614,7 @@ var inflight = null;
 var NEGATIVE_TTL_MS = 3e4;
 var resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
 var resolvedAssertedDefaultTtlSeconds = 0;
+var resolvedCapSetCookieResponses = false;
 var bakedCache;
 var bakedOverride;
 var configOverrides = null;
@@ -595,6 +648,9 @@ function parseBaked(raw) {
   const assertedDefaultTtlSeconds = positiveNumber(source["assertedDefaultTtlSeconds"]);
   if (assertedDefaultTtlSeconds !== void 0 && assertedDefaultTtlSeconds >= 1) {
     baked.assertedDefaultTtlSeconds = Math.floor(assertedDefaultTtlSeconds);
+  }
+  if (typeof source["capSetCookieResponses"] === "boolean") {
+    baked.capSetCookieResponses = source["capSetCookieResponses"];
   }
   if (Array.isArray(source["excludePaths"])) {
     const patterns = source["excludePaths"].filter(
@@ -648,6 +704,7 @@ async function resolveOnce() {
     const baked = bakedConfig();
     resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
     resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
+    resolvedCapSetCookieResponses = baked?.capSetCookieResponses ?? false;
     let apiKey = baked?.apiKey;
     if (apiKey === void 0) {
       apiKey = await fetchApiKeyFromSsm(
@@ -708,6 +765,9 @@ function getOriginTimeoutMs() {
 }
 function getAssertedDefaultTtlSeconds() {
   return resolvedAssertedDefaultTtlSeconds;
+}
+function getCapSetCookieResponses() {
+  return resolvedCapSetCookieResponses;
 }
 function getExcludePaths() {
   return bakedConfig()?.excludePaths ?? [];
@@ -890,6 +950,9 @@ function declaresUtf8MetaInPrescan(body) {
   return false;
 }
 var PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
+function hasPerRequestCacheControl(cacheControl) {
+  return cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(cacheControl);
+}
 function isInjectableRepresentation(input) {
   if (input.method !== "GET") return false;
   if (input.status !== "200") return false;
@@ -902,7 +965,7 @@ function isInjectableRepresentation(input) {
 function shouldAttempt(input, ignoreContentEncoding = false) {
   if (!isInjectableRepresentation(input)) return false;
   if (input.hasSetCookie) return false;
-  if (input.cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(input.cacheControl)) {
+  if (hasPerRequestCacheControl(input.cacheControl)) {
     return false;
   }
   if (ignoreContentEncoding) return true;
@@ -972,11 +1035,7 @@ function forwardedHeaders(headers) {
   return out;
 }
 
-// src/index.ts
-function normalizedRobotsTag(xRobotsTag) {
-  if (xRobotsTag === null) return null;
-  return xRobotsTag.split(",").map((directive) => directive.trim().replace(/\s+/g, " ").toLowerCase()).join(",");
-}
+// src/cache-cap.ts
 function cacheDirectiveSeconds(policy, wanted) {
   for (const directive of policy.split(",")) {
     const [rawName, rawValue] = directive.trim().split("=", 2);
@@ -987,22 +1046,6 @@ function cacheDirectiveSeconds(policy, wanted) {
     return Number.isSafeInteger(seconds) ? seconds : null;
   }
   return null;
-}
-function normalizedCacheControl(policy) {
-  if (policy === null) return null;
-  return policy.split(",").map((directive) => directive.trim().toLowerCase()).sort().join(",");
-}
-function normalizedCspStructure(policy) {
-  return policy.split(";").map((rawDirective) => {
-    const [rawName, ...rawSources] = rawDirective.trim().split(/\s+/);
-    if (rawName === void 0 || rawName === "") return "";
-    const sources = rawSources.map((source) => {
-      if (/^'nonce-[^']+'$/i.test(source)) return "'nonce-*'";
-      const hash = /^'(sha256|sha384|sha512)-[^']+'$/i.exec(source);
-      return hash?.[1] === void 0 ? source : `'${hash[1].toLowerCase()}-*'`;
-    });
-    return [rawName.toLowerCase(), ...sources].join(" ");
-  }).filter((directive) => directive !== "").join(";");
 }
 function retrySharedTtlSeconds(headers, revalidateInMs, assertedDefaultTtlSeconds) {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
@@ -1020,23 +1063,30 @@ function retrySharedTtlSeconds(headers, revalidateInMs, assertedDefaultTtlSecond
   const expires = headerValue(headers, "expires");
   if (expires !== null) {
     const expiresAt = Date.parse(expires);
-    if (!Number.isNaN(expiresAt)) {
-      const responseDate = Date.parse(headerValue(headers, "date") ?? "");
-      const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
-      return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1e3)));
+    if (Number.isNaN(expiresAt)) {
+      return 0;
     }
+    const responseDate = Date.parse(headerValue(headers, "date") ?? "");
+    const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
+    return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1e3)));
   }
   return assertedDefaultTtlSeconds > 0 ? Math.min(retryTtl, Math.floor(assertedDefaultTtlSeconds)) : null;
 }
-function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) {
+function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, opts) {
   if (requestHeaders["authorization"] !== void 0 || requestHeaders["cookie"] !== void 0) {
     return response;
   }
   const originalHeaders = response.headers ?? {};
+  if (hasPerRequestCacheControl(cacheControlValue(originalHeaders))) {
+    return response;
+  }
+  if (originalHeaders["set-cookie"] !== void 0 && !opts.capSetCookieResponses) {
+    return response;
+  }
   const sharedTtlSeconds = retrySharedTtlSeconds(
     originalHeaders,
     revalidateInMs,
-    getAssertedDefaultTtlSeconds()
+    opts.assertedDefaultTtlSeconds
   );
   if (sharedTtlSeconds === null) return response;
   const headers = { ...originalHeaders };
@@ -1053,6 +1103,28 @@ function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) 
     return response;
   }
   return { ...response, headers };
+}
+
+// src/index.ts
+function normalizedRobotsTag(xRobotsTag) {
+  if (xRobotsTag === null) return null;
+  return xRobotsTag.split(",").map((directive) => directive.trim().replace(/\s+/g, " ").toLowerCase()).join(",");
+}
+function normalizedCacheControl(policy) {
+  if (policy === null) return null;
+  return policy.split(",").map((directive) => directive.trim().toLowerCase()).sort().join(",");
+}
+function normalizedCspStructure(policy) {
+  return policy.split(";").map((rawDirective) => {
+    const [rawName, ...rawSources] = rawDirective.trim().split(/\s+/);
+    if (rawName === void 0 || rawName === "") return "";
+    const sources = rawSources.map((source) => {
+      if (/^'nonce-[^']+'$/i.test(source)) return "'nonce-*'";
+      const hash = /^'(sha256|sha384|sha512)-[^']+'$/i.exec(source);
+      return hash?.[1] === void 0 ? source : `'${hash[1].toLowerCase()}-*'`;
+    });
+    return [rawName.toLowerCase(), ...sources].join(" ");
+  }).filter((directive) => directive !== "").join(";");
 }
 var cache = new MemoryCache();
 function __resetHandlerStateForTests() {
@@ -1093,13 +1165,19 @@ var handler = async (event) => {
     const config = await resolveAdapterConfig();
     if (config === null) {
       const retryInMs = getConfigRetryInMs();
-      return retryInMs === null ? response : retryablePassThroughResponse(response, request.headers, retryInMs);
+      return retryInMs === null ? response : retryablePassThroughResponse(response, request.headers, retryInMs, {
+        assertedDefaultTtlSeconds: getAssertedDefaultTtlSeconds(),
+        capSetCookieResponses: getCapSetCookieResponses()
+      });
     }
     const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
     const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
     const lookup = await getJsonLdLookup(pageUrl, cache, config);
     if (lookup.snippet === null) {
-      return lookup.revalidateInMs === null ? response : retryablePassThroughResponse(response, request.headers, lookup.revalidateInMs);
+      return lookup.revalidateInMs === null ? response : retryablePassThroughResponse(response, request.headers, lookup.revalidateInMs, {
+        assertedDefaultTtlSeconds: getAssertedDefaultTtlSeconds(),
+        capSetCookieResponses: getCapSetCookieResponses()
+      });
     }
     const origin = await fetchOriginHtml(
       originUrl,
@@ -1227,12 +1305,15 @@ var handler = async (event) => {
   __resetHandlerStateForTests,
   buildOriginUrl,
   buildPageUrl,
+  cacheDirectiveSeconds,
   charsetOf,
   fetchOriginHtml,
   forwardedHeaders,
   getConfigRetryInMs,
   handler,
   resolveAdapterConfig,
+  retrySharedTtlSeconds,
+  retryablePassThroughResponse,
   serializedHeaderBytes,
   shouldAttempt
 });
