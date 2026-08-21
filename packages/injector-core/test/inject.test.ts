@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest';
 
 import { buildScriptTag, injectIntoHead } from '../src/index.js';
 
-const SNIPPET = '<script type="application/ld+json">{"@type":"Thing"}</script>';
+const SNIPPET =
+  '<script type="application/ld+json" data-source="Enhancely.ai">{"@type":"Thing"}</script>';
 
 describe('buildScriptTag', () => {
   it('wraps the raw JSON-LD string verbatim in a ld+json script tag', () => {
     const raw = '{"@context":"https://schema.org","name":"A \\u003c B"}';
-    expect(buildScriptTag(raw)).toBe(`<script type="application/ld+json">${raw}</script>`);
+    expect(buildScriptTag(raw)).toBe(
+      `<script type="application/ld+json" data-source="Enhancely.ai">${raw}</script>`
+    );
   });
 });
 

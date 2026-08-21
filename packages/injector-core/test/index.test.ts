@@ -13,7 +13,8 @@ import type { Fetcher, HtmlContext } from '../src/index.js';
 const PAGE_URL = 'https://example.com/pricing';
 const KEY = normalizeLite(PAGE_URL);
 const RAW_JSONLD = '{"@context":"https://schema.org","@type":"Product"}';
-const SNIPPET = buildScriptTag(RAW_JSONLD);
+const SNIPPET = buildScriptTag(RAW_JSONLD, '"v1"');
+const SNIPPET_V2 = buildScriptTag(RAW_JSONLD, '"v2"');
 const TTL_MS = 60_000;
 
 function makeConfig(fetchImpl: Fetcher, apiKey = 'sk-test-key') {
@@ -165,7 +166,7 @@ describe('getJsonLdSnippet', () => {
 
     const snippet = await getJsonLdSnippet(PAGE_URL, cache, makeConfig(fetchImpl));
 
-    expect(snippet).toBe(SNIPPET);
+    expect(snippet).toBe(SNIPPET_V2);
     const entry = await cache.get(KEY);
     expect(entry?.jsonldRaw).toBe(RAW_JSONLD);
     expect(entry?.etag).toBe('"v2"');
@@ -297,7 +298,7 @@ describe('getJsonLdSnippet — retry backoff (429/error memo)', () => {
     expect(await getJsonLdSnippet(PAGE_URL, cache, config)).toBeNull();
 
     vi.advanceTimersByTime(6_000);
-    expect(await getJsonLdSnippet(PAGE_URL, cache, config)).toBe(SNIPPET);
+    expect(await getJsonLdSnippet(PAGE_URL, cache, config)).toBe(SNIPPET_V2);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
 
     const entry = await cache.get(KEY);

@@ -154,6 +154,57 @@ export function parseRetryAfter(value: string | null, now: number = Date.now()):
   return Math.max(0, Math.ceil((date - now) / 1000));
 }
 
+/**
+ * Backoff seconds for a 429: Retry-After when present, else the standard
+ * rate-limit header `RateLimit-Reset` (delta seconds until the window resets)
+ * — the server's org request-rate limiter sends only the latter. Null when
+ * neither is usable; the orchestrator then applies its default backoff.
+ */
+function rateLimitBackoffSeconds(response: Response): number | null {
+  const retryAfter = parseRetryAfter(response.headers.get('retry-after'));
+  if (retryAfter !== null) return retryAfter;
+  const reset = response.headers.get('ratelimit-reset');
+  if (reset !== null && /^\d+$/.test(reset.trim())) return Number.parseInt(reset, 10);
+  return null;
+}
+
+/**
+ * Evaluate a 200 response into ok / terminal-negative / error.
+ *
+ * Shared by the GET and the register POST because the server serializes both
+ * identically. Two 200 shapes are NOT snippets (P0 fixes, 2026-08-21):
+ * - `X-JsonLd-Status: ignored` — the operator ignored this record;
+ * - body `{}` — a record whose generation never succeeded (fresh `failed`
+ *   or limit-reached records serialize as an empty object).
+ * Both previously passed the "any 2xx with a body" check and were injected
+ * verbatim into live pages.
+ */
+async function evaluateOkResponse(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal
+): Promise<JsonLdFetchResult> {
+  if (response.headers.get('x-jsonld-status')?.trim().toLowerCase() === 'ignored') {
+    cancelResponseBody(response, 'ignored-record');
+    return { status: 'terminal-negative', reason: 'ignored' };
+  }
+
+  let body: BodyReadResult;
+  try {
+    body = await readJsonLdBody(response, maxBytes, signal);
+  } catch {
+    // A non-standard/locked response stream may throw while acquiring its
+    // reader. Callers receive the same fail-open result as the orchestrator
+    // instead of an escaping rejection.
+    return { status: 'error', reason: 'body-read-failed' };
+  }
+  if (body.status === 'error') return body;
+  const trimmed = body.text.trim();
+  if (trimmed === '') return { status: 'error', reason: 'empty-body' };
+  if (trimmed === '{}') return { status: 'terminal-negative', reason: 'empty-record' };
+  return { status: 'ok', jsonldRaw: body.text, etag: response.headers.get('etag') };
+}
+
 export async function fetchJsonLd(
   config: InjectorConfig,
   pageUrl: string,
@@ -189,31 +240,114 @@ export async function fetchJsonLd(
     cancelResponseBody(response, 'not-found');
     return { status: 'not-found' };
   }
-  if (response.status === 429) {
+  if (response.status === 202) {
+    // Record exists, generation still running. The Problem-JSON body must
+    // never be treated as JSON-LD (it used to be injected verbatim).
     const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after'));
+    cancelResponseBody(response, 'pending');
+    return { status: 'pending', retryAfterSeconds };
+  }
+  if (response.status === 429) {
+    const retryAfterSeconds = rateLimitBackoffSeconds(response);
     cancelResponseBody(response, 'rate-limited');
     return {
       status: 'rate-limited',
       retryAfterSeconds,
     };
   }
-  if (!response.ok) {
+  if (response.status !== 200) {
+    // Only 200 carries a snippet. Any other status — including unexpected
+    // 2xx — has a non-snippet body and must fail open, never be injected.
     cancelResponseBody(response, `http-${response.status}`);
     return { status: 'error', reason: `http-${response.status}` };
   }
 
-  let body: BodyReadResult;
+  return evaluateOkResponse(response, config.maxJsonLdBytes, signal);
+}
+
+/**
+ * One register-or-revalidate POST: `POST {base}/api/v1/jsonld { url }` with
+ * `If-None-Match` when we hold an ETag and `Accept: application/ld+json`.
+ *
+ * The endpoint is not merely "register": for a KNOWN url it answers like the
+ * read path (200 + raw script-safe body + ETag, or 412 when the ETag still
+ * matches), for an UNKNOWN url it creates the record and starts generation
+ * (201), and for a record mid-generation it answers 202. One round-trip
+ * replaces the GET→404→POST pair. Duplicate POSTs for the same new URL are
+ * coalesced server-side; the call is treated as idempotent.
+ *
+ * Status map (server verified 2026-08-21):
+ * - 200 → ok / terminal-negative (`X-JsonLd-Status: ignored`, body `{}`)
+ * - 412 → not-modified (ETag still current — same semantics as the GET's 304)
+ * - 201/202 → pending (Retry-After honored when present)
+ * - 400 → terminal-negative `rejected` (denylist or unregistered hostname;
+ *   self-heals after a TTL once the operator fixes the domain registration)
+ * - 429 → rate-limited (Retry-After, else RateLimit-Reset)
+ * - 403 with Retry-After (plan hard cap sends 86400) → rate-limited, honored
+ *   by the register orchestrator's larger backoff cap; 403 WITHOUT a hint
+ *   (unvalidated-domain limit) → terminal-negative, resting a full TTL
+ */
+export async function registerOrRevalidate(
+  config: InjectorConfig,
+  pageUrl: string,
+  etag?: string | null
+): Promise<JsonLdFetchResult> {
+  const fetchImpl = config.fetchImpl ?? globalThis.fetch;
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${config.apiKey}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/ld+json',
+  };
+  if (etag) headers['If-None-Match'] = etag;
+
+  let response: Response;
+  let signal: AbortSignal;
   try {
-    body = await readJsonLdBody(response, config.maxJsonLdBytes, signal);
-  } catch {
-    // A non-standard/locked response stream may throw while acquiring its
-    // reader. Direct client callers receive the same fail-open result as the
-    // orchestrator instead of an escaping rejection.
-    return { status: 'error', reason: 'body-read-failed' };
+    signal = AbortSignal.timeout(config.timeoutMs);
+    response = await fetchImpl(`${config.enhancelyBase}/api/v1/jsonld`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: pageUrl }),
+      signal,
+    });
+  } catch (error) {
+    return { status: 'error', reason: error instanceof Error ? error.name : 'fetch-failed' };
   }
-  if (body.status === 'error') return body;
-  if (body.text.trim() === '') return { status: 'error', reason: 'empty-body' };
-  return { status: 'ok', jsonldRaw: body.text, etag: response.headers.get('etag') };
+
+  if (response.status === 412) {
+    cancelResponseBody(response, 'not-modified');
+    return { status: 'not-modified' };
+  }
+  if (response.status === 201 || response.status === 202) {
+    const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after'));
+    cancelResponseBody(response, 'pending');
+    return { status: 'pending', retryAfterSeconds };
+  }
+  if (response.status === 400) {
+    cancelResponseBody(response, 'rejected');
+    return { status: 'terminal-negative', reason: 'rejected' };
+  }
+  if (response.status === 429 || response.status === 403) {
+    const retryAfterSeconds = rateLimitBackoffSeconds(response);
+    cancelResponseBody(response, 'rate-limited');
+    // A 403 WITHOUT any backoff hint is a durable operator-state (the server's
+    // unvalidated-domain limit sends no Retry-After — only the plan hard cap
+    // does). Mapping it to 'rate-limited' would fall through to the 10 s error
+    // backoff and re-POST every URL six times a minute for as long as the
+    // state lasts. Rest for a full TTL instead; it self-heals once the
+    // operator validates the domain (same shape as the 400 rejections).
+    if (response.status === 403 && retryAfterSeconds === null) {
+      return { status: 'terminal-negative', reason: 'rejected' };
+    }
+    return { status: 'rate-limited', retryAfterSeconds };
+  }
+  if (response.status !== 200) {
+    cancelResponseBody(response, `http-${response.status}`);
+    return { status: 'error', reason: `http-${response.status}` };
+  }
+
+  return evaluateOkResponse(response, config.maxJsonLdBytes, signal);
 }
 
 /**

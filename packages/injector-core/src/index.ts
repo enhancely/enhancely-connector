@@ -25,7 +25,7 @@ export {
 } from './config.js';
 export { normalizeLite } from './normalize.js';
 export { MemoryCache, isFresh } from './cache.js';
-export { fetchJsonLd, registerJsonLd, parseRetryAfter } from './client.js';
+export { fetchJsonLd, registerJsonLd, registerOrRevalidate, parseRetryAfter } from './client.js';
 export { buildScriptTag, injectIntoHead } from './inject.js';
 export { matchesExcludedPath } from './exclude.js';
 
@@ -34,16 +34,17 @@ import type {
   CacheEntry,
   HtmlContext,
   InjectorConfig,
+  JsonLdFetchResult,
   JsonLdLookupResult,
 } from './types.js';
 import { normalizeLite } from './normalize.js';
 import { isFresh } from './cache.js';
-import { fetchJsonLd, registerJsonLd } from './client.js';
+import { fetchJsonLd, registerJsonLd, registerOrRevalidate } from './client.js';
 import { buildScriptTag, injectIntoHead } from './inject.js';
 
 /** Positive entry → script tag, negative entry (404 memo) → null. */
 function snippetFromEntry(entry: CacheEntry): string | null {
-  return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw) : null;
+  return entry.jsonldRaw !== null ? buildScriptTag(entry.jsonldRaw, entry.etag) : null;
 }
 
 /**
@@ -85,6 +86,14 @@ export function isHtmlMediaType(contentType: string | null): boolean {
 const DEFAULT_RETRY_BACKOFF_MS = 10_000;
 /** Upper bound for honoring 429 Retry-After (keeps memos short-lived). */
 const MAX_RETRY_BACKOFF_MS = 60_000;
+/**
+ * Upper bound for honoring Retry-After on the register-or-revalidate path.
+ * Durable server states (plan hard cap 403, monthly limit 429) send day-scale
+ * values; honoring them only up to 60 s would re-POST every URL every TTL for
+ * the rest of a billing cycle. Still bounded so a bogus header cannot park a
+ * URL forever.
+ */
+const MAX_REGISTER_BACKOFF_MS = 86_400_000;
 
 /**
  * Resolve the ready-to-inject `<script type="application/ld+json">…</script>`
@@ -95,13 +104,20 @@ const MAX_RETRY_BACKOFF_MS = 60_000;
  * - Entry carrying a retry backoff memo (previous 429/error) that has not
  *   elapsed → answered locally too, so page views never hammer a rate-limited
  *   or down API (nor pay the fetch timeout each time).
- * - Stale/missing → conditional GET (If-None-Match when we hold an ETag):
+ * - Stale/missing → one upstream call (`call`: conditional GET for the
+ *   lookup path, register-or-revalidate POST for the companion path; both
+ *   send If-None-Match when we hold an ETag):
  *   - 200 → store + inject
- *   - 304 → refresh the stored entry's storedAt, serve from cache
- *   - 404 → store a NEGATIVE entry (stops dead-URL polling), inject nothing
- *   - 429/error/timeout → serve the stale entry as-is if we have one
- *     (without touching storedAt) and record a short retryNotBefore memo:
- *     min(Retry-After, 60 s) on 429, 10 s otherwise
+ *   - 304/412 → refresh the stored entry's storedAt, serve from cache
+ *   - 404 → store a NEGATIVE entry (stops dead-URL polling), inject nothing;
+ *     the lookup path additionally fires ONE registration when autoRegister
+ *   - 202 pending → negative entry re-polling at the server's Retry-After
+ *     (capped at cacheTtlMs), or resting a full TTL without a hint
+ *   - terminal-negative (ignored / empty record / rejected) → negative entry
+ *     for a full TTL, never re-registered
+ *   - 429/403/error/timeout → serve the stale entry as-is if we have one
+ *     (without touching storedAt) and record a retryNotBefore memo:
+ *     min(Retry-After, maxBackoffMs) when sent, 10 s otherwise
  *
  * The API request carries the query-stripped URL (`normalizeLite(url)`, = the
  * cache key), never a locally computed hash. The server normalizes identically,
@@ -109,10 +125,12 @@ const MAX_RETRY_BACKOFF_MS = 60_000;
  *
  * Never throws.
  */
-export async function getJsonLdLookup(
+async function resolveLookup(
   url: string,
   cache: CacheBackend,
-  config: InjectorConfig
+  config: InjectorConfig,
+  call: (key: string, etag: string | null | undefined) => Promise<JsonLdFetchResult>,
+  opts: { registerOnNotFound: boolean; maxBackoffMs: number }
 ): Promise<JsonLdLookupResult> {
   try {
     const key = normalizeLite(url);
@@ -133,7 +151,7 @@ export async function getJsonLdLookup(
     // routinely carry tokens, search terms and PII) never leave the edge, and
     // the URL we look up matches the URL we cache under (`?a=1` and `?a=2`
     // share one entry precisely because they are the same page server-side).
-    const result = await fetchJsonLd(config, key, cached?.etag);
+    const result = await call(key, cached?.etag);
 
     switch (result.status) {
       case 'ok': {
@@ -142,13 +160,13 @@ export async function getJsonLdLookup(
           etag: result.etag,
           storedAt: Date.now(),
         });
-        return { snippet: buildScriptTag(result.jsonldRaw), revalidateInMs: null };
+        return { snippet: buildScriptTag(result.jsonldRaw, result.etag), revalidateInMs: null };
       }
       case 'not-modified': {
-        // 304 without a cached entry should be impossible (we only send
-        // If-None-Match when we hold one) — treat it like an error: nothing
-        // to serve, nothing to store. Rebuilding the entry (instead of
-        // spreading) drops any leftover retryNotBefore memo.
+        // 304 (GET) or 412 (register POST) without a cached entry should be
+        // impossible (we only send If-None-Match when we hold one) — treat it
+        // like an error: nothing to serve, nothing to store. Rebuilding the
+        // entry (instead of spreading) drops any leftover retryNotBefore memo.
         if (!cached) return { snippet: null, revalidateInMs: null };
         const refreshed: CacheEntry = {
           jsonldRaw: cached.jsonldRaw,
@@ -159,13 +177,44 @@ export async function getJsonLdLookup(
         await cache.set(key, refreshed);
         return lookupFromEntry(refreshed, config.cacheTtlMs);
       }
+      case 'pending': {
+        // The record exists but generation has produced no content yet. The
+        // server explicitly told us there is no current snippet, so any stale
+        // positive we hold describes a dead record incarnation — drop it.
+        // With a Retry-After hint the entry re-polls exactly then (storedAt 0
+        // keeps it permanently stale so only retryNotBefore gates the next
+        // call); without one it rests for a full TTL.
+        const entry: CacheEntry =
+          result.retryAfterSeconds !== null
+            ? {
+                jsonldRaw: null,
+                etag: null,
+                storedAt: 0,
+                retryNotBefore:
+                  Date.now() +
+                  Math.min(Math.max(result.retryAfterSeconds, 1) * 1000, config.cacheTtlMs),
+              }
+            : { jsonldRaw: null, etag: null, storedAt: Date.now() };
+        await cache.set(key, entry);
+        return lookupFromEntry(entry, config.cacheTtlMs);
+      }
+      case 'terminal-negative': {
+        // Ignored record, never-succeeded generation, or rejected
+        // registration. The server knows the URL — re-registering it would be
+        // pure load, so unlike `not-found` this NEVER triggers autoRegister.
+        // A plain negative entry re-checks after a full TTL (self-healing
+        // when the operator un-ignores the record or fixes the domain).
+        const negative: CacheEntry = { jsonldRaw: null, etag: null, storedAt: Date.now() };
+        await cache.set(key, negative);
+        return lookupFromEntry(negative, config.cacheTtlMs);
+      }
       case 'not-found': {
         // Auto-registration: the page is really being served (adapters gate on
         // 200 + text/html) but unknown to Enhancely — register it once. The
         // negative entry below suppresses further lookups (and thus further
         // registrations) for a full TTL; after expiry the next view picks up
         // the generated JSON-LD via the normal GET path.
-        if (config.autoRegister) {
+        if (opts.registerOnNotFound && config.autoRegister) {
           // Register the query-stripped URL for the same reason (see above):
           // no query string is ever POSTed to the third party.
           await registerJsonLd(config, key);
@@ -174,7 +223,7 @@ export async function getJsonLdLookup(
           jsonldRaw: null,
           etag: null,
           storedAt: Date.now(),
-          ...(config.autoRegister && { registrationPending: true }),
+          ...(opts.registerOnNotFound && config.autoRegister && { registrationPending: true }),
         };
         await cache.set(key, negative);
         return lookupFromEntry(negative, config.cacheTtlMs);
@@ -186,7 +235,7 @@ export async function getJsonLdLookup(
         // trusting this entry for another full TTL.
         const backoffMs =
           result.status === 'rate-limited' && result.retryAfterSeconds !== null
-            ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1000, MAX_RETRY_BACKOFF_MS)
+            ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1000, opts.maxBackoffMs)
             : DEFAULT_RETRY_BACKOFF_MS;
         const memo: CacheEntry = {
           jsonldRaw: cached?.jsonldRaw ?? null,
@@ -218,6 +267,40 @@ export async function getJsonLdLookup(
   } catch {
     return { snippet: null, revalidateInMs: null };
   }
+}
+
+export async function getJsonLdLookup(
+  url: string,
+  cache: CacheBackend,
+  config: InjectorConfig
+): Promise<JsonLdLookupResult> {
+  return resolveLookup(url, cache, config, (key, etag) => fetchJsonLd(config, key, etag), {
+    registerOnNotFound: true,
+    maxBackoffMs: MAX_RETRY_BACKOFF_MS,
+  });
+}
+
+/**
+ * Register-or-revalidate lookup for adapters that both DISCOVER pages and
+ * consume snippets in one place (the Lambda@Edge companion): a single
+ * `POST /api/v1/jsonld { url }` with `If-None-Match` replaces the GET→404→POST
+ * pair — unknown URLs are registered, known ones are revalidated (412) or
+ * fetched (200) in the same round-trip, and the entry this stores makes the
+ * NEXT miss inject. `autoRegister` is irrelevant here: the call itself is the
+ * registration. Rate-limit backoffs honor day-scale Retry-After values
+ * (plan caps), bounded by MAX_REGISTER_BACKOFF_MS.
+ *
+ * Never throws.
+ */
+export async function getJsonLdRegisterLookup(
+  url: string,
+  cache: CacheBackend,
+  config: InjectorConfig
+): Promise<JsonLdLookupResult> {
+  return resolveLookup(url, cache, config, (key, etag) => registerOrRevalidate(config, key, etag), {
+    registerOnNotFound: false,
+    maxBackoffMs: MAX_REGISTER_BACKOFF_MS,
+  });
 }
 
 /**

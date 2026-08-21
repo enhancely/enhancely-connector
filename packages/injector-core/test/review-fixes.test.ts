@@ -156,7 +156,7 @@ describe('backoff memo race (finding 3)', () => {
 describe('buildScriptTag stays verbatim', () => {
   it('wraps without re-escaping', () => {
     expect(buildScriptTag('{"a":"\\u003c"}')).toBe(
-      '<script type="application/ld+json">{"a":"\\u003c"}</script>'
+      '<script type="application/ld+json" data-source="Enhancely.ai">{"a":"\\u003c"}</script>'
     );
   });
 });
@@ -174,7 +174,7 @@ describe('buildScriptTag — XSS defense-in-depth (escapes literal <)', () => {
     // Every payload `<` became `\u003c`; none survive as a literal `<`.
     expect(out.split('</script>')).toHaveLength(2);
     expect(out).toBe(
-      '<script type="application/ld+json">' +
+      '<script type="application/ld+json" data-source="Enhancely.ai">' +
         '{"x":"\\u003c/script>\\u003cscript>alert(1)\\u003c/script>"}' +
         '</script>'
     );
@@ -183,7 +183,7 @@ describe('buildScriptTag — XSS defense-in-depth (escapes literal <)', () => {
   it('is idempotent: already-escaped `\\u003c` round-trips unchanged', () => {
     const alreadyEscaped = '{"x":"\\u003c/script>"}';
     expect(buildScriptTag(alreadyEscaped)).toBe(
-      `<script type="application/ld+json">${alreadyEscaped}</script>`
+      `<script type="application/ld+json" data-source="Enhancely.ai">${alreadyEscaped}</script>`
     );
     // Re-wrapping the escaped inner content changes nothing further.
     expect(buildScriptTag(alreadyEscaped)).toBe(buildScriptTag(alreadyEscaped));
