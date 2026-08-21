@@ -41,8 +41,12 @@ export type InjectorConfigInput = Partial<InjectorConfig> & Pick<InjectorConfig,
 
 /**
  * One cached lookup result per normalized URL.
- * `jsonldRaw === null` is a negative entry: Enhancely answered 404, do not
- * re-fetch until the entry expires (protects the API from dead-URL polling).
+ * `jsonldRaw === null` is a negative entry: Enhancely answered without a
+ * usable snippet (404, 202 pending, terminal-negative, or a rejected/limited
+ * registration) — do not call again until the entry expires or its
+ * `retryNotBefore` passes (protects the API from dead-URL polling). A pending
+ * entry with a server `Retry-After` hint uses `storedAt: 0` (permanently
+ * stale) plus `retryNotBefore`, so only the hint gates the next call.
  */
 export interface CacheEntry {
   jsonldRaw: string | null;
@@ -84,11 +88,27 @@ export interface CacheBackend {
   set(key: string, entry: CacheEntry): Promise<void>;
 }
 
-/** Result of one conditional GET against the Enhancely read endpoint. */
+/**
+ * Result of one call against the Enhancely API — the conditional GET
+ * (`fetchJsonLd`) and the register-or-revalidate POST (`registerOrRevalidate`)
+ * share this shape so one orchestrator switch handles both.
+ *
+ * - `pending`: the record exists but generation has not produced content yet
+ *   (HTTP 202; a 201 from the POST — record just created — maps here too).
+ *   `retryAfterSeconds` carries the server's Retry-After hint when present.
+ * - `terminal-negative`: the server answered definitively "there is no
+ *   snippet for this URL and asking again will not change that soon" —
+ *   an `ignored` record, a record whose generation never succeeded (body
+ *   `{}`), or a rejected registration (denylist / unregistered hostname).
+ *   Stored as a negative entry for a full TTL and — unlike `not-found` —
+ *   NEVER triggers auto-registration: the server already knows the URL.
+ */
 export type JsonLdFetchResult =
   | { status: 'ok'; jsonldRaw: string; etag: string | null }
   | { status: 'not-modified' }
   | { status: 'not-found' }
+  | { status: 'pending'; retryAfterSeconds: number | null }
+  | { status: 'terminal-negative'; reason: 'ignored' | 'empty-record' | 'rejected' }
   | { status: 'rate-limited'; retryAfterSeconds: number | null }
   | { status: 'error'; reason: string };
 

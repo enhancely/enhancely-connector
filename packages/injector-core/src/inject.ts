@@ -22,9 +22,31 @@
  * is idempotent (no literal `<` in the happy path → no-op) and byte-preserving
  * for valid content, and mirrors the server's own `escapeJsonForScriptEmbedding`.
  */
-export function buildScriptTag(jsonldRaw: string): string {
+/**
+ * Attribute-safe rendering of an ETag for the `data-etag` marker: the
+ * surrounding quotes and any weak prefix are presentation noise (the Kirby
+ * plugin strips them the same way), and the remainder is HTML-escaped
+ * defensively — RFC 9110 limits ETags to printable ASCII without `"`, but a
+ * third-party header value must not be able to break out of the attribute.
+ */
+function etagAttributeValue(etag: string): string {
+  return etag
+    .replace(/^W\//i, '')
+    .replace(/^"|"$/g, '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/"/g, '&quot;');
+}
+
+export function buildScriptTag(jsonldRaw: string, etag?: string | null): string {
   const safe = jsonldRaw.replace(/</g, '\\u003c');
-  return `<script type="application/ld+json">${safe}</script>`;
+  // `data-source` + `data-etag` mirror the Kirby plugin's markup so every
+  // integration exposes the same debugging surface: the page source alone
+  // answers "which record version is in this (possibly CDN-cached) copy?".
+  // Deliberately NO `data-status`: the connector only injects after a
+  // successful lookup, so it would always read 200 — noise, not signal.
+  const etagAttr = etag ? ` data-etag="${etagAttributeValue(etag)}"` : '';
+  return `<script type="application/ld+json" data-source="Enhancely.ai"${etagAttr}>${safe}</script>`;
 }
 
 /**

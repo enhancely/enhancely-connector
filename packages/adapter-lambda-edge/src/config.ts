@@ -115,6 +115,20 @@ export interface BakedConnectorConfig {
    */
   assertedDefaultTtlSeconds?: number;
   /**
+   * Operator assertion (companion entrypoint only, default false): on this
+   * origin, `Set-Cookie` on responses to credential-less requests is
+   * load-balancer plumbing (e.g. ALB stickiness stamped on every response),
+   * not session material. When true, the retry cache-lifetime cap ALSO
+   * applies to such responses — without it, an origin that stamps a cookie
+   * on everything can never have an uninjected copy unpinned. Requests
+   * carrying Cookie/Authorization stay untouched regardless, and
+   * `private`/`no-store` responses are never capped. Do NOT set this on an
+   * origin that mints session cookies (JSESSIONID & co.) for anonymous
+   * requests: the written s-maxage would license downstream shared caches to
+   * replay that Set-Cookie across users (session-fixation pattern).
+   */
+  capSetCookieResponses?: boolean;
+  /**
    * Request paths the connector must not touch AT ALL (login/account areas,
    * robots.txt-disallowed or noindex-by-policy sections): no Enhancely
    * lookup, no auto-registration, no cache-TTL rewriting, no origin re-fetch
@@ -141,6 +155,7 @@ let inflight: Promise<InjectorConfig | null> | null = null;
 const NEGATIVE_TTL_MS = 30_000;
 let resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
 let resolvedAssertedDefaultTtlSeconds = 0;
+let resolvedCapSetCookieResponses = false;
 // The baked FILE read is memoized separately from key resolution: exclusion
 // checks must work synchronously before (and without) any SSM call.
 let bakedCache: BakedConnectorConfig | null | undefined;
@@ -189,6 +204,9 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   // floor to s-maxage=0 downstream (safe but surprising) — treat it as off.
   if (assertedDefaultTtlSeconds !== undefined && assertedDefaultTtlSeconds >= 1) {
     baked.assertedDefaultTtlSeconds = Math.floor(assertedDefaultTtlSeconds);
+  }
+  if (typeof source['capSetCookieResponses'] === 'boolean') {
+    baked.capSetCookieResponses = source['capSetCookieResponses'];
   }
   if (Array.isArray(source['excludePaths'])) {
     const patterns = source['excludePaths'].filter(
@@ -271,6 +289,7 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
     // SSM is failing (getConfigRetryInMs) — that path caches uninjected
     // responses too.
     resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
+    resolvedCapSetCookieResponses = baked?.capSetCookieResponses ?? false;
 
     let apiKey = baked?.apiKey;
     if (apiKey === undefined) {
@@ -381,6 +400,15 @@ export function getAssertedDefaultTtlSeconds(): number {
 }
 
 /**
+ * Operator assertion `capSetCookieResponses` (baked config; companion design
+ * §3.3), default false. Only meaningful after `resolveAdapterConfig()`
+ * settled — exactly the order the handler uses.
+ */
+export function getCapSetCookieResponses(): boolean {
+  return resolvedCapSetCookieResponses;
+}
+
+/**
  * Operator exclude patterns (baked config `excludePaths`). Read directly from
  * the memoized baked file so the handler can skip excluded requests BEFORE
  * any config/SSM resolution — an excluded path must not even pay the first
@@ -399,6 +427,9 @@ function __resetMemoForTests(): void {
   resolvedConfig = null;
   negativeUntil = 0;
   inflight = null;
+  resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
+  resolvedAssertedDefaultTtlSeconds = 0;
+  resolvedCapSetCookieResponses = false;
 }
 
 /** TEST-ONLY: bypass the connector-config.json file read (`null` = no file). */

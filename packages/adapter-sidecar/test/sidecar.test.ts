@@ -14,7 +14,9 @@ import * as http from 'node:http';
 import { once } from 'node:events';
 
 const RAW_JSONLD = '{"@context":"https://schema.org","@type":"Thing"}';
-const SNIPPET = `<script type="application/ld+json">${RAW_JSONLD}</script>`;
+// Mirrors buildScriptTag output for the mock (ETag "v1"): the tag carries the
+// Kirby-parity attribution attributes since v0.8.0.
+const SNIPPET = `<script type="application/ld+json" data-source="Enhancely.ai" data-etag="v1">${RAW_JSONLD}</script>`;
 
 // 'Café' / 'Résumé' encoded as iso-8859-1: the high bytes are invalid UTF-8.
 const LATIN1_HTML = Buffer.from(
