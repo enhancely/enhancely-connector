@@ -5,6 +5,7 @@
   "cacheTtlMs": 300000,
   "autoRegister": false,
   "assertedDefaultTtlSeconds": 0,
+  "capSetCookieResponses": false,
   "excludePaths": [],
   "originTimeoutMs": 2000,
   "ssmParameterName": "/enhancely/connector/api-key",

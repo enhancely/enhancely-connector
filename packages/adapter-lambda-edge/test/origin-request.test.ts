@@ -42,7 +42,9 @@ vi.mock('@aws-sdk/client-ssm', () => {
 
 const PAGE_HTML = '<html><head><title>T</title></head><body>Hello</body></html>';
 const JSONLD_RAW = '{"@context":"https://schema.org","@type":"Article","headline":"Hi"}';
-const SNIPPET = `<script type="application/ld+json">${JSONLD_RAW}</script>`;
+// Mirrors buildScriptTag output for the standard Enhancely mock (ETag W/"1" —
+// the weak prefix and quotes are stripped for the data-etag attribute).
+const SNIPPET = `<script type="application/ld+json" data-source="Enhancely.ai" data-etag="1">${JSONLD_RAW}</script>`;
 
 let server: http.Server;
 let originPort: number;

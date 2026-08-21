@@ -32,7 +32,9 @@ vi.mock('@aws-sdk/client-ssm', () => {
 const PAGE_HTML = '<html><head><title>T</title></head><body>Hello</body></html>';
 const JSONLD_RAW = '{"@context":"https://schema.org","@type":"Article","headline":"Hi"}';
 /** Exactly what the core injects before `</head>` (all ASCII → bytes = length). */
-const SNIPPET = `<script type="application/ld+json">${JSONLD_RAW}</script>`;
+// Mirrors buildScriptTag output for the standard mock (ETag "v1"): the tag now
+// carries the Kirby-parity attribution attributes.
+const SNIPPET = `<script type="application/ld+json" data-source="Enhancely.ai" data-etag="v1">${JSONLD_RAW}</script>`;
 const UNICODE_JSONLD_RAW = '{"@context":"https://schema.org","@type":"Place","name":"München"}';
 const OVERSIZED_REFETCH_CSP = `default-src 'self'; report-uri /${'a'.repeat(12_000)}`;
 
@@ -334,7 +336,7 @@ describe('handler — happy path', () => {
     const result = await invoke(event);
 
     // Injected before </head>, verbatim body, marked as text.
-    expect(result?.body).toContain(`<script type="application/ld+json">${JSONLD_RAW}</script>`);
+    expect(result?.body).toContain(SNIPPET);
     expect(result?.body).toContain('</head>');
     expect(result?.body?.indexOf('application/ld+json')).toBeLessThan(
       result?.body?.indexOf('</head>') ?? -1

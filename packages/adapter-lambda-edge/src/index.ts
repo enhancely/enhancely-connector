@@ -50,12 +50,14 @@ import {
 } from '@enhancely/injector-core';
 import {
   getAssertedDefaultTtlSeconds,
+  getCapSetCookieResponses,
   getConfigRetryInMs,
   getExcludePaths,
   getOriginTimeoutMs,
   resolveAdapterConfig,
 } from './config.js';
 import { fetchOriginHtml } from './origin-fetch.js';
+import { retryablePassThroughResponse } from './cache-cap.js';
 import {
   blocksIndexing,
   buildOriginUrl,
@@ -107,6 +109,12 @@ export {
 } from './config.js';
 export type { BakedConnectorConfig } from './config.js';
 export { fetchOriginHtml } from './origin-fetch.js';
+export {
+  cacheDirectiveSeconds,
+  retrySharedTtlSeconds,
+  retryablePassThroughResponse,
+} from './cache-cap.js';
+export type { CapOptions } from './cache-cap.js';
 export type { OriginFetchResult } from './origin-fetch.js';
 
 /** Ignore casing and harmless comma/whitespace differences for stability checks. */
@@ -116,19 +124,6 @@ function normalizedRobotsTag(xRobotsTag: string | null): string | null {
     .split(',')
     .map((directive) => directive.trim().replace(/\s+/g, ' ').toLowerCase())
     .join(',');
-}
-
-/** Numeric Cache-Control directive value, or null when absent/invalid. */
-function cacheDirectiveSeconds(policy: string, wanted: 'max-age' | 's-maxage'): number | null {
-  for (const directive of policy.split(',')) {
-    const [rawName, rawValue] = directive.trim().split('=', 2);
-    if (rawName?.toLowerCase() !== wanted || rawValue === undefined) continue;
-    const value = rawValue.trim().replace(/^"|"$/g, '');
-    if (!/^\d+$/.test(value)) return null;
-    const seconds = Number(value);
-    return Number.isSafeInteger(seconds) ? seconds : null;
-  }
-  return null;
 }
 
 /** Compare Cache-Control semantically enough to ignore order/casing/spacing. */
@@ -161,130 +156,6 @@ function normalizedCspStructure(policy: string): string {
     })
     .filter((directive) => directive !== '')
     .join(';');
-}
-
-/**
- * Shared-cache TTL to impose on a retryable pass-through, or `null` when the
- * origin declared NO explicit cache lifetime.
- *
- * `null` is load-bearing: without an origin-declared lifetime the response's
- * cacheability is governed by the distribution's DefaultTTL, which this
- * function cannot see. Writing an s-maxage there could make an
- * origin-uncacheable response (DefaultTTL=0) shared-cacheable — the opposite of
- * the invariant "never make a response more cacheable than it already was". So
- * we only ever SHORTEN an explicit lifetime (max-age/s-maxage/Expires) and
- * leave header-less responses untouched.
- *
- * `assertedDefaultTtlSeconds` is the operator's way OUT of that blindness:
- * the baked config asserts that every associated cache behavior's DefaultTTL
- * is AT LEAST that many seconds for this content, i.e. a lifetime-less
- * pass-through is ALREADY shared-cached for at least that long. The written
- * TTL is `min(retryTtl, asserted)`, so the write can only SHORTEN effective
- * cacheability — the invariant is enforced arithmetically rather than
- * trusted (an assertion of "nonzero" alone would let retryTtl EXTEND a
- * DefaultTTL of one second). Without the assertion a single lookup timeout
- * pins an uninjected response in CloudFront for the full DefaultTTL (a day
- * on the common default) instead of the seconds the retry logic intends.
- * Note: applying the cap REPLACES the whole Cache-Control value, so
- * non-freshness directives on a lifetime-less response (`no-transform`,
- * `stale-while-revalidate`) are dropped for the capped copy — bounded by the
- * short TTL, and only under the assertion.
- */
-function retrySharedTtlSeconds(
-  headers: CloudFrontHeaders,
-  revalidateInMs: number,
-  assertedDefaultTtlSeconds: number
-): number | null {
-  const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1000));
-  const policy = cacheControlValue(headers);
-
-  if (policy !== null) {
-    const directiveNames = policy
-      .split(',')
-      .map((directive) => directive.split('=', 1)[0]?.trim().toLowerCase());
-    // no-cache is an explicit "revalidate every time" — honor it with s-maxage=0.
-    if (directiveNames.includes('no-cache')) {
-      return 0;
-    }
-    const originTtl =
-      cacheDirectiveSeconds(policy, 's-maxage') ?? cacheDirectiveSeconds(policy, 'max-age');
-    if (originTtl !== null) {
-      return Math.min(retryTtl, originTtl);
-    }
-  }
-
-  // No max-age/s-maxage: Expires is the only other explicit lifetime.
-  const expires = headerValue(headers, 'expires');
-  if (expires !== null) {
-    const expiresAt = Date.parse(expires);
-    if (!Number.isNaN(expiresAt)) {
-      const responseDate = Date.parse(headerValue(headers, 'date') ?? '');
-      const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
-      return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1000)));
-    }
-  }
-
-  // Origin declared no explicit lifetime. Without the operator assertion, do
-  // not introduce shared caching; with it, the response is already cached
-  // for at least the asserted DefaultTTL, and min() guarantees the written
-  // value never exceeds what the operator vouched for.
-  return assertedDefaultTtlSeconds > 0
-    ? Math.min(retryTtl, Math.floor(assertedDefaultTtlSeconds))
-    : null;
-}
-
-/**
- * Keep a retryable pass-through response in CloudFront only until the core or
- * config resolver will try again. Validators for the untouched origin body
- * are removed deliberately: after this short TTL CloudFront must obtain a full
- * origin response, so the origin-response Lambda runs again. A 304 would
- * otherwise keep the old uninjected body.
- *
- * Never add cacheability to a request carrying credentials/personalization.
- * In particular, s-maxage/public/must-revalidate override the normal shared
- * cache restriction on Authorization responses (RFC 9111 §3.5).
- */
-function retryablePassThroughResponse(
-  response: CloudFrontResultResponse,
-  requestHeaders: CloudFrontHeaders,
-  revalidateInMs: number
-): CloudFrontResultResponse {
-  if (requestHeaders['authorization'] !== undefined || requestHeaders['cookie'] !== undefined) {
-    return response;
-  }
-
-  const originalHeaders = response.headers ?? {};
-  const sharedTtlSeconds = retrySharedTtlSeconds(
-    originalHeaders,
-    revalidateInMs,
-    getAssertedDefaultTtlSeconds()
-  );
-  // The origin declared no explicit cache lifetime → leave the response exactly
-  // as it is (its cacheability is the distribution's DefaultTTL, which we must
-  // not override upward). Adding s-maxage here could cache an
-  // origin-uncacheable response.
-  if (sharedTtlSeconds === null) return response;
-
-  const headers: CloudFrontHeaders = { ...originalHeaders };
-  headers['cache-control'] = [
-    {
-      key: 'Cache-Control',
-      value: `max-age=0, s-maxage=${sharedTtlSeconds}, must-revalidate`,
-    },
-  ];
-  delete headers['expires'];
-  delete headers['etag'];
-  delete headers['last-modified'];
-
-  // Header edits are still subject to CloudFront's independent 32 KB limit.
-  // If the safer policy would cross it, retain the byte-for-byte response.
-  if (
-    serializedHeaderBytes(headers, response.status, response.statusDescription) >
-    MAX_RESPONSE_HEADER_BYTES
-  ) {
-    return response;
-  }
-  return { ...response, headers };
 }
 
 /* ------------------------------------------------------------------------ */
@@ -374,7 +245,10 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       const retryInMs = getConfigRetryInMs();
       return retryInMs === null
         ? response
-        : retryablePassThroughResponse(response, request.headers, retryInMs);
+        : retryablePassThroughResponse(response, request.headers, retryInMs, {
+            assertedDefaultTtlSeconds: getAssertedDefaultTtlSeconds(),
+            capSetCookieResponses: getCapSetCookieResponses(),
+          });
     }
 
     // Public page host for the Enhancely lookup. Origins that must NOT
@@ -392,7 +266,10 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     if (lookup.snippet === null) {
       return lookup.revalidateInMs === null
         ? response
-        : retryablePassThroughResponse(response, request.headers, lookup.revalidateInMs);
+        : retryablePassThroughResponse(response, request.headers, lookup.revalidateInMs, {
+            assertedDefaultTtlSeconds: getAssertedDefaultTtlSeconds(),
+            capSetCookieResponses: getCapSetCookieResponses(),
+          });
     }
 
     // Re-fetch the page: origin-response events do not expose the body.

@@ -177,6 +177,22 @@ export interface AttemptInput {
 /** `private` / `no-store` as Cache-Control directives (not substrings). */
 const PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
 
+/** True when the Cache-Control marks a per-request representation. */
+export function hasPerRequestCacheControl(cacheControl: string | null): boolean {
+  return cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(cacheControl);
+}
+
+/**
+ * Marker header the origin-request entrypoint stamps on every GENERATED
+ * response. Purpose: field debugging ("which path produced this response?")
+ * and a mis-pairing tripwire — per AWS docs the origin-response trigger never
+ * fires for generated responses, so a companion observing this header proves
+ * the full origin-response injector was wired next to the origin-request one
+ * (forbidden pairing) and must abstain. Nothing ever DEPENDS on the header.
+ */
+export const INJECTED_MARKER_HEADER = 'x-enhancely-injected';
+export const INJECTED_MARKER_VALUE = '1';
+
 /**
  * True only when injection may be attempted: GET + status exactly "200" +
  * media type exactly text/html + UTF-8-compatible (or absent) charset + no
@@ -213,7 +229,7 @@ export function shouldAttempt(input: AttemptInput, ignoreContentEncoding = false
   if (!isInjectableRepresentation(input)) return false;
 
   if (input.hasSetCookie) return false;
-  if (input.cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(input.cacheControl)) {
+  if (hasPerRequestCacheControl(input.cacheControl)) {
     return false;
   }
 
@@ -249,6 +265,22 @@ export function shouldAttemptGeneratedResponse(input: AttemptInput): boolean {
   // A compressed body cannot be injected into: the fetch asked for `identity`,
   // so a Content-Encoding here means the origin ignored us.
   return input.contentEncoding === null;
+}
+
+/**
+ * Register gate for the companion entrypoint: is this a real, servable HTML
+ * page worth enrolling at Enhancely?
+ *
+ * Representation-level only (GET + "200" + text/html + UTF-8-compatible
+ * charset). Deliberately IGNORES both per-request state (Set-Cookie /
+ * private / no-store — the paired origin-request injector injects those
+ * pages, so refusing to register them would starve it; see the companion
+ * design §3.2) and Content-Encoding (the CloudFront copy is usually gzip/br;
+ * the companion reads no body, so encoding is irrelevant to registering).
+ * The `contentEncoding` field of the input is not consulted.
+ */
+export function shouldRegisterRepresentation(input: AttemptInput): boolean {
+  return isInjectableRepresentation(input);
 }
 
 /**
