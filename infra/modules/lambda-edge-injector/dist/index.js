@@ -724,12 +724,14 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
   return new Promise((resolve, reject) => {
     const url = new URL(originUrl);
     const lib = url.protocol === "https:" ? https : http;
+    const authorityEnd = originUrl.indexOf("/", originUrl.indexOf("://") + 3);
+    const rawPath = authorityEnd === -1 ? "/" : originUrl.slice(authorityEnd);
     const request = lib.request(
       {
         protocol: url.protocol,
         hostname: url.hostname,
         port: url.port !== "" ? Number(url.port) : void 0,
-        path: `${url.pathname}${url.search}`,
+        path: rawPath,
         method: "GET",
         agent: false,
         // TLS SNI (and cert-hostname verification) must present the PUBLIC
@@ -769,6 +771,16 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
           response.headers["content-security-policy-report-only"]
         );
         const xRobotsTag = combinedHeaderValue(response.headers["x-robots-tag"]);
+        const decodeHeaderValue = (raw) => {
+          const utf8 = Buffer.from(raw, "latin1").toString("utf8");
+          return Buffer.from(utf8, "utf8").toString("latin1") === raw ? utf8 : raw;
+        };
+        const allHeaders = {};
+        for (const [name, value] of Object.entries(response.headers)) {
+          if (value === void 0) continue;
+          const values = Array.isArray(value) ? value : [String(value)];
+          allHeaders[name.toLowerCase()] = values.map(decodeHeaderValue);
+        }
         const chunks = [];
         let size = 0;
         let settled = false;
@@ -788,7 +800,8 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
               contentSecurityPolicyReportOnly: cspReportOnly,
               xRobotsTag,
               body: Buffer.alloc(0),
-              truncated: true
+              truncated: true,
+              allHeaders
             });
             response.destroy();
             return;
@@ -809,7 +822,8 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
             contentSecurityPolicyReportOnly: cspReportOnly,
             xRobotsTag,
             body: Buffer.concat(chunks),
-            truncated: false
+            truncated: false,
+            allHeaders
           });
         });
         response.on("error", (error) => {
@@ -824,7 +838,7 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, extraHeader
   });
 }
 
-// src/index.ts
+// src/shared.ts
 var MAX_GENERATED_RESPONSE_BYTES = 1048576;
 var MAX_RESPONSE_HEADER_BYTES = 32768;
 var GENERATED_RESPONSE_SAFETY_MARGIN_BYTES = 1024;
@@ -876,14 +890,17 @@ function declaresUtf8MetaInPrescan(body) {
   return false;
 }
 var PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
-function shouldAttempt(input, ignoreContentEncoding = false) {
+function isInjectableRepresentation(input) {
   if (input.method !== "GET") return false;
   if (input.status !== "200") return false;
   const contentType = input.contentType ?? "";
   const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase();
   if (mediaType !== "text/html") return false;
   const charset = charsetOf(contentType);
-  if (charset !== null && !UTF8_COMPATIBLE_CHARSETS.has(charset)) return false;
+  return charset === null || UTF8_COMPATIBLE_CHARSETS.has(charset);
+}
+function shouldAttempt(input, ignoreContentEncoding = false) {
+  if (!isInjectableRepresentation(input)) return false;
   if (input.hasSetCookie) return false;
   if (input.cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(input.cacheControl)) {
     return false;
@@ -900,7 +917,18 @@ function buildOriginUrl(request) {
   const defaultPort = custom.protocol === "https" ? 443 : 80;
   const portPart = custom.port !== defaultPort ? `:${custom.port}` : "";
   const query = request.querystring !== "" ? `?${request.querystring}` : "";
-  return `${custom.protocol}://${custom.domainName}${portPart}${custom.path}${request.uri}${query}`;
+  const origin = `${custom.protocol}://${custom.domainName}${portPart}`;
+  const url = `${origin}${custom.path}${request.uri}${query}`;
+  let resolved;
+  try {
+    resolved = new URL(url);
+  } catch {
+    return null;
+  }
+  if (`${resolved.protocol}//${resolved.host}` !== origin) return null;
+  const prefix = custom.path === "" ? "/" : `${custom.path}/`;
+  if (resolved.pathname !== custom.path && !resolved.pathname.startsWith(prefix)) return null;
+  return url;
 }
 var PAGE_HOST_HEADER = "x-enhancely-page-host";
 function customHeaderValue(request, name) {
@@ -921,6 +949,30 @@ function combinedHeaderValue2(headers, name) {
 function blocksIndexing(xRobotsTag) {
   return xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag);
 }
+var NON_FORWARDED_REQUEST_HEADERS = /* @__PURE__ */ new Set([
+  "host",
+  "accept-encoding",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade"
+]);
+function forwardedHeaders(headers) {
+  const out = {};
+  for (const [name, entries] of Object.entries(headers)) {
+    const key = name.toLowerCase();
+    if (NON_FORWARDED_REQUEST_HEADERS.has(key)) continue;
+    if (entries.length === 0) continue;
+    out[key] = entries.map((entry) => entry.value).join(key === "cookie" ? "; " : ", ");
+  }
+  return out;
+}
+
+// src/index.ts
 function normalizedRobotsTag(xRobotsTag) {
   if (xRobotsTag === null) return null;
   return xRobotsTag.split(",").map((directive) => directive.trim().replace(/\s+/g, " ").toLowerCase()).join(",");
@@ -1001,28 +1053,6 @@ function retryablePassThroughResponse(response, requestHeaders, revalidateInMs) 
     return response;
   }
   return { ...response, headers };
-}
-var NON_FORWARDED_REQUEST_HEADERS = /* @__PURE__ */ new Set([
-  "host",
-  "accept-encoding",
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade"
-]);
-function forwardedHeaders(headers) {
-  const out = {};
-  for (const [name, entries] of Object.entries(headers)) {
-    const key = name.toLowerCase();
-    if (NON_FORWARDED_REQUEST_HEADERS.has(key)) continue;
-    if (entries.length === 0) continue;
-    out[key] = entries.map((entry) => entry.value).join(key === "cookie" ? "; " : ", ");
-  }
-  return out;
 }
 var cache = new MemoryCache();
 function __resetHandlerStateForTests() {
