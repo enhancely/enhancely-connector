@@ -72,6 +72,16 @@ beforeAll(async () => {
         });
         res.end(PAGE_HTML);
       },
+      // Real HTML with validators but NO Enhancely record (the mock 404s on
+      // anything containing "missing") — the un-injected generated path.
+      '/missing-with-validators': () => {
+        res.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          etag: '"abc"',
+          'last-modified': 'Wed, 21 Oct 2026 07:28:00 GMT',
+        });
+        res.end(PAGE_HTML);
+      },
       // Carries headers that must survive, ones CloudFront forbids, and ones
       // that describe the ORIGINAL body.
       '/headers': () => {
@@ -305,11 +315,51 @@ describe('origin-request — happy path', () => {
   });
 });
 
-describe('origin-request — no snippet costs no origin traffic', () => {
-  it('returns the request untouched and never contacts the origin', async () => {
+describe('origin-request — no snippet still costs exactly ONE origin hit (v0.9.0)', () => {
+  it("generates the origin's own bytes instead of handing the request back", async () => {
     const result = await invoke(makeRequestEvent({ uri: '/missing' }));
-    expect(isPassThrough(result)).toBe(true);
-    expect(originHits).toBe(0);
+    const response = asResponse(result);
+    expect(response.body).toBe(PAGE_HTML);
+    expect(response.body).not.toContain('application/ld+json');
+    // One hit, not two: handing back would make CloudFront fetch the same page
+    // again — and it is what lets the retry cap bound this response.
+    expect(originHits).toBe(1);
+  });
+
+  it('does not mark an un-injected response as injected', async () => {
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/missing' })));
+    expect(response.headers?.['x-enhancely-injected']).toBeUndefined();
+  });
+
+  it('keeps the origin validators when the body is unmodified and uncapped', async () => {
+    // The route serves an ETag and no Cache-Control, and no DefaultTTL is
+    // asserted → the retry cap declines, so nothing is rewritten. The bytes
+    // ARE the origin's, so its ETag still describes them truthfully.
+    const response = asResponse(
+      await invoke(makeRequestEvent({ uri: '/missing-with-validators' }))
+    );
+    expect(response.body).toBe(PAGE_HTML);
+    expect(headerValue(response, 'etag')).toBe('"abc"');
+    expect(headerValue(response, 'last-modified')).toBe('Wed, 21 Oct 2026 07:28:00 GMT');
+  });
+
+  it('caps the pass-through and drops validators once a DefaultTTL is asserted', async () => {
+    __resetAdapterConfigForTests();
+    __resetOriginRequestStateForTests();
+    __resetUpstreamMemoForTests();
+    __setBakedConfigForTests({ apiKey: 'sk-test', assertedDefaultTtlSeconds: 86_400 });
+    __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
+
+    // This is what v0.7.0/v0.8.0 could NOT do on this trigger: the un-injected
+    // response is ours now, so its lifetime is bounded by the retry delay.
+    const response = asResponse(
+      await invoke(makeRequestEvent({ uri: '/missing-with-validators' }))
+    );
+    expect(headerValue(response, 'cache-control')).toMatch(
+      /^max-age=0, s-maxage=\d+, must-revalidate$/
+    );
+    expect(response.headers?.['etag']).toBeUndefined();
+    expect(response.headers?.['last-modified']).toBeUndefined();
   });
 });
 
@@ -393,7 +443,6 @@ describe('origin-request — pass-through gates', () => {
     ['non-HTML content type', '/json'],
     ['non-UTF-8 charset', '/latin1'],
     ['noindex', '/noindex'],
-    ['no </head> to inject before', '/no-head'],
     ['body over the fetch cap', '/big'],
     ['non-200 origin answer', '/redirect'],
   ];
@@ -490,23 +539,47 @@ describe('origin-request — multi-value and wildcard headers', () => {
   });
 });
 
-describe('origin-request — auto-registration is off on this trigger', () => {
-  it('never POSTs a registration, even with autoRegister enabled', async () => {
-    // The lookup runs BEFORE the origin answers, so the adapter cannot know
-    // whether the URL is an HTML page. Registering here would enrol redirects,
-    // JSON endpoints and 404s as pages.
+describe('origin-request — registration is precise on this trigger (v0.9.0)', () => {
+  function enableRegistration(): void {
     __resetAdapterConfigForTests();
     __resetOriginRequestStateForTests();
+    __resetUpstreamMemoForTests();
     __setBakedConfigForTests({ apiKey: 'sk-test', autoRegister: true });
     __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
+  }
 
-    const result = await invoke(makeRequestEvent({ uri: '/missing' }));
+  it('registers a real HTML page with ONE register-or-revalidate POST', async () => {
+    enableRegistration();
+    await invoke(makeRequestEvent({ uri: '/missing' }));
+
+    const calls = enhancelyFetch.mock.calls.map((call) => ({
+      url: String(call[0]),
+      method: (call[1] as RequestInit | undefined)?.method ?? 'GET',
+    }));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe('POST');
+    expect(calls[0]?.url).toMatch(/\/api\/v1\/jsonld$/);
+  });
+
+  for (const [name, uri] of [
+    ['a redirect', '/redirect'],
+    ['a non-HTML body', '/json'],
+  ] as const) {
+    it(`never registers ${name} — the response is gated before any API call`, async () => {
+      enableRegistration();
+      const result = await invoke(makeRequestEvent({ uri }));
+      expect(isPassThrough(result)).toBe(true);
+      // The decisive property of origin-first: NOTHING reached Enhancely.
+      expect(enhancelyFetch).not.toHaveBeenCalled();
+    });
+  }
+
+  it('never contacts Enhancely for an extension-filtered asset', async () => {
+    enableRegistration();
+    const result = await invoke(makeRequestEvent({ uri: '/style.css' }));
     expect(isPassThrough(result)).toBe(true);
-
-    const methods = enhancelyFetch.mock.calls.map(
-      (call) => (call[1] as RequestInit | undefined)?.method ?? 'GET'
-    );
-    expect(methods).not.toContain('POST');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(originHits).toBe(0);
   });
 });
 
@@ -526,17 +599,20 @@ describe('origin-request — a slow Enhancely parks ALL lookups, not just one UR
     );
     __setConfigOverridesForTests({ fetchImpl: slow });
 
-    const first = await invoke(makeRequestEvent({ uri: '/page' }));
-    expect(isPassThrough(first)).toBe(true);
+    const first = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
+    expect(first.body).toBe(PAGE_HTML);
     expect(slow).toHaveBeenCalledTimes(1);
 
-    // A DIFFERENT url must not pay the timeout again.
-    const second = await invoke(makeRequestEvent({ uri: '/other' }));
-    expect(isPassThrough(second)).toBe(true);
+    // A DIFFERENT url must not pay the timeout again — and it still gets the
+    // page we already fetched, rather than a second origin round-trip.
+    const second = asResponse(await invoke(makeRequestEvent({ uri: '/other' })));
+    expect(second.body).toBe(PAGE_HTML);
     expect(slow).toHaveBeenCalledTimes(1);
 
-    // …and no origin traffic was spent either.
-    expect(originHits).toBe(0);
+    // Origin-first: both pages WERE fetched (that is how we can still serve
+    // them), but neither paid the Enhancely timeout a second time. One origin
+    // hit per request — never two.
+    expect(originHits).toBe(2);
   });
 });
 

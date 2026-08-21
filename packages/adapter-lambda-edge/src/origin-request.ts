@@ -34,19 +34,44 @@
  * deliberately dropped, see STALE_BODY_HEADERS). It is identical in the only
  * respect that governs caching.
  *
- * ORDER OF OPERATIONS — deliberately lookup-first
- * The Enhancely lookup runs BEFORE the origin fetch, and a missing snippet
- * returns the request unmodified so CloudFront does its own normal fetch:
+ * ORDER OF OPERATIONS — origin-first (changed in v0.9.0)
+ * Up to v0.8.0 the Enhancely lookup ran BEFORE the origin fetch. That is the
+ * cheapest order in origin hits, but it forces the adapter to decide from the
+ * REQUEST alone whether a URL is worth asking about — and from the request
+ * alone that is unknowable. The extension pre-filter catches assets; an
+ * extension-less URI may still be a redirect, a JSON endpoint or a 404. Every
+ * one of those spent an unnecessary API call and added avoidable latency.
  *
- *   no snippet → 0 own fetches + 1 CloudFront fetch = 1  (same as today)
- *   snippet    → 1 own fetch, no CloudFront fetch   = 1  (today: 2)
+ * No request-side signal fixes this. `Accept` cannot: Googlebot sends the
+ * wildcard media range WITHOUT `text/html` (Google Search Central), so
+ * requiring `text/html` would exclude the single most important consumer of
+ * the injected JSON-LD — while also accepting the wildcard excludes nothing,
+ * because every script, image and XHR carries it too. Fetch
+ * Metadata (`Sec-Fetch-Dest`) is absent on http://, on pre-2023 browsers and
+ * on crawlers, and it is not normally part of the cache key — gating on a
+ * header outside the cache key means the un-injected variant can win the cache
+ * entry and be served to everyone.
  *
- * Running both concurrently would shave the lookup latency off the snippet
- * path, but it would spend a wasted origin fetch on every page WITHOUT a
- * snippet — and while a catalog is still filling up that is the large
- * majority of requests. Serial is the cheaper default; the lookup is a memory
- * cache hit in steady state anyway (and after an upstream failure the core's
- * `retryNotBefore` memo skips the call entirely).
+ * So the order is inverted: fetch the origin first, and look up only once the
+ * RESPONSE proves this is a servable, injectable HTML page. That is exactly
+ * what the Cloudflare and sidecar adapters do — they see the response before
+ * deciding and never had this problem. The fetch is not extra work; CloudFront
+ * would issue the same request, it just moves into this function:
+ *
+ *   HTML + snippet    → 1 own fetch, no CloudFront fetch  = 1
+ *   HTML, no snippet  → 1 own fetch, response generated   = 1
+ *   not HTML / vetoed → 1 own fetch + 1 CloudFront fetch  = 2
+ *
+ * Only the third line costs a second origin hit, and it is reserved for
+ * representations this adapter must not touch (non-2xx, non-HTML, noindex,
+ * non-UTF-8, over quota). Two consequences follow, both of which the previous
+ * order could not deliver:
+ *   - REGISTRATION is precise. The adapter knows the response is real HTML, so
+ *     autoRegister no longer has to be forced off (v0.7.0/v0.8.0 could only
+ *     have registered redirects, JSON endpoints and 404s).
+ *   - The retry cache cap works. The un-injected response is now generated
+ *     here, so assertedDefaultTtlSeconds bounds it directly instead of leaving
+ *     CloudFront to cache the origin's own copy for the full DefaultTTL.
  *
  * FAIL-OPEN
  * Every failure path returns the untouched `request`. CloudFront then behaves
@@ -70,11 +95,20 @@ import type {
 } from 'aws-lambda';
 import {
   getJsonLdLookup,
+  getJsonLdRegisterLookup,
   injectIntoHead,
   matchesExcludedPath,
   MemoryCache,
 } from '@enhancely/injector-core';
-import { getExcludePaths, getOriginTimeoutMs, resolveAdapterConfig } from './config.js';
+import type { JsonLdLookupResult } from '@enhancely/injector-core';
+import {
+  getAssertedDefaultTtlSeconds,
+  getCapSetCookieResponses,
+  getExcludePaths,
+  getOriginTimeoutMs,
+  resolveAdapterConfig,
+} from './config.js';
+import { retryablePassThroughResponse } from './cache-cap.js';
 import {
   isUpstreamDown,
   noteUpstreamCallDuration,
@@ -121,7 +155,7 @@ import {
  * and a wrong guess costs one discarded fetch, never a wrong body.
  */
 const NON_HTML_EXTENSION =
-  /\.(?:js|mjs|cjs|css|map|json|xml|txt|csv|wasm|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp4|webm|ogv|mp3|wav|flac|mov|avi|pdf|zip|gz|tgz|bz2|xz|7z|rar|apk|dmg|exe|bin)$/i;
+  /\.(?:js|mjs|cjs|css|map|json|jsonld|geojson|xml|rss|atom|txt|csv|tsv|yaml|yml|wasm|webmanifest|ics|vcf|png|jpe?g|jfif|gif|webp|avif|heic|heif|svg|ico|bmp|tiff?|psd|eps|woff2?|ttf|otf|eot|mp4|m4v|webm|ogv|mkv|flv|mov|avi|mp3|m4a|aac|opus|wav|flac|oga|ogg|vtt|srt|pdf|docx?|xlsx?|pptx?|odt|ods|odp|epub|mobi|zip|gz|tgz|bz2|xz|7z|rar|tar|iso|apk|dmg|exe|msi|deb|rpm|bin)$/i;
 
 /**
  * Headers an edge function may not emit. Adding one of these to a generated
@@ -221,11 +255,21 @@ function isDisallowedResponseHeader(name: string): boolean {
  * dropping an origin header would be a behavior (and possibly security)
  * regression that no test on the injected markup would catch.
  */
-export function buildResponseHeaders(allHeaders: Record<string, string[]>): CloudFrontHeaders {
+export function buildResponseHeaders(
+  allHeaders: Record<string, string[]>,
+  bodyWasModified = true
+): CloudFrontHeaders {
   const headers: CloudFrontHeaders = {};
   for (const [name, values] of Object.entries(allHeaders)) {
     if (isDisallowedResponseHeader(name)) continue;
-    if (STALE_BODY_HEADERS.includes(name)) continue;
+    // Validators and digests describe the ORIGINAL bytes: wrong once the body
+    // carries an injected snippet, still accurate when it does not. On the
+    // pass-through path only Content-Encoding must go — the fetch asked for
+    // identity, so the bytes we return are uncompressed whatever the origin
+    // labelled them.
+    if (bodyWasModified ? STALE_BODY_HEADERS.includes(name) : name === 'content-encoding') {
+      continue;
+    }
     // CloudFront expects the canonical casing in `key` and lowercase keys in
     // the map; the origin's own casing is not preserved by node anyway.
     // EVERY value, not just the first: Set-Cookie is the case that matters —
@@ -303,27 +347,20 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
     const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
 
-    // Lookup FIRST — see the module header. No snippet means this function
-    // adds zero origin traffic and zero latency beyond a memory-cache probe.
-    // autoRegister is forced OFF here. It fires on a 404 from Enhancely, and on
-    // this trigger the lookup runs BEFORE the origin answers — so the adapter
-    // does not yet know whether this URL is an HTML page at all. Leaving it on
-    // would register redirects, JSON endpoints and 404s as pages. The
-    // origin-response trigger gates on the response first and can keep it.
-    // Follow-up: teach the core a "look up, register later" split so the
-    // registration can happen after the gate instead of being dropped.
-    // A recent lookup already burned the full timeout — the API is not
-    // answering, and it will not answer for THIS url either. Skip straight to
-    // pass-through so the page is not delayed a second time.
-    if (isUpstreamDown()) return request;
-
-    const startedAt = Date.now();
-    const lookup = await getJsonLdLookup(pageUrl, cache, { ...config, autoRegister: false });
-    // config.timeoutMs is the ENHANCELY budget (getOriginTimeoutMs is the
-    // separate origin-fetch budget and would be the wrong yardstick here).
-    noteUpstreamCallDuration(Date.now() - startedAt, config.timeoutMs);
-    if (lookup.snippet === null) return request;
-
+    // ORIGIN FIRST (v0.9.0 — see the module header). The trigger cannot know
+    // from the request alone whether this URL is an HTML page: the extension
+    // pre-filter catches assets, but an extension-less URI may just as well be
+    // a redirect, a JSON endpoint or a 404. Asking Enhancely first therefore
+    // spent an unnecessary API call on every such request.
+    //
+    // Fetching the origin first inverts that: the lookup happens only once the
+    // response PROVES this is a servable, injectable HTML page, exactly like
+    // the Cloudflare and sidecar adapters, which never had this problem. The
+    // fetch is not extra work — CloudFront would issue the same request — it
+    // just moves into this function, so the common paths still cost ONE origin
+    // hit. Handing the request back after fetching is the only case that costs
+    // two, and it is reserved for representations this adapter must not touch.
+    //
     // From here on we own the origin fetch: CloudFront will not contact the
     // origin for this request unless we hand the request back.
     const origin = await fetchOriginHtml(
@@ -400,23 +437,49 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       return request;
     }
 
-    const injected = injectIntoHead(originalHtml, lookup.snippet);
-    // Nothing injected (no </head>) → let CloudFront fetch and serve the
-    // origin's own bytes rather than generating a byte-identical copy.
-    if (injected === originalHtml) return request;
+    // ── The response has now PROVEN this is a servable, injectable HTML page.
+    // Only here is an Enhancely call justified — and only here does the
+    // adapter know enough to REGISTER the page, which is why autoRegister is
+    // no longer forced off (v0.7.0-v0.8.0 had to, deciding before the fetch).
+    //
+    // A recent call already burned the full timeout: the API is not answering
+    // and will not answer for THIS url either. Skip the lookup, but still
+    // serve the body we already hold — handing back would make CloudFront
+    // fetch the very same page a second time.
+    let lookup: JsonLdLookupResult = { snippet: null, revalidateInMs: null };
+    if (!isUpstreamDown()) {
+      const startedAt = Date.now();
+      lookup = config.autoRegister
+        ? await getJsonLdRegisterLookup(pageUrl, cache, config)
+        : await getJsonLdLookup(pageUrl, cache, { ...config, autoRegister: false });
+      // config.timeoutMs is the ENHANCELY budget (getOriginTimeoutMs is the
+      // separate origin-fetch budget and would be the wrong yardstick here).
+      noteUpstreamCallDuration(Date.now() - startedAt, config.timeoutMs);
+    }
 
-    const headers = buildResponseHeaders(origin.allHeaders);
-    // The generated text is UTF-8 regardless of what the origin declared, so
-    // Unicode in the injected JSON-LD can never be decoded under a stale label.
-    headers['content-type'] = [{ key: 'Content-Type', value: GENERATED_HTML_CONTENT_TYPE }];
-    // Marker: "this response was GENERATED by the injector". Field debugging
-    // (which path produced this response?) and the companion's mis-pairing
-    // tripwire — per AWS docs origin-response triggers never fire for
-    // generated responses, so a companion seeing this header proves a
-    // forbidden double-injector association. Nothing depends on it.
-    headers[INJECTED_MARKER_HEADER] = [
-      { key: 'X-Enhancely-Injected', value: INJECTED_MARKER_VALUE },
-    ];
+    // No snippet, or nothing to inject into (no </head>) → serve the origin's
+    // own bytes, byte-for-byte. Generating the unmodified body instead of
+    // handing the request back keeps this at ONE origin hit, and it is what
+    // lets the retry cache cap below work at all: the response CloudFront
+    // caches is now ours to bound.
+    const injected =
+      lookup.snippet === null ? originalHtml : injectIntoHead(originalHtml, lookup.snippet);
+    const didInject = injected !== originalHtml;
+
+    // Validators describe the ORIGINAL bytes. They stay accurate on the
+    // pass-through path and must go on the injected one.
+    const headers = buildResponseHeaders(origin.allHeaders, didInject);
+    if (didInject) {
+      // The generated text is UTF-8 regardless of what the origin declared, so
+      // Unicode in the injected JSON-LD can never be decoded under a stale label.
+      headers['content-type'] = [{ key: 'Content-Type', value: GENERATED_HTML_CONTENT_TYPE }];
+      // Marker: "this response carries injected JSON-LD". Field debugging
+      // (which path produced this response?) and a never-touch-injected-content
+      // invariant for the companion. Nothing depends on it.
+      headers[INJECTED_MARKER_HEADER] = [
+        { key: 'X-Enhancely-Injected', value: INJECTED_MARKER_VALUE },
+      ];
+    }
 
     // CloudFront caps response headers at 32 KB independently of the 1 MB
     // quota; exceeding it is a viewer-facing 502 after Lambda has completed.
@@ -434,7 +497,19 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       body: injected,
       bodyEncoding: 'text',
     };
-    return result;
+    if (didInject) return result;
+
+    // Un-injected pass-through: bound how long CloudFront may keep this copy,
+    // so the page flips as soon as the record exists instead of resting for
+    // the behavior's DefaultTTL. This is what makes assertedDefaultTtlSeconds
+    // effective on this trigger — v0.7.0/v0.8.0 could not do it here because
+    // the un-injected response was CloudFront's, not ours.
+    return lookup.revalidateInMs === null
+      ? result
+      : retryablePassThroughResponse(result, request.headers, lookup.revalidateInMs, {
+          assertedDefaultTtlSeconds: getAssertedDefaultTtlSeconds(),
+          capSetCookieResponses: getCapSetCookieResponses(),
+        });
   } catch (error) {
     // Fail-open: hand the request back and CloudFront proceeds exactly as if
     // this function were not associated.

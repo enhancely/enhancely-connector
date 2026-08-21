@@ -33,6 +33,35 @@ skips obvious asset traffic; anything it lets through is still checked against
 the real response, and a wrong guess costs one discarded fetch, never a wrong
 body.
 
+### Order of operations: origin first (v0.9.0)
+
+The Enhancely lookup runs only **after** the origin response proves the URL is a
+servable, injectable HTML page. Up to v0.8.0 it ran first, which forced the
+adapter to guess from the request alone — and from the request alone this is
+unknowable:
+
+- **`Accept` cannot decide it.** Googlebot sends the wildcard media range
+  _without_ `text/html` (Google Search Central), so requiring `text/html` would
+  exclude the most important consumer of the injected JSON-LD; accepting the
+  wildcard excludes nothing, since every script, image and XHR carries it too.
+- **Fetch Metadata (`Sec-Fetch-Dest`) cannot either.** It is absent on
+  `http://`, on pre-2023 browsers and on crawlers, and it is normally not part
+  of the cache key — gating on a header outside the cache key lets the
+  un-injected variant win the cache entry and be served to everyone.
+
+Origin-first avoids spending Enhancely calls on extension-less non-pages while retaining the local extension fast path.
+
+| path                           | origin hits                                  |
+| ------------------------------ | -------------------------------------------- |
+| HTML + snippet                 | 1 (we fetch, we generate)                    |
+| HTML, no snippet               | 1 (we fetch, we generate the origin's bytes) |
+| not HTML / vetoed / over quota | 2 (we fetch, then hand back)                 |
+
+Only the third line pays twice, and it is reserved for representations this
+adapter must not touch. Two things follow that the old order could not deliver:
+`auto_register` is precise (the adapter knows it is HTML), and the retry cache
+cap applies to the un-injected response because that response is now ours.
+
 ### The companion (origin-response, pairs WITH origin-request)
 
 `src/companion.ts` is a third, slim entrypoint that restores the two things the
