@@ -14,13 +14,13 @@ immediately before `</head>`. If anything goes wrong — timeout, missing record
 
 ## Packages
 
-| Package                                                           | Status                                                                                                                                                                                                                                                                                                                |
-| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/injector-core` (`@enhancely/injector-core`)             | **Implemented + tested.** Shared core: API client, cache + ETag revalidation, HTML injection, fail-open orchestration.                                                                                                                                                                                                |
-| `packages/adapter-cloudflare` (`@enhancely/adapter-cloudflare`)   | **Reference adapter.** Cloudflare Worker wrapping the core.                                                                                                                                                                                                                                                           |
-| `packages/adapter-lambda-edge` (`@enhancely/adapter-lambda-edge`) | **Implemented + tested.** CloudFront Lambda@Edge (origin-response) adapter — cannot read the origin body, so it re-fetches the page from the origin (one extra roundtrip per CloudFront cache miss), synchronizes replacement metadata, and fails open on CloudFront body/header quotas; key via baked config or SSM. |
-| `packages/adapter-sidecar` (`@enhancely/adapter-sidecar`)         | **Functional skeleton.** Node HTTP reverse proxy for nginx/apache setups.                                                                                                                                                                                                                                             |
-| `packages/adapter-sidecar-go`                                     | **Reserved.** Planned Go single-binary distribution of the sidecar.                                                                                                                                                                                                                                                   |
+| Package                                                           | Status                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/injector-core` (`@enhancely/injector-core`)             | **Implemented + tested.** Shared core: API client, cache + ETag revalidation, HTML injection, fail-open orchestration.                                                                                                                                                                                                                                                     |
+| `packages/adapter-cloudflare` (`@enhancely/adapter-cloudflare`)   | **Reference adapter.** Cloudflare Worker wrapping the core.                                                                                                                                                                                                                                                                                                                |
+| `packages/adapter-lambda-edge` (`@enhancely/adapter-lambda-edge`) | **Implemented + tested.** CloudFront Lambda@Edge, two entrypoints sharing one core. **`origin-request` (recommended)** generates the response: one origin hit, no cross-response reconciliation, and it also injects pages that set cookies. `origin-response` keeps the re-fetch pattern (two origin hits, metadata must match across both). Key via baked config or SSM. |
+| `packages/adapter-sidecar` (`@enhancely/adapter-sidecar`)         | **Functional skeleton.** Node HTTP reverse proxy for nginx/apache setups.                                                                                                                                                                                                                                                                                                  |
+| `packages/adapter-sidecar-go`                                     | **Reserved.** Planned Go single-binary distribution of the sidecar.                                                                                                                                                                                                                                                                                                        |
 
 All adapters are thin wrappers — connector logic lives exclusively in `injector-core`.
 
@@ -49,16 +49,16 @@ The API key is a secret — it must never be exposed client-side or committed. `
 
 ## Configuration
 
-| Setting                     | Default                    | Notes                                                                   |
-| --------------------------- | -------------------------- | ----------------------------------------------------------------------- |
-| `ENHANCELY_API_KEY`         | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.      |
-| `ENHANCELY_BASE`            | `https://app.enhancely.ai` | **TODO: confirm** final production API base URL.                        |
-| `timeoutMs`                 | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call.              |
-| `cacheTtlMs`                | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry. |
-| `maxJsonLdBytes`            | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                 |
-| `autoRegister`              | `false`                    | Register unknown pages after a 404; adapters still fail open.           |
-| `excludePaths`              | `[]`                       | Lambda@Edge-only path exclusions, checked before config/API work.       |
-| `assertedDefaultTtlSeconds` | `0` (off)                  | Lambda@Edge-only asserted minimum DefaultTTL for bounded retry caching. |
+| Setting                     | Default                    | Notes                                                                                                                      |
+| --------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `ENHANCELY_API_KEY`         | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.                                                         |
+| `ENHANCELY_BASE`            | `https://app.enhancely.ai` | **TODO: confirm** final production API base URL.                                                                           |
+| `timeoutMs`                 | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call.                                                                 |
+| `cacheTtlMs`                | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry.                                                    |
+| `maxJsonLdBytes`            | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                                                                    |
+| `autoRegister`              | `false`                    | Register unknown pages after a 404; adapters still fail open.                                                              |
+| `excludePaths`              | `[]`                       | Lambda@Edge-only path exclusions, checked before config/API work.                                                          |
+| `assertedDefaultTtlSeconds` | `0` (off)                  | `origin-response` trigger only — asserted minimum DefaultTTL for bounded retry caching. Has no effect on `origin-request`. |
 
 Lambda@Edge path exclusions use CloudFront-style `*`/`?` patterns. Before
 matching, the raw path is canonicalized once: RFC 3986 unreserved escapes are
@@ -89,15 +89,27 @@ module "enhancely_injector" {
 Upgrades are a `?ref=` bump. Environments without egress to GitHub can fall
 back to vendoring the release assets below.
 
+> The module currently wires the **`origin-response`** trigger only. For the
+> recommended `origin-request` trigger, vendor
+> `lambda-edge-origin-request-index.js` and set `EventType = "origin-request"`
+> yourself until the module gains a trigger option.
+
 ## Consuming releases (for integrators)
 
 Every tag `vX.Y.Z` publishes a [GitHub Release](https://github.com/enhancely/enhancely-connector/releases) with versioned, checksummed artifacts:
 
-| Asset                    | Purpose                                                                                                                                                        |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lambda-edge-index.js`   | Self-contained Lambda@Edge bundle (CommonJS, Node 20). Vendor it next to your Terraform and zip it together with your deploy-specific `connector-config.json`. |
-| `lambda-edge-bundle.zip` | The same bundle pre-zipped (no config inside).                                                                                                                 |
-| `SHA256SUMS`             | Checksums for both assets — verify after download.                                                                                                             |
+| Asset                                   | Purpose                                                                                                                                                                                      |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lambda-edge-origin-request-index.js`   | **Recommended.** Self-contained Lambda@Edge bundle for the `origin-request` trigger (CommonJS, Node 20). One origin hit per injected cache miss, and it also injects pages that set cookies. |
+| `lambda-edge-origin-request-bundle.zip` | The same bundle pre-zipped, as `index.js` (no config inside).                                                                                                                                |
+| `lambda-edge-index.js`                  | Bundle for the `origin-response` trigger (origin re-fetch pattern). Two origin hits per injected cache miss; skips pages that set cookies.                                                   |
+| `lambda-edge-bundle.zip`                | The same bundle pre-zipped (no config inside).                                                                                                                                               |
+| `SHA256SUMS`                            | Checksums for all assets — verify after download.                                                                                                                                            |
+
+Both bundles expose `index.handler`; the CloudFront `EventType` (and the zip you
+deploy) is what selects the trigger. See
+[`packages/adapter-lambda-edge/README.md`](packages/adapter-lambda-edge/README.md#which-trigger)
+for the trade-off.
 
 Recommended vendoring flow (Terraform, for reproducible deployments):
 

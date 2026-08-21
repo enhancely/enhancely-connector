@@ -64,6 +64,17 @@ export interface OriginFetchResult {
   body: Buffer;
   /** True when the body exceeded `maxBytes` and buffering was aborted. */
   truncated: boolean;
+  /**
+   * EVERY response header, lowercase-keyed, with each value preserved
+   * separately (never comma-joined — `Set-Cookie` must not be folded).
+   *
+   * The origin-response adapter does not need this: there CloudFront already
+   * holds the real response and this fetch only supplies a body. The
+   * origin-request adapter does — it GENERATES the whole viewer response, so
+   * dropping the origin's other headers (Vary, Link, Strict-Transport-Security,
+   * X-Frame-Options, …) would silently strip security and caching metadata.
+   */
+  allHeaders: Record<string, string[]>;
 }
 
 export function fetchOriginHtml(
@@ -77,12 +88,22 @@ export function fetchOriginHtml(
     const url = new URL(originUrl);
     const lib = url.protocol === 'https:' ? https : http;
 
+    // The request path is taken from the ORIGINAL string, never from
+    // `url.pathname`: `new URL` resolves dot-segments, so a URI containing
+    // `..` — or its encoded form `%2e%2e` — would be silently rewritten before
+    // it reaches the origin. CloudFront forwards the raw path and lets the
+    // origin decide, so this fetch must send exactly the same bytes or it can
+    // receive a different document than the viewer is entitled to.
+    // (buildOriginUrl separately refuses URIs that escape the origin path.)
+    const authorityEnd = originUrl.indexOf('/', originUrl.indexOf('://') + 3);
+    const rawPath = authorityEnd === -1 ? '/' : originUrl.slice(authorityEnd);
+
     const request = lib.request(
       {
         protocol: url.protocol,
         hostname: url.hostname,
         port: url.port !== '' ? Number(url.port) : undefined,
-        path: `${url.pathname}${url.search}`,
+        path: rawPath,
         method: 'GET',
         agent: false,
         // TLS SNI (and cert-hostname verification) must present the PUBLIC
@@ -123,6 +144,24 @@ export function fetchOriginHtml(
         );
         const xRobotsTag = combinedHeaderValue(response.headers['x-robots-tag']);
 
+        // node lowercases header names already; keep multi-value headers as
+        // separate entries so the caller can emit them faithfully.
+        // Header values arrive as Latin-1 bytes (node reads them that way). A
+        // value the origin actually sent as UTF-8 would otherwise reach the
+        // viewer double-encoded, because CloudFront serializes what we return
+        // as UTF-8. Recover it only when the round-trip is exact — otherwise
+        // the value really was Latin-1 and must stay untouched.
+        const decodeHeaderValue = (raw: string): string => {
+          const utf8 = Buffer.from(raw, 'latin1').toString('utf8');
+          return Buffer.from(utf8, 'utf8').toString('latin1') === raw ? utf8 : raw;
+        };
+        const allHeaders: Record<string, string[]> = {};
+        for (const [name, value] of Object.entries(response.headers)) {
+          if (value === undefined) continue;
+          const values = Array.isArray(value) ? value : [String(value)];
+          allHeaders[name.toLowerCase()] = values.map(decodeHeaderValue);
+        }
+
         const chunks: Buffer[] = [];
         let size = 0;
         let settled = false;
@@ -144,6 +183,7 @@ export function fetchOriginHtml(
               xRobotsTag,
               body: Buffer.alloc(0),
               truncated: true,
+              allHeaders,
             });
             response.destroy(); // stop paying for bytes we will never use
             return;
@@ -166,6 +206,7 @@ export function fetchOriginHtml(
             xRobotsTag,
             body: Buffer.concat(chunks),
             truncated: false,
+            allHeaders,
           });
         });
 

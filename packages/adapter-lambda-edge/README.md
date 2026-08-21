@@ -1,12 +1,74 @@
 # @enhancely/adapter-lambda-edge
 
-CloudFront **Lambda@Edge** adapter for the Enhancely JSON-LD injector.
+CloudFront **Lambda@Edge** adapters for the Enhancely JSON-LD injector.
 
-> **Status: implemented + tested.** Origin-response trigger with the
-> **origin re-fetch pattern** (see below). All connector logic comes from
-> `@enhancely/injector-core` — this adapter only translates CloudFront event
-> shapes and wires up the two edge-specific concerns: key resolution without
-> environment variables, and getting hold of the HTML body at all.
+> **Status: implemented + tested.** Two entrypoints, one core. All connector
+> logic comes from `@enhancely/injector-core` — these adapters only translate
+> CloudFront event shapes and wire up the two edge-specific concerns: key
+> resolution without environment variables, and getting hold of the HTML body
+> at all. Everything they share lives in `src/shared.ts`, so the two triggers
+> cannot drift apart.
+
+## Which trigger?
+
+|                                                     | **origin-request** (`src/origin-request.ts`)                                  | **origin-response** (`src/index.ts`)                     |
+| --------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Origin hits per injected cache miss                 | **1**                                                                         | **2** (CloudFront's + our re-fetch)                      |
+| Cross-response consistency gates                    | none — there is only one response                                             | X-Robots-Tag, Cache-Control, Expires, CSP must all match |
+| Pages that set a cookie or are `private`/`no-store` | **injected**                                                                  | skipped                                                  |
+| Fail-open primitive                                 | `return request` — CloudFront proceeds as if the function were not associated | return the response it already holds                     |
+| Body over the 1 MB quota                            | hands the request back, CloudFront streams it unlimited                       | viewer-facing **502**                                    |
+| Artifact                                            | `dist/lambda-origin-request.zip`                                              | `dist/lambda.zip`                                        |
+
+**`origin-request` is the recommended trigger.** It exists because the
+origin-response trigger cannot read the origin body: that adapter has to fetch
+the page a second time and then prove the two responses describe the same
+object. On an origin-request trigger the function may instead _generate_ the
+response, so CloudFront never contacts the origin at all — one fetch, nothing
+to reconcile.
+
+The one structural cost: the decision to fetch has to be made from the
+**request**, before any `Content-Type` exists. A cheap extension pre-filter
+skips obvious asset traffic; anything it lets through is still checked against
+the real response, and a wrong guess costs one discarded fetch, never a wrong
+body.
+
+### Why origin-request injects pages that set cookies
+
+`origin-response` skips any response carrying `Set-Cookie` or
+`Cache-Control: private|no-store`, because a _re-fetch_ cannot faithfully
+reproduce a page that stamps new state into the viewer. That reasoning is a
+property of the double fetch, not of the page, so `origin-request` does not
+apply it — the response handed to the viewer **is** the one the origin just
+produced, `Set-Cookie` included verbatim.
+
+On sites behind a stickiness-enabled load balancer — where _every_ response
+carries a session cookie — the old rule silently meant "never inject at all".
+
+Generated-response caching follows the response cache directives; Set-Cookie alone is not a cacheability signal. The connector therefore preserves the origin's cache semantics.
+
+One correction while being precise: the generated response is _not_
+byte-identical to the passed-through one — `ETag`, `Last-Modified` and
+`Content-Length` are deliberately dropped because they describe the uninjected
+body. It is identical in the only respect that governs caching.
+
+### Order of operations: lookup first
+
+The Enhancely lookup runs **before** the origin fetch, and a missing snippet
+hands the request back so CloudFront does its own normal fetch:
+
+```
+no snippet → 0 own fetches + 1 CloudFront fetch = 1   (same as without the function)
+snippet    → 1 own fetch,   0 CloudFront fetches = 1   (origin-response: 2)
+```
+
+Running both concurrently would shave the lookup latency off the snippet path,
+but would spend a wasted origin fetch on every page _without_ a snippet — and
+while a catalog is still filling up, that is the large majority of requests.
+The lookup is a memory-cache hit in steady state anyway, and after an upstream
+failure the core's `retryNotBefore` memo skips the call entirely.
+
+---
 
 ## Architecture: origin-response + re-fetch — and why
 
@@ -92,6 +154,14 @@ page is never at risk; worst case is one uninjected view.
 The re-fetch deliberately uses `node:http`/`node:https`, not `fetch`:
 undici's `fetch` treats `Host` as a forbidden header and silently drops it,
 which would break virtual hosts on the origin.
+
+> **`assertedDefaultTtlSeconds` and the retry cache-control rewriting apply to
+> the `origin-response` trigger only.** The `origin-request` entrypoint hands
+> the request back when there is no snippet, so CloudFront fetches and caches
+> the origin's own response — this adapter never sees it and cannot shorten its
+> lifetime. On that trigger an uninjected page is cached for the behavior's
+> normal TTL. Follow-up: pair it with an origin-response function that does
+> nothing but the capping (see the open question in the feature request).
 
 ## Configuration (no environment variables at the edge!)
 
@@ -207,9 +277,20 @@ to the browser (non-negotiable rule #1 of this repo).
 
 ```bash
 pnpm --filter @enhancely/injector-core build          # once, or `pnpm -r build`
-pnpm --filter @enhancely/adapter-lambda-edge build    # typecheck + esbuild bundle → dist/index.js
-pnpm --filter @enhancely/adapter-lambda-edge package  # → dist/lambda.zip (includes connector-config.json when present)
+pnpm --filter @enhancely/adapter-lambda-edge build    # typecheck + two esbuild bundles
+pnpm --filter @enhancely/adapter-lambda-edge package  # → two zips (config included when present)
 ```
+
+`build` produces both bundles, `package` produces both zips:
+
+| Artifact                         | Trigger           | Lambda handler  |
+| -------------------------------- | ----------------- | --------------- |
+| `dist/lambda-origin-request.zip` | `origin-request`  | `index.handler` |
+| `dist/lambda.zip`                | `origin-response` | `index.handler` |
+
+Both zips contain their bundle **as `index.js`**, so the Lambda `handler`
+setting is `index.handler` either way — only the zip and the CloudFront event
+type differ. (`dist/origin-request.js` is the unzipped bundle for vendoring.)
 
 The bundle is CJS, `--platform=node --target=node20`, with `@aws-sdk/*`
 external (provided by the Lambda runtime). For the baked-key option, write
@@ -265,29 +346,36 @@ aws lambda create-function --region us-east-1 \
   --handler index.handler \
   --role arn:aws:iam::<ACCOUNT>:role/enhancely-lambda-edge \
   --timeout 10 --memory-size 256 \
-  --zip-file fileb://dist/lambda.zip
+  --zip-file fileb://dist/lambda-origin-request.zip   # origin-response: dist/lambda.zip
 
 aws lambda publish-version --region us-east-1 \
   --function-name enhancely-injector
 # note the returned Version → ARN like …:function:enhancely-injector:1
 ```
 
-Redeploys: `aws lambda update-function-code … --zip-file fileb://dist/lambda.zip`
+Redeploys: `aws lambda update-function-code … --zip-file fileb://dist/lambda-origin-request.zip   # origin-response: dist/lambda.zip`
 followed by a fresh `publish-version` and step 4 with the new version ARN.
 
 ### 4. Attach to the CloudFront behavior (origin-response)
 
 ```bash
 aws cloudfront get-distribution-config --id <DIST_ID> > dist-config.json
-# In DistributionConfig.DefaultCacheBehavior (or the relevant CacheBehavior):
+# In DistributionConfig.DefaultCacheBehavior (or the relevant CacheBehavior).
+# EventType must match the artifact you deployed:
+#   lambda-origin-request.zip → "origin-request"   (recommended)
+#   lambda.zip                → "origin-response"
 #   "LambdaFunctionAssociations": {
 #     "Quantity": 1,
 #     "Items": [{
 #       "LambdaFunctionARN": "arn:aws:lambda:us-east-1:<ACCOUNT>:function:enhancely-injector:<VERSION>",
-#       "EventType": "origin-response",
+#       "EventType": "origin-request",
 #       "IncludeBody": false
 #     }]
 #   }
+#
+# Do NOT associate both triggers with the same behavior using these artifacts:
+# origin-request already generates the final response, and the origin-response
+# adapter would then re-fetch it a second time.
 aws cloudfront update-distribution --id <DIST_ID> \
   --if-match <ETag-from-get> \
   --distribution-config file://dist-config.updated.json

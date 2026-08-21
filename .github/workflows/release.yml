@@ -44,6 +44,17 @@ jobs:
           # lambda.zip without any connector-config.json (config is deploy-specific).
           cd packages/adapter-lambda-edge/dist && rm -f release.zip && zip -q -X release.zip index.js && cd -
           cp packages/adapter-lambda-edge/dist/release.zip release-assets/lambda-edge-bundle.zip
+          # origin-request entrypoint (recommended trigger). Shipped as
+          # index.js inside its zip so the Lambda handler stays index.handler.
+          cp packages/adapter-lambda-edge/dist/origin-request.js \
+             release-assets/lambda-edge-origin-request-index.js
+          rm -rf packages/adapter-lambda-edge/dist/.rel-or
+          mkdir -p packages/adapter-lambda-edge/dist/.rel-or
+          cp packages/adapter-lambda-edge/dist/origin-request.js \
+             packages/adapter-lambda-edge/dist/.rel-or/index.js
+          cd packages/adapter-lambda-edge/dist/.rel-or && zip -q -X ../release-or.zip index.js && cd -
+          cp packages/adapter-lambda-edge/dist/release-or.zip \
+             release-assets/lambda-edge-origin-request-bundle.zip
 
       - name: Verify Terraform module bundle is in sync
         run: |
@@ -55,7 +66,9 @@ jobs:
       - name: Checksums
         run: |
           cd release-assets
-          sha256sum lambda-edge-index.js lambda-edge-bundle.zip > SHA256SUMS
+          sha256sum lambda-edge-origin-request-index.js \
+                    lambda-edge-origin-request-bundle.zip \
+                    lambda-edge-index.js lambda-edge-bundle.zip > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
@@ -65,6 +78,8 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
+            release-assets/lambda-edge-origin-request-index.js \
+            release-assets/lambda-edge-origin-request-bundle.zip \
             release-assets/lambda-edge-index.js \
             release-assets/lambda-edge-bundle.zip \
             release-assets/SHA256SUMS

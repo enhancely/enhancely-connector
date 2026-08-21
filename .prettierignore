@@ -5,3 +5,7 @@ pnpm-lock.yaml
 .terraform/
 *.tfstate
 *.tfstate.*
+
+# Deploy-specific, gitignored — present locally, absent in CI. Ignoring it
+# keeps `pnpm format:check` identical in both places.
+connector-config.json

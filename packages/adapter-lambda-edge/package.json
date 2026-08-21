@@ -2,13 +2,13 @@
   "name": "@enhancely/adapter-lambda-edge",
   "version": "0.1.0",
   "private": true,
-  "description": "CloudFront Lambda@Edge origin-response adapter for the Enhancely JSON-LD injector (origin re-fetch pattern, fail-open)",
+  "description": "CloudFront Lambda@Edge adapters for the Enhancely JSON-LD injector: origin-request (generates the response, one origin hit) and origin-response (re-fetch pattern), both fail-open",
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js \"--external:@aws-sdk/*\"",
+    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js \"--external:@aws-sdk/*\" && esbuild src/origin-request.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/origin-request.js \"--external:@aws-sdk/*\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "package": "pnpm run build && { cp connector-config.json dist/ 2>/dev/null || true; } && cd dist && rm -f lambda.zip && zip -q -X lambda.zip index.js && { zip -q lambda.zip connector-config.json >/dev/null 2>&1 || true; } && echo 'dist/lambda.zip ready'",
+    "package": "pnpm run build && { cp connector-config.json dist/ 2>/dev/null || true; } && cd dist && rm -rf lambda.zip lambda-origin-request.zip .pkg && zip -q -X lambda.zip index.js && { zip -q lambda.zip connector-config.json >/dev/null 2>&1 || true; } && mkdir -p .pkg && cp origin-request.js .pkg/index.js && { cp connector-config.json .pkg/ 2>/dev/null || true; } && ( cd .pkg && zip -q -X ../lambda-origin-request.zip index.js && { zip -q ../lambda-origin-request.zip connector-config.json >/dev/null 2>&1 || true; } ) && rm -rf .pkg && echo 'dist/lambda.zip (origin-response) + dist/lambda-origin-request.zip (origin-request) ready'",
     "test": "vitest run"
   },
   "dependencies": {
