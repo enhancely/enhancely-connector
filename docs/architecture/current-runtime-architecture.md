@@ -257,7 +257,7 @@ flowchart TD
     GU --> CF
 
     HB --> O2["Origin-Fetch durch CloudFront"]
-    O2 --> COMP{"Companion-Cap-Gates:<br/>GET, nicht ausgeschlossen, keine Asset-Endung,<br/>kein Range, exakt 200 HTML,<br/>Header-Charset passend, indexierbar,<br/>kein no-transform/Attachment,<br/>syntaktisch nutzbarer Custom Origin?"}
+    O2 --> COMP{"Companion-Cap-Gates:<br/>GET, nicht ausgeschlossen, keine Asset-Endung,<br/>kein Range, exakt 200 HTML,<br/>Header-Charset passend, indexierbar,<br/>kein no-transform / keine gültige<br/>Nicht-inline-Disposition,<br/>syntaktisch nutzbarer Custom Origin?"}
     COMP -- "nein" --> PASS["Byte-identischer Pass-through"]
     COMP -- "ja" --> CCFG["Config auflösen<br/>(einzige optionale I/O;<br/>0 Origin / 0 Enhancely)"]
     CCFG --> HASCFG{"Config verfügbar?"}
@@ -286,19 +286,26 @@ Die Reihenfolge ist absichtlich günstig nach Kosten sortiert:
    Body-Fehler öffnen den 10-Sekunden-Origin-Circuit und führen zum Handback.
 10. Ein wegen der Größe truncierter Body führt zum 30-Minuten-Hard-Handback-Memo.
 11. Kein vorhandener `X-Enhancely-Injected`-Marker.
-12. Exakt `200`, exakt der Medientyp `text/html`, ein deklarierter Charset ist
-    UTF-8-kompatibel, kein `Cache-Control: no-transform` und kein
-    `Content-Disposition: attachment`.
-13. Kein `Content-Encoding` auf dem angeforderten Identity-Response.
-14. Kein `X-Robots-Tag: noindex` oder `none`.
-15. Der tatsächliche Body ist UTF-8-sicher beziehungsweise eindeutig sicher dekodierbar.
-16. Ein realer, parser-sicherer `</head>`-Einfügepunkt existiert.
-17. Header und HTML plus minimaler Script-Wrapper passen grundsätzlich in die
+12. Exakt `200`; `Content-Type` kommt in genau einer Feldinstanz mit genau einem
+    eindeutigen Medientyp `text/html` vor; ein deklarierter Charset ist
+    UTF-8-kompatibel. Top-Level-Kommas, Unicode-Pseudo-OWS und unausgeglichene
+    HTTP-Quotes sind ein Veto.
+13. Kein `Cache-Control: no-transform` und keine gültige
+    Nicht-`inline`-`Content-Disposition` (einschließlich `attachment` und
+    unbekannter gültiger Typen). Ein explizites `no-transform` bleibt auch bei
+    fehlerhaften Whitespace-/Semikolon-Trennern wirksam; unausgeglichene Quotes
+    vetoen konservativ.
+14. Kein `Content-Encoding` auf dem angeforderten Identity-Response.
+15. Kein `X-Robots-Tag: noindex` oder `none`; die Sperre bleibt auch bei
+    fehlerhaften Whitespace-/Semikolon-Trennern wirksam.
+16. Der tatsächliche Body ist UTF-8-sicher beziehungsweise eindeutig sicher dekodierbar.
+17. Ein realer, parser-sicherer `</head>`-Einfügepunkt existiert.
+18. Header und HTML plus minimaler Script-Wrapper passen grundsätzlich in die
     CloudFront-Limits.
-18. Die öffentliche URL ist absolut HTTP(S), enthält keine Credentials und ist nach
+19. Die öffentliche URL ist absolut HTTP(S), enthält keine Credentials und ist nach
     `normalizeLite` ein Fixpunkt. Ein Fehler endet lokal vor Cache und API.
-19. Erst jetzt: JSON-LD-Cache prüfen und bei Bedarf Enhancely aufrufen.
-20. Mit der tatsächlichen Snippet-Größe die exakte Response-Quota prüfen.
+20. Erst jetzt: JSON-LD-Cache prüfen und bei Bedarf Enhancely aufrufen.
+21. Mit der tatsächlichen Snippet-Größe die exakte Response-Quota prüfen.
 
 `Set-Cookie`, `private` und `no-store` verhindern im empfohlenen Origin-Request-Pfad
 keine Injektion. Es gibt dort nur eine Origin-Antwort; sie wird inklusive dieser Header
@@ -313,29 +320,29 @@ Die Werte in der Spalte **Origin gesamt** enthalten sowohl den direkten Injector
 als auch einen eventuell folgenden CloudFront-Fetch. `0/1` bei Enhancely bedeutet:
 lokaler Cache/Backoff `0`, echter stale/miss Lookup `1`.
 
-| Fall pro Viewer-Request                                                                                                                                                             |                                 Origin gesamt | Enhancely extern | Companion                       | Ergebnis                                                                                                                                                  |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------: | ---------------: | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| CloudFront-Cache-Hit                                                                                                                                                                |                                             0 |                0 | nein                            | Bereits gecachter Response.                                                                                                                               |
-| Non-GET, ausgeschlossener Pfad, Range, nicht unterstützter Origin oder fehlender Host                                                                                               |                                             1 |                0 | ja, aber Gate-Exit              | Normaler CloudFront-Originpfad, unverändert.                                                                                                              |
-| Offensichtliche Asset-Endung; Origin liefert Nicht-HTML, Status ungleich `200` oder sogar unerwartet `200 text/html`                                                                |                                             1 |                0 | ja, aber Extension-Gate         | Beide Funktionen schließen Asset-Endungen aus. Keine Injektion, kein künstlicher Companion-Cap.                                                           |
-| Fehlende Config/API-Key                                                                                                                                                             |                                             1 |                0 | ja                              | Der Injector gibt vor dem Direkt-Fetch zurück. Der Companion darf nur die Config auflösen und bei sonst geeigneter Antwort sicher auf deren Retry kappen. |
-| Reproduzierbarer Redirect oder kleine `4xx`-/`5xx`-Antwort                                                                                                                          |                                             1 |                0 | nein                            | Status, Header und Body werden aus dem ersten Fetch zurückgegeben.                                                                                        |
-| Reproduzierbarer leerer `204`                                                                                                                                                       |                                             1 |                0 | nein                            | Leerer `204` wird aus dem ersten Fetch zurückgegeben.                                                                                                     |
-| Nicht reproduzierbarer `201`–`203`, `204` mit Body/zu großen Headern, `205`–`299`, `304` oder übergroßer Fehlerresponse, erstes Auftreten                                           |                                             2 |                0 | ja; Status-Gate                 | Injector klassifiziert einmal, danach übernimmt CloudFront.                                                                                               |
-| Derselbe nicht reproduzierbare Status während des Hard-Handback-Memos                                                                                                               |                                             1 |                0 | ja; Status-Gate                 | Injector überspringt seinen Klassifizierungs-Fetch.                                                                                                       |
-| Kleines reproduzierbares `200`, aber nicht `text/html`                                                                                                                              |                                             1 |                0 | nein                            | Binär/verbatim aus dem ersten Fetch.                                                                                                                      |
-| Nicht reproduzierbares oder zu großes `200` Nicht-HTML, erstes Auftreten                                                                                                            |                                             2 |                0 | ja; Content-Type-Gate           | Handback; Hard-Handback-Memo wird gesetzt.                                                                                                                |
-| Dasselbe Nicht-HTML während des Hard-Handback-Memos                                                                                                                                 |                                             1 |                0 | ja; Content-Type-Gate           | Nur normaler CloudFront-Origin-Fetch.                                                                                                                     |
-| Reproduzierbares `200 text/html`, aber lokaler Veto vor Enhancely, z. B. `noindex`, unsichere Zeichenkodierung, `no-transform`, Attachment, kein echter Head oder Mindestquota-Veto |                                             1 |                0 | nein                            | Original wird unverändert aus dem ersten Fetch generiert.                                                                                                 |
-| Übergroßes/truncated `200 text/html`, Veto vor Enhancely                                                                                                                            | 2 beim ersten Mal, danach 1 während des Memos |                0 | ja; optional sicherer Cache-Cap | Companion sieht Body/Head/Quota nicht, ruft deshalb Enhancely nie auf und kappt höchstens auf `nonPageMemoTtlMs`.                                         |
-| Injizierbares `200 text/html`, positiver JSON-LD-Cache frisch                                                                                                                       |                                             1 |                0 | nein                            | Snippet aus MemoryCache injiziert.                                                                                                                        |
-| Injizierbares `200 text/html`, negativer Cache oder Backoff ohne positiven stale Eintrag                                                                                            |                                             1 |                0 | nein                            | Original unverändert; keine erneute API-Last.                                                                                                             |
-| Injizierbares `200 text/html`, positiver stale Eintrag während API-Fehler-, Timeout- oder Rate-Limit-Backoff                                                                        |                                             1 |                0 | nein                            | Stale JSON-LD wird weiter injiziert; nach dem Backoff wird erneut revalidiert.                                                                            |
-| Injizierbares `200 text/html`, aber öffentliche URL ist ungültig, enthält Credentials oder ist nicht normalisierungsstabil                                                          |                                             1 |                0 | nein                            | Core lehnt vor Cache/API lokal ab; Original wird generiert.                                                                                               |
-| Injizierbares `200 text/html`, JSON-LD stale oder miss                                                                                                                              |                                             1 |      höchstens 1 | nein                            | `200/304/412` kann injizieren; eine definitive negative Antwort liefert Original, ein transienter Fehler darf stale JSON-LD nutzen.                       |
-| Tatsächliches Snippet überschreitet erst nach dem Lookup die Quota, Original passt noch                                                                                             |                                             1 |              0/1 | nein                            | Original unverändert; kein zweiter Origin-Fetch.                                                                                                          |
-| Seltener Post-Lookup-Handback, auch das Original kann nicht generiert werden                                                                                                        |                                             2 |      höchstens 1 | ja; optional sicherer Cache-Cap | Der einzige mögliche Enhancely-Request fand im Injector statt; der Companion führt keinen zweiten aus.                                                    |
-| Direkter Origin-Fetch schlägt fehl                                                                                                                                                  |                      bis zu 2 Origin-Versuche |                0 | nur bei CloudFront-Response     | Fail-open; der Companion kann ein danach geliefertes geeignetes `200 text/html` nur sicher auf `nonPageMemoTtlMs` kappen.                                 |
+| Fall pro Viewer-Request                                                                                                                                                                                   |                                 Origin gesamt | Enhancely extern | Companion                       | Ergebnis                                                                                                                                                  |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------: | ---------------: | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CloudFront-Cache-Hit                                                                                                                                                                                      |                                             0 |                0 | nein                            | Bereits gecachter Response.                                                                                                                               |
+| Non-GET, ausgeschlossener Pfad, Range, nicht unterstützter Origin oder fehlender Host                                                                                                                     |                                             1 |                0 | ja, aber Gate-Exit              | Normaler CloudFront-Originpfad, unverändert.                                                                                                              |
+| Offensichtliche Asset-Endung; Origin liefert Nicht-HTML, Status ungleich `200` oder sogar unerwartet `200 text/html`                                                                                      |                                             1 |                0 | ja, aber Extension-Gate         | Beide Funktionen schließen Asset-Endungen aus. Keine Injektion, kein künstlicher Companion-Cap.                                                           |
+| Fehlende Config/API-Key                                                                                                                                                                                   |                                             1 |                0 | ja                              | Der Injector gibt vor dem Direkt-Fetch zurück. Der Companion darf nur die Config auflösen und bei sonst geeigneter Antwort sicher auf deren Retry kappen. |
+| Reproduzierbarer Redirect oder kleine `4xx`-/`5xx`-Antwort                                                                                                                                                |                                             1 |                0 | nein                            | Status, Header und Body werden aus dem ersten Fetch zurückgegeben.                                                                                        |
+| Reproduzierbarer leerer `204`                                                                                                                                                                             |                                             1 |                0 | nein                            | Leerer `204` wird aus dem ersten Fetch zurückgegeben.                                                                                                     |
+| Nicht reproduzierbarer `201`–`203`, `204` mit Body/zu großen Headern, `205`–`299`, `304` oder übergroßer Fehlerresponse, erstes Auftreten                                                                 |                                             2 |                0 | ja; Status-Gate                 | Injector klassifiziert einmal, danach übernimmt CloudFront.                                                                                               |
+| Derselbe nicht reproduzierbare Status während des Hard-Handback-Memos                                                                                                                                     |                                             1 |                0 | ja; Status-Gate                 | Injector überspringt seinen Klassifizierungs-Fetch.                                                                                                       |
+| Kleines reproduzierbares `200`, aber nicht `text/html`                                                                                                                                                    |                                             1 |                0 | nein                            | Binär/verbatim aus dem ersten Fetch.                                                                                                                      |
+| Nicht reproduzierbares oder zu großes `200` Nicht-HTML, erstes Auftreten                                                                                                                                  |                                             2 |                0 | ja; Content-Type-Gate           | Handback; Hard-Handback-Memo wird gesetzt.                                                                                                                |
+| Dasselbe Nicht-HTML während des Hard-Handback-Memos                                                                                                                                                       |                                             1 |                0 | ja; Content-Type-Gate           | Nur normaler CloudFront-Origin-Fetch.                                                                                                                     |
+| Reproduzierbares `200 text/html`, aber lokaler Veto vor Enhancely, z. B. `noindex`, unsichere Zeichenkodierung, `no-transform`, gültige Nicht-inline-Disposition, kein echter Head oder Mindestquota-Veto |                                             1 |                0 | nein                            | Original wird unverändert aus dem ersten Fetch generiert.                                                                                                 |
+| Übergroßes/truncated `200 text/html`, Veto vor Enhancely                                                                                                                                                  | 2 beim ersten Mal, danach 1 während des Memos |                0 | ja; optional sicherer Cache-Cap | Companion sieht Body/Head/Quota nicht, ruft deshalb Enhancely nie auf und kappt höchstens auf `nonPageMemoTtlMs`.                                         |
+| Injizierbares `200 text/html`, positiver JSON-LD-Cache frisch                                                                                                                                             |                                             1 |                0 | nein                            | Snippet aus MemoryCache injiziert.                                                                                                                        |
+| Injizierbares `200 text/html`, negativer Cache oder Backoff ohne positiven stale Eintrag                                                                                                                  |                                             1 |                0 | nein                            | Original unverändert; keine erneute API-Last.                                                                                                             |
+| Injizierbares `200 text/html`, positiver stale Eintrag während API-Fehler-, Timeout- oder Rate-Limit-Backoff                                                                                              |                                             1 |                0 | nein                            | Stale JSON-LD wird weiter injiziert; nach dem Backoff wird erneut revalidiert.                                                                            |
+| Injizierbares `200 text/html`, aber öffentliche URL ist ungültig, enthält Credentials oder ist nicht normalisierungsstabil                                                                                |                                             1 |                0 | nein                            | Core lehnt vor Cache/API lokal ab; Original wird generiert.                                                                                               |
+| Injizierbares `200 text/html`, JSON-LD stale oder miss                                                                                                                                                    |                                             1 |      höchstens 1 | nein                            | `200/304/412` kann injizieren; eine definitive negative Antwort liefert Original, ein transienter Fehler darf stale JSON-LD nutzen.                       |
+| Tatsächliches Snippet überschreitet erst nach dem Lookup die Quota, Original passt noch                                                                                                                   |                                             1 |              0/1 | nein                            | Original unverändert; kein zweiter Origin-Fetch.                                                                                                          |
+| Seltener Post-Lookup-Handback, auch das Original kann nicht generiert werden                                                                                                                              |                                             2 |      höchstens 1 | ja; optional sicherer Cache-Cap | Der einzige mögliche Enhancely-Request fand im Injector statt; der Companion führt keinen zweiten aus.                                                    |
+| Direkter Origin-Fetch schlägt fehl                                                                                                                                                                        |                      bis zu 2 Origin-Versuche |                0 | nur bei CloudFront-Response     | Fail-open; der Companion kann ein danach geliefertes geeignetes `200 text/html` nur sicher auf `nonPageMemoTtlMs` kappen.                                 |
 
 Die Folgewerte setzen warme Lambda-Execution-Environments voraus. Eine neue
 Execution Environment startet mit leeren lokalen Caches und Memos.
@@ -356,9 +363,11 @@ möglichen Cache-Begrenzung verlangt er in dieser Reihenfolge:
 2. `GET` und kein `excludePaths`-Treffer.
 3. Keine bekannte Nicht-HTML-Dateiendung.
 4. Kein `Range`-Request.
-5. Exakt `200 text/html`, kompatibler deklarierter Charset, kein `no-transform` und
-   kein Attachment. `Content-Encoding` ist erlaubt, weil der Companion den Body weder
-   liest noch verändert.
+5. Exakt `200` und genau eine eindeutige `Content-Type: text/html`-Feldinstanz ohne
+   mehrdeutiges Top-Level-Komma, Unicode-Pseudo-OWS oder unausgeglichene Quotes;
+   kompatibler deklarierter Charset, kein
+   `no-transform` und keine gültige Nicht-`inline`-Disposition. `Content-Encoding`
+   ist erlaubt, weil der Companion den Body weder liest noch verändert.
 6. Kein `X-Robots-Tag: noindex` oder `none`.
 7. `buildOriginUrl` kann aus dem Event syntaktisch eine sichere Custom-Origin-URL
    ableiten. Die Funktion erkennt S3-Origins und unsichere Path-Escapes, aber nicht die
@@ -479,39 +488,47 @@ empfohlenen Lambda-Aufbau aber nicht verwendet.
 
 ### Antwortbehandlung
 
-| Enhancely-Antwort                                   | Connector-Verhalten                                                                                                   |
-| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `200` mit JSON-LD                                   | Positiv speichern. Der jeweilige Injector versucht danach seine restlichen Body-/Quota-Gates.                         |
-| `304` beim GET                                      | Vorhandenen Cache-Eintrag behalten und seine Freshness-TTL neu starten.                                               |
-| `412` beim Register-or-Revalidate POST              | Wie `304`: vorhandenen Eintrag behalten und Freshness neu starten.                                                    |
-| `201` oder `202`                                    | Pending-negativ speichern; Originalseite unverändert ausliefern.                                                      |
-| `200` mit `X-JsonLd-Status: ignored` oder Body `{}` | Terminal-negativ für eine volle Cache-TTL; nie als JSON-LD injizieren.                                                |
-| GET `404`                                           | Negativ für eine volle Cache-TTL. Bei `autoRegister=true` tritt im empfohlenen Pfad stattdessen der direkte POST auf. |
-| POST `400` oder `403` ohne Backoff-Hinweis          | Terminal-negativ für eine volle Cache-TTL.                                                                            |
-| `429`, POST-`403` mit Hinweis, Fehler oder Timeout  | Stale positive Daten weiterverwenden, sonst Originalseite; Retry-/Circuit-Zeit setzen.                                |
-| JSON-LD größer als 256 KiB                          | Stream abbrechen; einen stale positiven Eintrag weiterverwenden, sonst Originalseite.                                 |
+Bei `429` liest der Connector zuerst `Retry-After` (Sekunden oder HTTP-Datum)
+und ersatzweise `RateLimit-Reset` (Delta-Sekunden). Nur wenn beide Header fehlen
+oder unbrauchbar sind, verwendet er den 10-Sekunden-Fallback. Ein langer Hinweis
+bleibt auf dem Register-Pfad URL-lokal; der URL-übergreifende Circuit ist davon
+getrennt und immer auf 60 Sekunden begrenzt.
+
+| Enhancely-Antwort                                   | Connector-Verhalten                                                                                                                                          |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `200` mit JSON-LD                                   | Positiv speichern. Der jeweilige Injector versucht danach seine restlichen Body-/Quota-Gates.                                                                |
+| `304` beim GET                                      | Vorhandenen Cache-Eintrag behalten und seine Freshness-TTL neu starten.                                                                                      |
+| `412` beim Register-or-Revalidate POST              | Wie `304`: vorhandenen Eintrag behalten und Freshness neu starten.                                                                                           |
+| `201` oder `202`                                    | Pending-negativ speichern; Originalseite unverändert ausliefern.                                                                                             |
+| `200` mit `X-JsonLd-Status: ignored` oder Body `{}` | Terminal-negativ für eine volle Cache-TTL; nie als JSON-LD injizieren.                                                                                       |
+| GET `404`                                           | Negativ für eine volle Cache-TTL. Bei `autoRegister=true` tritt im empfohlenen Pfad stattdessen der direkte POST auf.                                        |
+| POST `400` oder `403` ohne `Retry-After`            | Terminal-negativ für eine volle Cache-TTL.                                                                                                                   |
+| `429`                                               | Stale positive Daten weiterverwenden, sonst Originalseite; URL-lokalen Retry setzen und den gemeinsamen Circuit separat auf höchstens 60 Sekunden begrenzen. |
+| POST-`403` mit `Retry-After`                        | Stale positive Daten weiterverwenden, sonst Originalseite; ausschließlich URL-lokal bis höchstens 24 Stunden warten. Kein gemeinsamer Circuit.               |
+| Fehler oder Timeout                                 | Stale positive Daten weiterverwenden, sonst Originalseite; 10 Sekunden ausschließlich URL-lokal warten.                                                      |
+| JSON-LD größer als 256 KiB                          | Stream abbrechen; einen stale positiven Eintrag weiterverwenden, sonst Originalseite.                                                                        |
 
 ## Cache- und Zeitmodell
 
 Es gibt bewusst **keinen einzelnen „Connector-Cache“**. Folgende Ebenen und Uhren sind
 unabhängig voneinander:
 
-| Ebene / Zustand                                            | Standard und Scope                                                                                                     | Wirkung                                                                                                      |
-| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| CloudFront-Seitencache                                     | Keine feste Connector-TTL; Origin-Header und Cache-Behavior bestimmen die Laufzeit.                                    | Cache-Hits umgehen beide Lambda-Origin-Trigger: 0 Origin, 0 Enhancely.                                       |
-| Positiver JSON-LD-Eintrag                                  | 5 Minuten frisch, konfigurierbar; pro Backend-Key. Memory lokal je Execution Environment/Isolate, KV namespaceweit.    | Währenddessen kein Enhancely-Netzwerkrequest.                                                                |
-| Negativer JSON-LD-Eintrag (`404`, ignored, `{}`, rejected) | 5 Minuten frisch, konfigurierbar; mit demselben Backend-Scope.                                                         | Währenddessen keine Injektion und kein erneuter Enhancely-Request.                                           |
-| `201/202` mit `Retry-After`                                | `min(cacheTtlMs, max(1 s, Hint))`; ohne Hint volle Cache-TTL.                                                          | Re-Poll erst nach dem angegebenen Termin.                                                                    |
-| Normaler API-Fehler/Timeout                                | 10 Sekunden URL-lokal.                                                                                                 | Stale positive Daten bleiben verwendbar; sonst keine Injektion.                                              |
-| GET-Rate-Limit                                             | Hint mindestens 1 Sekunde, maximal 60 Sekunden; ohne Hint 10 Sekunden.                                                 | Circuit für alle URLs mit demselben Enhancely-Base/API-Key/Fetch-Implementierungs-Scope.                     |
-| Register-POST `429`                                        | Hint mindestens 1 Sekunde, maximal 24 Stunden; ohne nutzbaren Hint 10 Sekunden.                                        | Dauerhafte Rate Limits werden nicht im Sekundentakt erneut gepostet.                                         |
-| Register-POST `403`                                        | Mit Hint mindestens 1 Sekunde und maximal 24 Stunden; ohne Hint terminal-negativ für die volle JSON-LD-TTL.            | Plan-Hard-Caps respektieren lange Hints; ein Domain-/Operatorzustand ohne Hint ruht standardmäßig 5 Minuten. |
-| Enhancely-Timeout-Memo des Origin-Request-Injectors        | 10 Sekunden pro Injector-Execution-Environment, wenn ein Call mindestens 90 % seines Timeouts verbraucht.              | Andere URLs überspringen in diesem Fenster den Enhancely-Netzwerkaufruf.                                     |
-| Hard-Handback-/Non-Page-Memo des Injectors                 | 30 Minuten, konfigurierbar; pro vollständiger öffentlicher URL inklusive Query und pro Injector-Execution-Environment. | Überspringt bei Wiederholungen den bereits bekannten, nicht nutzbaren Klassifizierungs-Fetch.                |
-| Cache-Cap-Ziel des Companion bei vorhandener Config        | Dasselbe `nonPageMemoTtlMs`, standardmäßig 30 Minuten; kein eigener Companion-Memoeintrag.                             | Verkürzt nur eine bereits sicher cachebare Handback-Antwort; 0 Origin und 0 Enhancely.                       |
-| Origin-Fehler-Circuits                                     | 10 Sekunden; Endpoint+VHost für bewiesene DNS/TCP/TLS-Setupfehler, exakter Request für spätere/unklare Fehler.         | Verhindert einen bekannten aussichtslosen direkten Origin-Fetch; CloudFront bleibt fail-open zuständig.      |
-| Fehlende Config / SSM-Fehler                               | 30 Sekunden negative Config-Cooldown.                                                                                  | Danach wird SSM erneut versucht.                                                                             |
-| Erfolgreich geladene Config/API-Key                        | Lebensdauer der Lambda-Execution-Environment.                                                                          | Gleichzeitige erste Auflösungen teilen einen In-flight-Request.                                              |
+| Ebene / Zustand                                            | Standard und Scope                                                                                                              | Wirkung                                                                                                 |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| CloudFront-Seitencache                                     | Keine feste Connector-TTL; Origin-Header und Cache-Behavior bestimmen die Laufzeit.                                             | Cache-Hits umgehen beide Lambda-Origin-Trigger: 0 Origin, 0 Enhancely.                                  |
+| Positiver JSON-LD-Eintrag                                  | 5 Minuten frisch, konfigurierbar; pro Backend-Key. Memory lokal je Execution Environment/Isolate, KV namespaceweit.             | Währenddessen kein Enhancely-Netzwerkrequest.                                                           |
+| Negativer JSON-LD-Eintrag (`404`, ignored, `{}`, rejected) | 5 Minuten frisch, konfigurierbar; mit demselben Backend-Scope.                                                                  | Währenddessen keine Injektion und kein erneuter Enhancely-Request.                                      |
+| `201/202` mit `Retry-After`                                | `min(cacheTtlMs, max(1 s, Hint))`; ohne Hint volle Cache-TTL.                                                                   | Re-Poll erst nach dem angegebenen Termin.                                                               |
+| Normaler API-Fehler/Timeout                                | 10 Sekunden URL-lokal.                                                                                                          | Stale positive Daten bleiben verwendbar; sonst keine Injektion.                                         |
+| GET-Rate-Limit                                             | URL-lokal: Hint mindestens 1 Sekunde, maximal 60 Sekunden; ohne Hint 10 Sekunden. Shared Circuit: maximal 60 Sekunden.          | Circuit für alle URLs mit demselben Enhancely-Base/API-Key/Fetch-Implementierungs-Scope.                |
+| Register-POST `429`                                        | URL-lokal: Hint mindestens 1 Sekunde, maximal 24 Stunden; ohne nutzbaren Hint 10 Sekunden. Shared Circuit: maximal 60 Sekunden. | Die betroffene URL respektiert lange Limits; andere URLs werden höchstens 60 Sekunden gebremst.         |
+| Register-POST `403`                                        | Mit `Retry-After` URL-lokal mindestens 1 Sekunde und maximal 24 Stunden; sonst terminal-negativ für die volle JSON-LD-TTL.      | Kein Shared Circuit: Plan-/Registrierungslimits einer URL unterdrücken keine kalten Reads anderer URLs. |
+| Enhancely-Timeout-Memo des Origin-Request-Injectors        | 10 Sekunden pro Injector-Execution-Environment, wenn ein Call mindestens 90 % seines Timeouts verbraucht.                       | Andere URLs überspringen in diesem Fenster den Enhancely-Netzwerkaufruf.                                |
+| Hard-Handback-/Non-Page-Memo des Injectors                 | 30 Minuten, konfigurierbar; pro vollständiger öffentlicher URL inklusive Query und pro Injector-Execution-Environment.          | Überspringt bei Wiederholungen den bereits bekannten, nicht nutzbaren Klassifizierungs-Fetch.           |
+| Cache-Cap-Ziel des Companion bei vorhandener Config        | Dasselbe `nonPageMemoTtlMs`, standardmäßig 30 Minuten; kein eigener Companion-Memoeintrag.                                      | Verkürzt nur eine bereits sicher cachebare Handback-Antwort; 0 Origin und 0 Enhancely.                  |
+| Origin-Fehler-Circuits                                     | 10 Sekunden; Endpoint+VHost für bewiesene DNS/TCP/TLS-Setupfehler, exakter Request für spätere/unklare Fehler.                  | Verhindert einen bekannten aussichtslosen direkten Origin-Fetch; CloudFront bleibt fail-open zuständig. |
+| Fehlende Config / SSM-Fehler                               | 30 Sekunden negative Config-Cooldown.                                                                                           | Danach wird SSM erneut versucht.                                                                        |
+| Erfolgreich geladene Config/API-Key                        | Lebensdauer der Lambda-Execution-Environment.                                                                                   | Gleichzeitige erste Auflösungen teilen einen In-flight-Request.                                         |
 
 Das Hard-Handback-Memo nutzt lokal die vollständige öffentliche URL inklusive Query.
 Die CloudFront-Query-Cache-Key-Policy entscheidet zusätzlich, ob Varianten überhaupt
@@ -533,7 +550,13 @@ instanziiert und verwendet keinen JSON-LD-Cache.
 - Gleichzeitige Lookups für denselben Cache, dieselbe normalisierte URL und denselben
   Lookup-Modus werden per Single-flight zusammengeführt.
 - Cache-Schreibvorgänge derselben URL werden innerhalb einer Execution Environment
-  serialisiert. Eine prozessübergreifende CAS-Garantie benötigt ein entsprechend
+  serialisiert. Ein erfolgreiches neues `200` oder eine erfolgreiche
+  `304`-/`412`-Revalidierung gewinnt gegen einen reinen Retry-Memo. Ein erfolgreiches
+  GET-`404` darf stale positive Daten entfernen, übernimmt dabei aber die längste
+  parallele `retryNotBefore`-Deadline. Treffen nur transiente Ergebnisse zusammen,
+  bleiben stale positive Daten und die längste Deadline erhalten. Ein wirklich
+  neuer positiver Eintrag wird nie von einem älteren Negativ-/Fehlerergebnis
+  überschrieben. Eine prozessübergreifende CAS-Garantie benötigt ein entsprechend
   starkes verteiltes Backend.
 
 ### ETag-Revalidierung
@@ -568,11 +591,17 @@ Die bereits vorhandene Laufzeit wird in dieser Reihenfolge ermittelt:
 5. Ohne explizite Origin-Laufzeit nur die optionale Betreiberzusicherung
    `assertedDefaultTtlSeconds`.
 
-Der Parser trennt Direktiven quote-aware, sodass Kommas in einem gültigen
-`quoted-string` keine erfundenen `s-maxage`-Werte erzeugen. Doppelte, syntaktisch
-mehrdeutige oder fehlerhafte Freshness-Direktiven sowie nicht strikt als modernes
+Der Parser validiert jede Feldinstanz separat und trennt Direktiven quote-aware,
+sodass weder Kommas in einem gültigen `quoted-string` noch zwei einzeln malformed
+Quotes erfundene `s-maxage`-Werte erzeugen. Eine syntaktisch uneindeutige
+`Cache-Control`-Feldmenge bleibt im Produktionspfad vollständig unverändert.
+Doppelte, aber einzeln parsebare Freshness-Direktiven sowie nicht strikt als modernes
 HTTP-Datum lesbare `Expires`-/`Date`-Werte werden konservativ als bereits stale (`0`)
-behandelt.
+behandelt. Im Legacy-Origin-Response-Modus werden Direktiven-Namen für die
+Stabilitätsprüfung case-insensitiv, Extension-Werte dagegen byte- und case-sensitiv
+verglichen; doppelte Direktiven-Namen sind mehrdeutig und damit ein Veto.
+Proprietäre `X-Robots-Tag`-Argumente bleiben einschließlich Case und
+Nicht-HTTP-Whitespace byte-stabil.
 
 Wenn sicher verkürzt werden kann, schreibt der Connector:
 
@@ -675,7 +704,9 @@ Sein Ablauf unterscheidet sich grundlegend:
 3. Nur bei geeignetem `200 text/html` wird der JSON-LD-Cache beziehungsweise
    Enhancely betrachtet.
 4. Nur wenn ein Snippet vorhanden ist, holt der Handler den Origin noch einmal mit
-   `Accept-Encoding: identity`: **Origin Nr. 2**.
+   `Accept-Encoding: identity`: **Origin Nr. 2**. Dabei werden die ursprünglichen
+   Request-Header und die statischen Custom-Origin-Header wiedergegeben; wie bei
+   CloudFront haben statische Custom-Origin-Header bei Namensgleichheit Vorrang.
 5. Erst dann kann injiziert werden; Metadaten beider Antworten müssen konsistent sein.
 
 Damit ist dieser Modus eine bewusste Ausnahme vom Body-/Head-Beweis vor dem
@@ -734,6 +765,14 @@ Upstream- und Seiten-Cache-Fähigkeiten unterscheiden sich jedoch.
 - Logischer Core-Cache-Key und an Enhancely gesendete URL sind bytegleich.
 - Queries und Fragmente verlassen den Connector nicht in Richtung Enhancely.
 - Injektion erfolgt nur bei exaktem Status `200` und exaktem Medientyp `text/html`.
+- Jede Header-Feldinstanz wird vor einer Listenaggregation separat auf balancierte
+  HTTP-Quotes geprüft. `Content-Type` muss genau einmal vorkommen; Unicode-Whitespace
+  gilt nicht als HTTP-OWS. Mehrdeutige `Cache-Control`-Felder werden weder transformiert
+  noch durch eine neue Shared-Cache-Policy ersetzt.
+- Cloudflare Fetch stellt keine rohen Feldinstanzgrenzen bereit. Deshalb gilt dort
+  jedes Komma innerhalb eines gequoteten Gate-Werts konservativ als mehrdeutig; auch
+  ein legitimer quoted comma führt nur zu Unterinjektion und kann keine während des
+  Foldings „geheilten“ malformed Instanzen durchlassen.
 - Im Lambda@Edge-Aufbau verhindert ein vorhandener `X-Enhancely-Injected`-Marker eine
   doppelte Injektion. Der empfohlene Origin-Request-Injector stempelt ihn nach der
   Injektion; Companion und Lambda-Injector-Gates respektieren ihn.

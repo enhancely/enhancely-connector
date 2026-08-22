@@ -134,9 +134,9 @@ describe('registerOrRevalidate — status map', () => {
     ],
     [
       new Response('hard cap', { status: 403, headers: { 'Retry-After': '86400' } }),
-      { status: 'rate-limited', retryAfterSeconds: 86400 },
+      { status: 'registration-limited', retryAfterSeconds: 86400 },
     ],
-    // Hint-less 403 (unvalidated-domain limit sends no Retry-After): a durable
+    // 403 without Retry-After (unvalidated-domain limit): a durable
     // operator-state — must rest a full TTL, never enter the 10 s error loop.
     [
       new Response('domain not validated', { status: 403 }),
@@ -341,7 +341,7 @@ describe('getJsonLdRegisterLookup — single-POST register economy', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it('a hint-less 403 rests a full TTL instead of the 10 s error loop', async () => {
+  it('a 403 without Retry-After rests a full TTL instead of the 10 s error loop', async () => {
     const { config, fetchImpl } = withMockFetch([
       new Response('domain not validated', { status: 403 }),
     ]);

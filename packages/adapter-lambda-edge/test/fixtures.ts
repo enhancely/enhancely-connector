@@ -10,10 +10,13 @@ import type {
 import { handler } from '../src/index.js';
 
 /** Build CloudFront's header map (lowercase keys, array-of-values shape). */
-export function cfHeaders(headers: Record<string, string>): CloudFrontHeaders {
+export function cfHeaders(headers: Record<string, string | string[]>): CloudFrontHeaders {
   const out: CloudFrontHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
-    out[name.toLowerCase()] = [{ key: name, value }];
+    out[name.toLowerCase()] = (Array.isArray(value) ? value : [value]).map((entry) => ({
+      key: name,
+      value: entry,
+    }));
   }
   return out;
 }
@@ -27,7 +30,7 @@ export interface EventOptions {
   /** Extra request headers (cookie, authorization, …) on the origin request. */
   requestHeaders?: Record<string, string>;
   status?: string;
-  responseHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string | string[]>;
   originProtocol?: 'http' | 'https';
   originDomain?: string;
   originPort?: number;

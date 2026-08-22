@@ -185,6 +185,30 @@ beforeAll(async () => {
       res.end(PAGE_HTML);
       return;
     }
+    if (path === '/cache-control-quoted-collision') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'foo="a,y", no-cache="x,b"',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/cache-control-case-value') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'foo="variant-a", max-age=17',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/cache-control-duplicate-order') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'max-age=600, max-age=0',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
     if (path === '/expires') {
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
@@ -277,6 +301,36 @@ beforeAll(async () => {
         'content-type': 'text/html; charset=utf-8',
         'x-robots-tag': 'unavailable_after: 25 Jun 2027 15:00:00 PST',
       });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/robots-refetch-extension-case') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': 'x-proprietary: Variant-A',
+      });
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/conflicting-content-type') {
+      res.writeHead(200, [
+        'Content-Type',
+        'text/html; charset=utf-8',
+        'Content-Type',
+        'application/json',
+      ]);
+      res.end(PAGE_HTML);
+      return;
+    }
+    if (path === '/conflicting-content-disposition') {
+      res.writeHead(200, [
+        'Content-Type',
+        'text/html; charset=utf-8',
+        'Content-Disposition',
+        'inline',
+        'Content-Disposition',
+        'attachment; filename="page.html"',
+      ]);
       res.end(PAGE_HTML);
       return;
     }
@@ -388,6 +442,17 @@ describe('handler — happy path', () => {
     // …while the origin re-fetch keeps the origin-facing Host header.
     expect(lastHostHeader).toBe('127.0.0.1');
     expect(result?.body).toContain('application/ld+json');
+  });
+
+  it('replays static origin custom headers with CloudFront precedence', async () => {
+    const event = eventFor('/page', {
+      requestHeaders: { 'x-origin-secret': 'viewer-value' },
+      originCustomHeaders: { 'x-origin-secret': 'configured-value' },
+    });
+    const result = await invoke(event);
+
+    expect(result?.body).toContain('application/ld+json');
+    expect(lastRequestHeaders['x-origin-secret']).toBe('configured-value');
   });
 
   it('serves the second hit for the same URL from the core cache', async () => {
@@ -521,6 +586,28 @@ describe('handler — Content-Encoding on the FIRST response (gzip fix)', () => 
     const result = await invoke(event);
 
     expect(enhancelyFetch).toHaveBeenCalledTimes(1); // snippet fetched → re-fetch reached
+    expect(originHits).toBe(1);
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+});
+
+describe('handler — repeated representation headers', () => {
+  it('fails open when the identity re-fetch returns conflicting Content-Type instances', async () => {
+    const event = eventFor('/conflicting-content-type');
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+    expect(originHits).toBe(1);
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('fails open when any identity re-fetch Content-Disposition is non-inline', async () => {
+    const event = eventFor('/conflicting-content-disposition');
+    const result = await invoke(event);
+
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(1);
     expect(result).toBe(event.Records[0]?.cf.response);
     expect(result?.body).toBeUndefined();
@@ -696,6 +783,45 @@ describe('handler — representation headers follow the re-fetch body', () => {
     });
   });
 
+  it('does not normalize different quoted-comma Cache-Control policies as equal', async () => {
+    const event = eventFor('/cache-control-quoted-collision', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'foo="a,b", no-cache="x,y"',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('keeps Cache-Control extension values case-sensitive during stability checks', async () => {
+    const event = eventFor('/cache-control-case-value', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'FOO="Variant-A", MAX-AGE=17',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('fails open instead of sorting ambiguous duplicate Cache-Control directives', async () => {
+    const event = eventFor('/cache-control-duplicate-order', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'max-age=0, max-age=600',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
   it('retains and copies a stable Cache-Control policy for the generated body', async () => {
     const event = eventFor('/cache-control', {
       responseHeaders: {
@@ -776,6 +902,10 @@ describe('handler — gating pass-through (original response, no origin contact)
     ['non-GET request', { method: 'POST' as const }],
     ['non-200 status', { status: '404' }],
     ['non-HTML content type', { responseHeaders: { 'content-type': 'application/json' } }],
+    [
+      'conflicting Content-Type header instances',
+      { responseHeaders: { 'content-type': ['text/html; charset=utf-8', 'application/json'] } },
+    ],
     [
       'non-UTF-8 charset on the CloudFront response',
       { responseHeaders: { 'content-type': 'text/html; charset=iso-8859-1' } },
@@ -1421,6 +1551,32 @@ describe('handler — retryable pass-through cache policy', () => {
 
     expect(result?.body).toContain(SNIPPET);
     expect(originHits).toBe(1);
+  });
+
+  it('keeps proprietary X-Robots-Tag arguments case-sensitive', async () => {
+    const event = eventFor('/robots-refetch-extension-case', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': 'x-proprietary: variant-a',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
+  });
+
+  it('does not normalize Unicode whitespace in proprietary robots metadata', async () => {
+    const event = eventFor('/robots-refetch-extension-case', {
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': '\u00a0x-proprietary: Variant-A\u00a0',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.body).toBeUndefined();
   });
 
   it.each([

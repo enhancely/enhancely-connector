@@ -75,10 +75,75 @@ function defineConfig(input) {
 // ../injector-core/dist/cache.js
 var DEFAULT_MEMORY_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
+// ../injector-core/dist/header-value.js
+function splitHttpQuotedValue(value, delimiter) {
+  const parts = [];
+  let start = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quoted) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        quoted = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+    } else if (char === delimiter) {
+      parts.push(value.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(value.slice(start));
+  return { parts, balanced: !quoted };
+}
+function trimHttpOws(value) {
+  return value.replace(/^[\t ]+|[\t ]+$/g, "");
+}
+function splitOutsideHttpQuotes(value, delimiter) {
+  return splitHttpQuotedValue(value, delimiter).parts;
+}
+function splitOutsideHttpQuotesStrict(value, delimiter) {
+  const parsed = splitHttpQuotedValue(value, delimiter);
+  return parsed.balanced ? parsed.parts : null;
+}
+
 // ../injector-core/dist/encoding.js
 function charsetOf(contentType) {
-  const match = /;\s*charset\s*=\s*"?([\w-]+)"?/i.exec(contentType);
-  return match?.[1]?.toLowerCase() ?? null;
+  const parameters = splitOutsideHttpQuotes(contentType, ";");
+  for (let index = 1; index < parameters.length; index += 1) {
+    const parameter = parameters[index] ?? "";
+    const equalsAt = parameter.indexOf("=");
+    if (equalsAt < 0 || trimHttpOws(parameter.slice(0, equalsAt)).toLowerCase() !== "charset") {
+      continue;
+    }
+    const raw = trimHttpOws(parameter.slice(equalsAt + 1));
+    if (!raw.startsWith('"'))
+      return raw.toLowerCase();
+    let value = "";
+    let escaped = false;
+    for (let cursor = 1; cursor < raw.length; cursor += 1) {
+      const char = raw[cursor];
+      if (escaped) {
+        value += char;
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        return trimHttpOws(raw.slice(cursor + 1)) === "" ? value.toLowerCase() : null;
+      } else {
+        value += char;
+      }
+    }
+    return null;
+  }
+  return null;
 }
 
 // ../injector-core/dist/exclude.js
@@ -149,13 +214,122 @@ function matchesExcludedPath(patterns, pathname) {
 }
 
 // ../injector-core/dist/robots.js
+var VALUE_BEARING_ROBOTS_DIRECTIVES = /* @__PURE__ */ new Set([
+  "max-image-preview",
+  "max-snippet",
+  "max-video-preview",
+  "unavailable_after"
+]);
 function blocksIndexing(xRobotsTag) {
-  return xRobotsTag !== null && xRobotsTag !== void 0 && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag);
+  if (xRobotsTag === null || xRobotsTag === void 0)
+    return false;
+  return xRobotsTag.split(",").some((rawClause) => {
+    const clause = rawClause.trim();
+    if (clause === "")
+      return false;
+    if (/(?:^|[\s:;])noindex(?=$|[\s:;])/i.test(clause))
+      return true;
+    const nonePattern = /(?:^|[\s:;])(none)(?=$|[\s;])/gi;
+    for (const match of clause.matchAll(nonePattern)) {
+      const noneAt = (match.index ?? 0) + match[0].length - (match[1]?.length ?? 0);
+      let cursor = noneAt - 1;
+      while (cursor >= 0 && /[\t\n\f\r ]/.test(clause[cursor] ?? ""))
+        cursor -= 1;
+      if (clause[cursor] !== ":")
+        return true;
+      cursor -= 1;
+      while (cursor >= 0 && /[\t\n\f\r ]/.test(clause[cursor] ?? ""))
+        cursor -= 1;
+      const keyEnd = cursor + 1;
+      while (cursor >= 0 && /[A-Za-z0-9_-]/.test(clause[cursor] ?? ""))
+        cursor -= 1;
+      const key = clause.slice(cursor + 1, keyEnd).toLowerCase();
+      if (!VALUE_BEARING_ROBOTS_DIRECTIVES.has(key))
+        return true;
+    }
+    return false;
+  });
 }
 
 // ../injector-core/dist/representation.js
+function fieldInstances(value) {
+  if (value === null || value === void 0)
+    return [];
+  return typeof value === "string" ? [value] : value;
+}
+function isHtmlMediaType(value) {
+  const instances = fieldInstances(value);
+  if (instances.length !== 1)
+    return false;
+  const fieldValues = splitOutsideHttpQuotesStrict(instances[0] ?? "", ",");
+  if (fieldValues === null || fieldValues.length !== 1)
+    return false;
+  const parameters = splitOutsideHttpQuotesStrict(fieldValues[0] ?? "", ";");
+  return parameters !== null && trimHttpOws(parameters[0] ?? "").toLowerCase() === "text/html";
+}
+var HTTP_TOKEN_AT_START = /^[\t ]*([!#$%&'*+\-.^_`|~0-9A-Za-z]+)/;
+var COMPLETE_HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+function leadingHttpToken(value) {
+  return HTTP_TOKEN_AT_START.exec(value)?.[1]?.toLowerCase() ?? null;
+}
+function instanceHasNoTransformDirective(value) {
+  if (splitOutsideHttpQuotesStrict(value, ",") === null)
+    return true;
+  let quoted = false;
+  let escaped = false;
+  let start = 0;
+  const inspect = (end) => {
+    let tokenStart = start;
+    while (tokenStart < end && /^[\t\n\f\r ]$/.test(value[tokenStart] ?? ""))
+      tokenStart += 1;
+    if (tokenStart >= end)
+      return false;
+    let previous = tokenStart - 1;
+    while (previous >= 0 && /^[\t\n\f\r ]$/.test(value[previous] ?? ""))
+      previous -= 1;
+    if (value[previous] === "=")
+      return false;
+    return leadingHttpToken(value.slice(tokenStart, end)) === "no-transform";
+  };
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] ?? "";
+    if (quoted) {
+      if (escaped)
+        escaped = false;
+      else if (char === "\\")
+        escaped = true;
+      else if (char === '"')
+        quoted = false;
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+      continue;
+    }
+    if (char === "," || char === ";" || /^[\t\n\f\r ]$/.test(char)) {
+      if (inspect(index))
+        return true;
+      start = index + 1;
+    }
+  }
+  return inspect(value.length);
+}
+function hasNoTransformDirective(value) {
+  return fieldInstances(value).some(instanceHasNoTransformDirective);
+}
 function isAttachmentDisposition(value) {
-  return /(?:^|,)\s*attachment(?:\s*;|\s*(?:,|$))/i.test(value ?? "");
+  return fieldInstances(value).some((instance) => {
+    const members = splitOutsideHttpQuotesStrict(instance, ",");
+    if (members === null)
+      return true;
+    return members.some((member) => {
+      const parameters = splitOutsideHttpQuotesStrict(member, ";");
+      if (parameters === null)
+        return true;
+      const disposition = trimHttpOws(parameters[0] ?? "");
+      return COMPLETE_HTTP_TOKEN.test(disposition) && disposition.toLowerCase() !== "inline";
+    });
+  });
 }
 
 // src/shared.ts
@@ -178,20 +352,20 @@ function serializedHeaderBytes(headers, status = "200", statusDescription = "OK"
   return total;
 }
 var PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
-var NO_TRANSFORM_CACHE_CONTROL = /(?:^|[\s,])no-transform(?:$|[\s,=])/i;
 function hasPerRequestCacheControl(cacheControl) {
-  return cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(cacheControl);
+  if (cacheControl === null || cacheControl === void 0) return false;
+  const instances = typeof cacheControl === "string" ? [cacheControl] : cacheControl;
+  return instances.some((value) => PER_REQUEST_CACHE_CONTROL.test(value));
 }
 var INJECTED_MARKER_HEADER = "x-enhancely-injected";
 function isInjectableRepresentation(input) {
   if (input.method !== "GET") return false;
   if (input.status !== "200") return false;
-  const contentType = input.contentType ?? "";
-  const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase();
-  if (mediaType !== "text/html") return false;
+  if (!isHtmlMediaType(input.contentType)) return false;
+  const contentType = typeof input.contentType === "string" ? input.contentType : input.contentType?.[0] ?? "";
   const charset = charsetOf(contentType);
   if (charset !== null && !UTF8_COMPATIBLE_CHARSETS.has(charset)) return false;
-  if (NO_TRANSFORM_CACHE_CONTROL.test(input.cacheControl ?? "")) return false;
+  if (hasNoTransformDirective(input.cacheControl)) return false;
   if (isAttachmentDisposition(input.contentDisposition)) return false;
   return true;
 }
@@ -221,13 +395,13 @@ function buildOriginUrl(request) {
 function headerValue(headers, name) {
   return headers[name]?.[0]?.value ?? null;
 }
-function cacheControlValue(headers) {
-  const entries = headers["cache-control"];
-  return entries === void 0 ? null : entries.map((entry) => entry.value).join(", ");
-}
 function combinedHeaderValue(headers, name) {
   const entries = headers[name];
   return entries === void 0 ? null : entries.map((entry) => entry.value).join(", ");
+}
+function headerValues(headers, name) {
+  const entries = headers[name];
+  return entries === void 0 ? null : entries.map((entry) => entry.value);
 }
 
 // src/cache-cap.ts
@@ -291,6 +465,17 @@ function parseCacheControl(policy) {
   }
   return parsed;
 }
+function parseCacheControlFields(headers) {
+  const entries = headers["cache-control"];
+  if (entries === void 0) return void 0;
+  const directives = [];
+  for (const entry of entries) {
+    const parsed = parseCacheControl(entry.value);
+    if (parsed === null) return null;
+    directives.push(...parsed);
+  }
+  return directives;
+}
 function parseCacheDirective(directives, wanted) {
   if (directives === null) return { state: "invalid" };
   let matchedValue = null;
@@ -330,10 +515,9 @@ function strictHttpDate(value) {
 }
 function retrySharedTtlSeconds(headers, revalidateInMs, assertedDefaultTtlSeconds) {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
-  const policy = cacheControlValue(headers);
-  if (policy !== null) {
-    const directives = parseCacheControl(policy);
-    if (directives === null) return 0;
+  const directives = parseCacheControlFields(headers);
+  if (directives === null) return 0;
+  if (directives !== void 0) {
     if (directives.some((directive) => directive.name === "no-cache")) {
       return 0;
     }
@@ -372,7 +556,10 @@ function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, 
     return response;
   }
   const originalHeaders = response.headers ?? {};
-  if (hasPerRequestCacheControl(cacheControlValue(originalHeaders))) {
+  if (parseCacheControlFields(originalHeaders) === null) {
+    return response;
+  }
+  if (hasPerRequestCacheControl(headerValues(originalHeaders, "cache-control"))) {
     return response;
   }
   if (originalHeaders["set-cookie"] !== void 0 && !opts.capSetCookieResponses) {
@@ -618,10 +805,10 @@ var handler = async (event) => {
     const input = {
       method: request.method,
       status: response.status,
-      contentType: headerValue(response.headers, "content-type"),
+      contentType: headerValues(response.headers, "content-type"),
       contentEncoding: null,
-      cacheControl: cacheControlValue(response.headers),
-      contentDisposition: combinedHeaderValue(response.headers, "content-disposition"),
+      cacheControl: headerValues(response.headers, "cache-control"),
+      contentDisposition: headerValues(response.headers, "content-disposition"),
       hasSetCookie: response.headers["set-cookie"] !== void 0
     };
     if (!shouldAttemptGeneratedResponse(input)) return response;

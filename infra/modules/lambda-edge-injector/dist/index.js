@@ -397,13 +397,18 @@ async function registerOrRevalidate(config, pageUrl, etag) {
     cancelResponseBody(response, "rejected");
     return { status: "terminal-negative", reason: "rejected" };
   }
-  if (response.status === 429 || response.status === 403) {
+  if (response.status === 429) {
     const retryAfterSeconds = rateLimitBackoffSeconds(response);
     cancelResponseBody(response, "rate-limited");
-    if (response.status === 403 && retryAfterSeconds === null) {
+    return { status: "rate-limited", retryAfterSeconds };
+  }
+  if (response.status === 403) {
+    const retryAfterSeconds = parseRetryAfter(response.headers.get("retry-after"));
+    cancelResponseBody(response, "registration-limited");
+    if (retryAfterSeconds === null) {
       return { status: "terminal-negative", reason: "rejected" };
     }
-    return { status: "rate-limited", retryAfterSeconds };
+    return { status: "registration-limited", retryAfterSeconds };
   }
   if (response.status !== 200) {
     cancelResponseBody(response, `http-${response.status}`);
@@ -427,19 +432,123 @@ var NOSCRIPT_VOID_ELEMENTS = ["basefont", "bgsound", "link", "meta"];
 var NOSCRIPT_RAW_TEXT_ELEMENTS = ["style", "noframes"];
 var PLAINTEXT_ELEMENT = "plaintext";
 function endOfTag(html, start) {
-  let quote = "";
+  let state = "tag-name";
   for (let i = start + 1; i < html.length; i++) {
-    const c = html[i];
-    if (quote !== "") {
-      if (c === quote)
-        quote = "";
-    } else if (c === '"' || c === "'") {
-      quote = c;
-    } else if (c === ">") {
-      return i + 1;
+    const char = html[i] ?? "";
+    const whitespace = /[\t\n\f\r ]/.test(char);
+    switch (state) {
+      case "tag-name":
+        if (whitespace)
+          state = "before-attribute-name";
+        else if (char === "/")
+          state = "self-closing-start-tag";
+        else if (char === ">")
+          return i + 1;
+        break;
+      case "before-attribute-name":
+        if (whitespace)
+          break;
+        if (char === "/")
+          state = "self-closing-start-tag";
+        else if (char === ">")
+          return i + 1;
+        else
+          state = "attribute-name";
+        break;
+      case "attribute-name":
+        if (whitespace)
+          state = "after-attribute-name";
+        else if (char === "/")
+          state = "self-closing-start-tag";
+        else if (char === "=")
+          state = "before-attribute-value";
+        else if (char === ">")
+          return i + 1;
+        break;
+      case "after-attribute-name":
+        if (whitespace)
+          break;
+        if (char === "/")
+          state = "self-closing-start-tag";
+        else if (char === "=")
+          state = "before-attribute-value";
+        else if (char === ">")
+          return i + 1;
+        else
+          state = "attribute-name";
+        break;
+      case "before-attribute-value":
+        if (whitespace)
+          break;
+        if (char === '"')
+          state = "attribute-value-double";
+        else if (char === "'")
+          state = "attribute-value-single";
+        else if (char === ">")
+          return i + 1;
+        else
+          state = "attribute-value-unquoted";
+        break;
+      case "attribute-value-double":
+        if (char === '"')
+          state = "after-attribute-value-quoted";
+        break;
+      case "attribute-value-single":
+        if (char === "'")
+          state = "after-attribute-value-quoted";
+        break;
+      case "attribute-value-unquoted":
+        if (whitespace)
+          state = "before-attribute-name";
+        else if (char === ">")
+          return i + 1;
+        break;
+      case "after-attribute-value-quoted":
+        if (whitespace)
+          state = "before-attribute-name";
+        else if (char === "/")
+          state = "self-closing-start-tag";
+        else if (char === ">")
+          return i + 1;
+        else {
+          state = "before-attribute-name";
+          i -= 1;
+        }
+        break;
+      case "self-closing-start-tag":
+        if (char === ">")
+          return i + 1;
+        state = "before-attribute-name";
+        i -= 1;
+        break;
     }
   }
   return -1;
+}
+function endOfComment(html, start) {
+  if (html.startsWith("<!-->", start))
+    return start + 5;
+  if (html.startsWith("<!--->", start))
+    return start + 6;
+  for (let index = start + 4; index < html.length - 1; index += 1) {
+    if (html[index] !== "-" || html[index + 1] !== "-")
+      continue;
+    if (html[index + 2] === ">")
+      return index + 3;
+    if (html[index + 2] === "!" && html[index + 3] === ">")
+      return index + 4;
+  }
+  return -1;
+}
+function startsDoctype(html, start) {
+  return html.slice(start, start + "<!doctype".length).replace(/[A-Z]/g, (char) => char.toLowerCase()) === "<!doctype";
+}
+function endOfStructuralToken(html, start) {
+  if (startsDoctype(html, start)) {
+    const end = html.indexOf(">", start + 2);
+    return end < 0 ? -1 : end + 1;
+  }
+  return endOfTag(html, start);
 }
 function endOfRawTextElement(html, lower, tag, start) {
   const needle = `</${tag}`;
@@ -448,22 +557,24 @@ function endOfRawTextElement(html, lower, tag, start) {
     const close = lower.indexOf(needle, from);
     if (close < 0)
       return -1;
+    const after = html[close + needle.length];
+    if (after === void 0 || !/[\t\n\f\r />]/.test(after)) {
+      from = close + needle.length;
+      continue;
+    }
     if (tag === "script") {
-      const escaped = lower.indexOf("<!--", start);
-      if (escaped >= 0 && escaped < close) {
-        let nested = lower.indexOf("<script", escaped + 4);
-        while (nested >= 0 && nested < close) {
-          if (startsElement(lower, nested, "script"))
+      const rawTextSpan = lower.slice(start, close);
+      const escaped = rawTextSpan.indexOf("<!--");
+      if (escaped >= 0) {
+        let nested = rawTextSpan.indexOf("<script", escaped + 4);
+        while (nested >= 0) {
+          if (startsElement(rawTextSpan, nested, "script"))
             return -1;
-          nested = lower.indexOf("<script", nested + 7);
+          nested = rawTextSpan.indexOf("<script", nested + 7);
         }
       }
     }
-    const after = html[close + needle.length];
-    if (after !== void 0 && /[\t\n\f\r />]/.test(after)) {
-      return endOfTag(html, close);
-    }
-    from = close + needle.length;
+    return endOfTag(html, close);
   }
   return -1;
 }
@@ -503,13 +614,13 @@ function endOfSafeHeadNoscript(html, lower, contentStart) {
     if (textEnd === close)
       return closeEnd;
     if (lower.startsWith("<!--", lt)) {
-      const commentEnd = html.indexOf("-->", lt + 4);
-      if (commentEnd < 0 || commentEnd + 3 > close)
+      const commentEnd = endOfComment(html, lt);
+      if (commentEnd < 0 || commentEnd > close)
         return -1;
-      i = commentEnd + 3;
+      i = commentEnd;
       continue;
     }
-    const tagEnd = endOfTag(html, lt);
+    const tagEnd = endOfStructuralToken(html, lt);
     if (tagEnd < 0 || tagEnd > close)
       return -1;
     const endTagName = plainEndTagName(lower, lt, tagEnd);
@@ -519,7 +630,7 @@ function endOfSafeHeadNoscript(html, lower, contentStart) {
       i = tagEnd;
       continue;
     }
-    if (/^<!doctype(?:[\t\n\f\r >])/i.test(html.slice(lt, tagEnd))) {
+    if (startsDoctype(html, lt)) {
       i = tagEnd;
       continue;
     }
@@ -554,13 +665,13 @@ function findHeadInjectionPoint(html) {
     if (/[^\t\n\f\r ]/.test(structuralText))
       return null;
     if (lower.startsWith("<!--", lt)) {
-      const end = html.indexOf("-->", lt + 4);
+      const end = endOfComment(html, lt);
       if (end < 0)
         return null;
-      i = end + 3;
+      i = end;
       continue;
     }
-    const tagEnd = endOfTag(html, lt);
+    const tagEnd = endOfStructuralToken(html, lt);
     if (tagEnd < 0)
       return null;
     const endTagName = plainEndTagName(lower, lt, tagEnd);
@@ -591,7 +702,7 @@ function findHeadInjectionPoint(html) {
         i = tagEnd;
         continue;
       }
-      if (/^<!doctype(?:[\t\n\f\r >])/i.test(html.slice(lt, tagEnd))) {
+      if (startsDoctype(html, lt)) {
         if (sawBodyOpen)
           return null;
         i = tagEnd;
@@ -651,10 +762,75 @@ function injectIntoHead(html, snippet, injectionPoint = findHeadInjectionPoint(h
   return html.slice(0, index) + snippet + html.slice(index);
 }
 
+// ../injector-core/dist/header-value.js
+function splitHttpQuotedValue(value, delimiter) {
+  const parts = [];
+  let start = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quoted) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        quoted = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+    } else if (char === delimiter) {
+      parts.push(value.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(value.slice(start));
+  return { parts, balanced: !quoted };
+}
+function trimHttpOws(value) {
+  return value.replace(/^[\t ]+|[\t ]+$/g, "");
+}
+function splitOutsideHttpQuotes(value, delimiter) {
+  return splitHttpQuotedValue(value, delimiter).parts;
+}
+function splitOutsideHttpQuotesStrict(value, delimiter) {
+  const parsed = splitHttpQuotedValue(value, delimiter);
+  return parsed.balanced ? parsed.parts : null;
+}
+
 // ../injector-core/dist/encoding.js
 function charsetOf(contentType) {
-  const match = /;\s*charset\s*=\s*"?([\w-]+)"?/i.exec(contentType);
-  return match?.[1]?.toLowerCase() ?? null;
+  const parameters = splitOutsideHttpQuotes(contentType, ";");
+  for (let index = 1; index < parameters.length; index += 1) {
+    const parameter = parameters[index] ?? "";
+    const equalsAt = parameter.indexOf("=");
+    if (equalsAt < 0 || trimHttpOws(parameter.slice(0, equalsAt)).toLowerCase() !== "charset") {
+      continue;
+    }
+    const raw = trimHttpOws(parameter.slice(equalsAt + 1));
+    if (!raw.startsWith('"'))
+      return raw.toLowerCase();
+    let value = "";
+    let escaped = false;
+    for (let cursor = 1; cursor < raw.length; cursor += 1) {
+      const char = raw[cursor];
+      if (escaped) {
+        value += char;
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        return trimHttpOws(raw.slice(cursor + 1)) === "" ? value.toLowerCase() : null;
+      } else {
+        value += char;
+      }
+    }
+    return null;
+  }
+  return null;
 }
 function containsOnlyAscii(body) {
   return body.every((byte) => byte <= 127);
@@ -669,28 +845,175 @@ function latin1Window(body) {
     value += String.fromCharCode(body[i] ?? 0);
   return value;
 }
-function declaresUtf8MetaInPrescan(body) {
-  let window = latin1Window(body);
-  window = window.replace(/<!--[\s\S]*?-->/g, " ");
-  const openComment = window.indexOf("<!--");
-  if (openComment !== -1)
-    window = window.slice(0, openComment);
-  const metaRe = /<meta\b([^>]*)>/gi;
-  const attrRe = /([^\s"'>/=]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]*))/g;
-  let tag;
-  while ((tag = metaRe.exec(window)) !== null) {
-    const attrs = /* @__PURE__ */ new Map();
-    attrRe.lastIndex = 0;
-    let attr;
-    while ((attr = attrRe.exec(tag[1] ?? "")) !== null) {
-      const name = attr[1]?.toLowerCase() ?? "";
-      if (!attrs.has(name))
-        attrs.set(name, attr[2] ?? attr[3] ?? attr[4] ?? "");
+function htmlTagAt(value, start) {
+  let nameStart = start + 1;
+  const isEnd = value[nameStart] === "/";
+  if (isEnd)
+    nameStart += 1;
+  const match = /^[A-Za-z][^\t\n\f\r />]*/.exec(value.slice(nameStart));
+  const originalName = match?.[0];
+  if (originalName === void 0)
+    return null;
+  return {
+    name: originalName.toLowerCase(),
+    isEnd,
+    attributesStart: nameStart + originalName.length
+  };
+}
+var ASCII_WHITESPACE = /[\t\n\f\r ]/;
+function asciiLowerChar(char) {
+  const code = char.charCodeAt(0);
+  return code >= 65 && code <= 90 ? String.fromCharCode(code + 32) : char;
+}
+function prescanAttributes(value, start) {
+  const attributes = /* @__PURE__ */ new Map();
+  let position = start;
+  while (true) {
+    while (position < value.length && (ASCII_WHITESPACE.test(value[position] ?? "") || value[position] === "/")) {
+      position += 1;
     }
-    const direct = attrs.get("charset");
-    const declared = direct !== void 0 ? direct.trim().toLowerCase() : attrs.get("http-equiv")?.trim().toLowerCase() === "content-type" ? charsetOf(attrs.get("content") ?? "") : null;
-    if (declared === "utf-8" || declared === "utf8")
-      return true;
+    if (position >= value.length)
+      return null;
+    if (value[position] === ">")
+      return { attributes, end: position + 1 };
+    let name = "";
+    let hasEquals = false;
+    while (position < value.length) {
+      const char = value[position] ?? "";
+      if (char === "=" && name !== "") {
+        hasEquals = true;
+        position += 1;
+        break;
+      }
+      if (ASCII_WHITESPACE.test(char)) {
+        while (position < value.length && ASCII_WHITESPACE.test(value[position] ?? "")) {
+          position += 1;
+        }
+        if (value[position] === "=") {
+          hasEquals = true;
+          position += 1;
+        }
+        break;
+      }
+      if (char === "/" || char === ">")
+        break;
+      name += asciiLowerChar(char);
+      position += 1;
+    }
+    if (!hasEquals) {
+      if (name !== "" && !attributes.has(name))
+        attributes.set(name, "");
+      if (value[position] === ">")
+        return { attributes, end: position + 1 };
+      continue;
+    }
+    while (position < value.length && ASCII_WHITESPACE.test(value[position] ?? "")) {
+      position += 1;
+    }
+    if (position >= value.length)
+      return null;
+    let attributeValue = "";
+    const quote = value[position];
+    if (quote === '"' || quote === "'") {
+      position += 1;
+      while (position < value.length && value[position] !== quote) {
+        attributeValue += asciiLowerChar(value[position] ?? "");
+        position += 1;
+      }
+      if (value[position] !== quote)
+        return null;
+      position += 1;
+    } else {
+      while (position < value.length && !ASCII_WHITESPACE.test(value[position] ?? "") && value[position] !== ">") {
+        attributeValue += asciiLowerChar(value[position] ?? "");
+        position += 1;
+      }
+    }
+    if (name !== "" && !attributes.has(name))
+      attributes.set(name, attributeValue);
+    if (value[position] === ">")
+      return { attributes, end: position + 1 };
+  }
+}
+function charsetFromMetaContent(content) {
+  const lower = content.toLowerCase();
+  let position = 0;
+  while (position < content.length) {
+    const match = lower.indexOf("charset", position);
+    if (match < 0)
+      return null;
+    position = match + "charset".length;
+    while (position < content.length && ASCII_WHITESPACE.test(content[position] ?? "")) {
+      position += 1;
+    }
+    if (content[position] !== "=")
+      continue;
+    position += 1;
+    while (position < content.length && ASCII_WHITESPACE.test(content[position] ?? "")) {
+      position += 1;
+    }
+    if (position >= content.length)
+      return null;
+    const quote = content[position];
+    if (quote === '"' || quote === "'") {
+      const end = content.indexOf(quote, position + 1);
+      return end < 0 ? null : content.slice(position + 1, end);
+    }
+    const start = position;
+    while (position < content.length && !ASCII_WHITESPACE.test(content[position] ?? "") && content[position] !== ";") {
+      position += 1;
+    }
+    return content.slice(start, position);
+  }
+  return null;
+}
+function isUtf8EncodingLabel(value) {
+  const normalized = (value ?? "").replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "").toLowerCase();
+  return normalized === "utf-8" || normalized === "utf8";
+}
+function declaresUtf8MetaInPrescan(body) {
+  const window = latin1Window(body);
+  let cursor = 0;
+  while (cursor < window.length) {
+    const start = window.indexOf("<", cursor);
+    if (start < 0)
+      return false;
+    if (window.startsWith("<!--", start)) {
+      const commentEnd = window.indexOf("-->", start + 2);
+      if (commentEnd < 0)
+        return false;
+      cursor = commentEnd + 3;
+      continue;
+    }
+    const tag = htmlTagAt(window, start);
+    if (tag === null) {
+      if (window.startsWith("<!", start) || window.startsWith("</", start) || window.startsWith("<?", start)) {
+        const end = window.indexOf(">", start + 2);
+        if (end < 0)
+          return false;
+        cursor = end + 1;
+      } else {
+        cursor = start + 1;
+      }
+      continue;
+    }
+    const parsed = prescanAttributes(window, tag.attributesStart);
+    if (parsed === null)
+      return false;
+    if (tag.isEnd) {
+      cursor = parsed.end;
+      continue;
+    }
+    if (tag.name === "meta") {
+      const attrs = parsed.attributes;
+      const direct = attrs.get("charset");
+      const declared = direct !== void 0 ? direct : attrs.get("http-equiv") === "content-type" ? charsetFromMetaContent(attrs.get("content") ?? "") : null;
+      if (declared !== null)
+        return isUtf8EncodingLabel(declared);
+      cursor = parsed.end;
+      continue;
+    }
+    cursor = parsed.end;
   }
   return false;
 }
@@ -781,13 +1104,122 @@ function matchesExcludedPath(patterns, pathname) {
 }
 
 // ../injector-core/dist/robots.js
+var VALUE_BEARING_ROBOTS_DIRECTIVES = /* @__PURE__ */ new Set([
+  "max-image-preview",
+  "max-snippet",
+  "max-video-preview",
+  "unavailable_after"
+]);
 function blocksIndexing(xRobotsTag) {
-  return xRobotsTag !== null && xRobotsTag !== void 0 && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag);
+  if (xRobotsTag === null || xRobotsTag === void 0)
+    return false;
+  return xRobotsTag.split(",").some((rawClause) => {
+    const clause = rawClause.trim();
+    if (clause === "")
+      return false;
+    if (/(?:^|[\s:;])noindex(?=$|[\s:;])/i.test(clause))
+      return true;
+    const nonePattern = /(?:^|[\s:;])(none)(?=$|[\s;])/gi;
+    for (const match of clause.matchAll(nonePattern)) {
+      const noneAt = (match.index ?? 0) + match[0].length - (match[1]?.length ?? 0);
+      let cursor = noneAt - 1;
+      while (cursor >= 0 && /[\t\n\f\r ]/.test(clause[cursor] ?? ""))
+        cursor -= 1;
+      if (clause[cursor] !== ":")
+        return true;
+      cursor -= 1;
+      while (cursor >= 0 && /[\t\n\f\r ]/.test(clause[cursor] ?? ""))
+        cursor -= 1;
+      const keyEnd = cursor + 1;
+      while (cursor >= 0 && /[A-Za-z0-9_-]/.test(clause[cursor] ?? ""))
+        cursor -= 1;
+      const key = clause.slice(cursor + 1, keyEnd).toLowerCase();
+      if (!VALUE_BEARING_ROBOTS_DIRECTIVES.has(key))
+        return true;
+    }
+    return false;
+  });
 }
 
 // ../injector-core/dist/representation.js
+function fieldInstances(value) {
+  if (value === null || value === void 0)
+    return [];
+  return typeof value === "string" ? [value] : value;
+}
+function isHtmlMediaType(value) {
+  const instances = fieldInstances(value);
+  if (instances.length !== 1)
+    return false;
+  const fieldValues = splitOutsideHttpQuotesStrict(instances[0] ?? "", ",");
+  if (fieldValues === null || fieldValues.length !== 1)
+    return false;
+  const parameters = splitOutsideHttpQuotesStrict(fieldValues[0] ?? "", ";");
+  return parameters !== null && trimHttpOws(parameters[0] ?? "").toLowerCase() === "text/html";
+}
+var HTTP_TOKEN_AT_START = /^[\t ]*([!#$%&'*+\-.^_`|~0-9A-Za-z]+)/;
+var COMPLETE_HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+function leadingHttpToken(value) {
+  return HTTP_TOKEN_AT_START.exec(value)?.[1]?.toLowerCase() ?? null;
+}
+function instanceHasNoTransformDirective(value) {
+  if (splitOutsideHttpQuotesStrict(value, ",") === null)
+    return true;
+  let quoted = false;
+  let escaped = false;
+  let start = 0;
+  const inspect = (end) => {
+    let tokenStart = start;
+    while (tokenStart < end && /^[\t\n\f\r ]$/.test(value[tokenStart] ?? ""))
+      tokenStart += 1;
+    if (tokenStart >= end)
+      return false;
+    let previous = tokenStart - 1;
+    while (previous >= 0 && /^[\t\n\f\r ]$/.test(value[previous] ?? ""))
+      previous -= 1;
+    if (value[previous] === "=")
+      return false;
+    return leadingHttpToken(value.slice(tokenStart, end)) === "no-transform";
+  };
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] ?? "";
+    if (quoted) {
+      if (escaped)
+        escaped = false;
+      else if (char === "\\")
+        escaped = true;
+      else if (char === '"')
+        quoted = false;
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+      continue;
+    }
+    if (char === "," || char === ";" || /^[\t\n\f\r ]$/.test(char)) {
+      if (inspect(index))
+        return true;
+      start = index + 1;
+    }
+  }
+  return inspect(value.length);
+}
+function hasNoTransformDirective(value) {
+  return fieldInstances(value).some(instanceHasNoTransformDirective);
+}
 function isAttachmentDisposition(value) {
-  return /(?:^|,)\s*attachment(?:\s*;|\s*(?:,|$))/i.test(value ?? "");
+  return fieldInstances(value).some((instance) => {
+    const members = splitOutsideHttpQuotesStrict(instance, ",");
+    if (members === null)
+      return true;
+    return members.some((member) => {
+      const parameters = splitOutsideHttpQuotesStrict(member, ";");
+      if (parameters === null)
+        return true;
+      const disposition = trimHttpOws(parameters[0] ?? "");
+      return COMPLETE_HTTP_TOKEN.test(disposition) && disposition.toLowerCase() !== "inline";
+    });
+  });
 }
 
 // ../injector-core/dist/rate-limit-circuit.js
@@ -922,14 +1354,66 @@ function sameCacheEntry(left, right) {
     return false;
   return left.jsonldRaw === right.jsonldRaw && left.etag === right.etag && left.storedAt === right.storedAt && left.registrationPending === right.registrationPending && left.retryNotBefore === right.retryNotBefore;
 }
+function sameCacheEntryIgnoringRetry(left, right) {
+  if (left === void 0 || right === void 0)
+    return false;
+  return left.jsonldRaw === right.jsonldRaw && left.etag === right.etag && left.storedAt === right.storedAt && left.registrationPending === right.registrationPending;
+}
 async function storeIfSnapshotUnchanged(cache2, key, snapshot, entry, preferPositive = false) {
   return withCacheWriteLock(cache2, key, async () => {
     const current = await cache2.get(key);
+    const isConcurrentRetryOnlyMemo = current !== void 0 && current.retryNotBefore !== void 0 && !sameCacheEntry(current, snapshot) && sameCacheEntryIgnoringRetry(current, snapshot);
+    if (isConcurrentRetryOnlyMemo) {
+      const resolved = entry.jsonldRaw === null ? {
+        ...entry,
+        retryNotBefore: Math.max(entry.retryNotBefore ?? 0, current.retryNotBefore ?? 0)
+      } : entry;
+      await cache2.set(key, resolved);
+      return resolved;
+    }
     if (current !== void 0 && !sameCacheEntry(current, snapshot) && !(preferPositive && entry.jsonldRaw !== null && current.jsonldRaw === null)) {
       return current;
     }
     await cache2.set(key, entry);
     return entry;
+  });
+}
+async function storeBackoffMemo(cache2, key, snapshot, memo) {
+  return withCacheWriteLock(cache2, key, async () => {
+    const current = await cache2.get(key);
+    if (sameCacheEntry(current, snapshot) || current === void 0) {
+      await cache2.set(key, memo);
+      return memo;
+    }
+    const isRetryOnlySnapshotMemo = current.retryNotBefore !== void 0 && sameCacheEntryIgnoringRetry(current, snapshot);
+    if (current.jsonldRaw !== null && !isRetryOnlySnapshotMemo)
+      return current;
+    const merged = {
+      ...current,
+      retryNotBefore: Math.max(current.retryNotBefore ?? 0, memo.retryNotBefore)
+    };
+    await cache2.set(key, merged);
+    return merged;
+  });
+}
+async function storeNotFoundMergingConcurrentBackoff(cache2, key, snapshot, entry) {
+  return withCacheWriteLock(cache2, key, async () => {
+    const current = await cache2.get(key);
+    if (sameCacheEntry(current, snapshot) || current === void 0) {
+      await cache2.set(key, entry);
+      return entry;
+    }
+    const isRetryOnlySnapshotMemo = current.retryNotBefore !== void 0 && sameCacheEntryIgnoringRetry(current, snapshot);
+    if (current.retryNotBefore === void 0 || current.jsonldRaw !== null && !isRetryOnlySnapshotMemo) {
+      return current;
+    }
+    const merged = {
+      ...entry,
+      ...current.registrationPending === true && { registrationPending: true },
+      retryNotBefore: Math.max(entry.retryNotBefore ?? 0, current.retryNotBefore)
+    };
+    await cache2.set(key, merged);
+    return merged;
   });
 }
 function localLookup(cached, cacheTtlMs) {
@@ -1041,13 +1525,14 @@ async function resolveLookup(url, cache2, config, call, opts) {
               });
               return lookupFromEntry(entry2, config.cacheTtlMs);
             }
-            if (registration.status === "rate-limited" || registration.status === "error" || registration.status === "not-modified") {
-              const backoffMs = registration.status === "rate-limited" && registration.retryAfterSeconds !== null ? Math.min(Math.max(registration.retryAfterSeconds, 1) * 1e3, MAX_REGISTER_BACKOFF_MS) : DEFAULT_RETRY_BACKOFF_MS;
-              const retryNotBefore = Date.now() + backoffMs;
+            if (registration.status === "rate-limited" || registration.status === "registration-limited" || registration.status === "error" || registration.status === "not-modified") {
+              const backoffMs = (registration.status === "rate-limited" || registration.status === "registration-limited") && registration.retryAfterSeconds !== null ? Math.min(Math.max(registration.retryAfterSeconds, 1) * 1e3, MAX_REGISTER_BACKOFF_MS) : DEFAULT_RETRY_BACKOFF_MS;
+              const now = Date.now();
+              const retryNotBefore = now + backoffMs;
               if (registration.status === "rate-limited") {
-                recordRateLimitDeadline(config, retryNotBefore);
+                recordRateLimitDeadline(config, now + Math.min(backoffMs, MAX_RETRY_BACKOFF_MS));
               }
-              const entry2 = await storeIfSnapshotUnchanged(cache2, key, cached, {
+              const entry2 = await storeBackoffMemo(cache2, key, cached, {
                 jsonldRaw: null,
                 etag: null,
                 storedAt: 0,
@@ -1056,7 +1541,7 @@ async function resolveLookup(url, cache2, config, call, opts) {
               return lookupFromEntry(entry2, config.cacheTtlMs);
             }
           }
-          const entry = await storeIfSnapshotUnchanged(cache2, key, cached, {
+          const entry = await storeNotFoundMergingConcurrentBackoff(cache2, key, cached, {
             jsonldRaw: null,
             etag: null,
             storedAt: Date.now(),
@@ -1064,12 +1549,14 @@ async function resolveLookup(url, cache2, config, call, opts) {
           });
           return lookupFromEntry(entry, config.cacheTtlMs);
         }
+        case "registration-limited":
         case "rate-limited":
         case "error": {
-          const backoffMs = result.status === "rate-limited" && result.retryAfterSeconds !== null ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1e3, opts.maxBackoffMs) : DEFAULT_RETRY_BACKOFF_MS;
-          const retryNotBefore = Date.now() + backoffMs;
+          const backoffMs = (result.status === "rate-limited" || result.status === "registration-limited") && result.retryAfterSeconds !== null ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1e3, opts.maxBackoffMs) : DEFAULT_RETRY_BACKOFF_MS;
+          const now = Date.now();
+          const retryNotBefore = now + backoffMs;
           if (result.status === "rate-limited") {
-            recordRateLimitDeadline(config, retryNotBefore);
+            recordRateLimitDeadline(config, now + Math.min(backoffMs, MAX_RETRY_BACKOFF_MS));
           }
           const memo = {
             jsonldRaw: cached?.jsonldRaw ?? null,
@@ -1080,14 +1567,7 @@ async function resolveLookup(url, cache2, config, call, opts) {
           };
           let served = memo;
           try {
-            served = await withCacheWriteLock(cache2, key, async () => {
-              const current = await cache2.get(key);
-              if (sameCacheEntry(current, cached)) {
-                await cache2.set(key, memo);
-                return memo;
-              }
-              return current ?? memo;
-            });
+            served = await storeBackoffMemo(cache2, key, cached, memo);
           } catch {
           }
           return lookupFromEntry(served, config.cacheTtlMs);
@@ -1355,10 +1835,6 @@ function isEndpointSetupFailure(error) {
   if (code === null) return false;
   return ENDPOINT_SETUP_ERROR_CODES.has(code) || code.startsWith("ERR_TLS_") || code.startsWith("ERR_SSL_") || code.startsWith("ERR_OSSL_") || code.startsWith("CERT_");
 }
-function combinedHeaderValue(value) {
-  if (Array.isArray(value)) return value.join(", ");
-  return value ?? null;
-}
 function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, maxHeaderBytes, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(originUrl);
@@ -1410,27 +1886,25 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, maxHeaderBy
       (response) => {
         transportReady = true;
         const status = response.statusCode ?? 0;
-        const contentType = response.headers["content-type"] ?? null;
-        const contentEncoding = response.headers["content-encoding"] ?? null;
-        const cacheControl = response.headers["cache-control"] ?? null;
-        const expires = response.headers["expires"] ?? null;
-        const contentDisposition = combinedHeaderValue(response.headers["content-disposition"]);
-        const hasSetCookie = response.headers["set-cookie"] !== void 0;
-        const csp = combinedHeaderValue(response.headers["content-security-policy"]);
-        const cspReportOnly = combinedHeaderValue(
-          response.headers["content-security-policy-report-only"]
-        );
-        const xRobotsTag = combinedHeaderValue(response.headers["x-robots-tag"]);
         const decodeHeaderValue = (raw) => {
           const utf8 = Buffer.from(raw, "latin1").toString("utf8");
           return Buffer.from(utf8, "utf8").toString("latin1") === raw ? utf8 : raw;
         };
         const allHeaders = {};
-        for (const [name, value] of Object.entries(response.headers)) {
-          if (value === void 0) continue;
-          const values = Array.isArray(value) ? value : [String(value)];
+        for (const [name, values] of Object.entries(response.headersDistinct)) {
+          if (values === void 0) continue;
           allHeaders[name.toLowerCase()] = values.map(decodeHeaderValue);
         }
+        const combinedHeader = (name) => allHeaders[name]?.join(", ") ?? null;
+        const contentType = combinedHeader("content-type");
+        const contentEncoding = combinedHeader("content-encoding");
+        const cacheControl = combinedHeader("cache-control");
+        const expires = combinedHeader("expires");
+        const contentDisposition = combinedHeader("content-disposition");
+        const hasSetCookie = allHeaders["set-cookie"] !== void 0;
+        const csp = combinedHeader("content-security-policy");
+        const cspReportOnly = combinedHeader("content-security-policy-report-only");
+        const xRobotsTag = combinedHeader("x-robots-tag");
         const chunks = [];
         let size = 0;
         let settled = false;
@@ -1525,20 +1999,20 @@ function serializedHeaderBytes(headers, status = "200", statusDescription = "OK"
   return total;
 }
 var PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
-var NO_TRANSFORM_CACHE_CONTROL = /(?:^|[\s,])no-transform(?:$|[\s,=])/i;
 function hasPerRequestCacheControl(cacheControl) {
-  return cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(cacheControl);
+  if (cacheControl === null || cacheControl === void 0) return false;
+  const instances = typeof cacheControl === "string" ? [cacheControl] : cacheControl;
+  return instances.some((value) => PER_REQUEST_CACHE_CONTROL.test(value));
 }
 var INJECTED_MARKER_HEADER = "x-enhancely-injected";
 function isInjectableRepresentation(input) {
   if (input.method !== "GET") return false;
   if (input.status !== "200") return false;
-  const contentType = input.contentType ?? "";
-  const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase();
-  if (mediaType !== "text/html") return false;
+  if (!isHtmlMediaType(input.contentType)) return false;
+  const contentType = typeof input.contentType === "string" ? input.contentType : input.contentType?.[0] ?? "";
   const charset = charsetOf(contentType);
   if (charset !== null && !UTF8_COMPATIBLE_CHARSETS.has(charset)) return false;
-  if (NO_TRANSFORM_CACHE_CONTROL.test(input.cacheControl ?? "")) return false;
+  if (hasNoTransformDirective(input.cacheControl)) return false;
   if (isAttachmentDisposition(input.contentDisposition)) return false;
   return true;
 }
@@ -1574,6 +2048,14 @@ function buildOriginUrl(request) {
   return url;
 }
 var PAGE_HOST_HEADER = "x-enhancely-page-host";
+function originCustomHeaders(request) {
+  const out = {};
+  for (const [name, entries] of Object.entries(request.origin?.custom?.customHeaders ?? {})) {
+    const value = entries?.[0]?.value;
+    if (value !== void 0) out[name.toLowerCase()] = value;
+  }
+  return out;
+}
 function customHeaderValue(request, name) {
   const value = request.origin?.custom?.customHeaders[name]?.[0]?.value ?? null;
   return value !== null && value !== "" ? value : null;
@@ -1581,13 +2063,13 @@ function customHeaderValue(request, name) {
 function headerValue(headers, name) {
   return headers[name]?.[0]?.value ?? null;
 }
-function cacheControlValue(headers) {
-  const entries = headers["cache-control"];
-  return entries === void 0 ? null : entries.map((entry) => entry.value).join(", ");
-}
-function combinedHeaderValue2(headers, name) {
+function combinedHeaderValue(headers, name) {
   const entries = headers[name];
   return entries === void 0 ? null : entries.map((entry) => entry.value).join(", ");
+}
+function headerValues(headers, name) {
+  const entries = headers[name];
+  return entries === void 0 ? null : entries.map((entry) => entry.value);
 }
 var NON_FORWARDED_REQUEST_HEADERS = /* @__PURE__ */ new Set([
   "host",
@@ -1681,6 +2163,17 @@ function parseCacheControl(policy) {
   }
   return parsed;
 }
+function parseCacheControlFields(headers) {
+  const entries = headers["cache-control"];
+  if (entries === void 0) return void 0;
+  const directives = [];
+  for (const entry of entries) {
+    const parsed = parseCacheControl(entry.value);
+    if (parsed === null) return null;
+    directives.push(...parsed);
+  }
+  return directives;
+}
 function parseCacheDirective(directives, wanted) {
   if (directives === null) return { state: "invalid" };
   let matchedValue = null;
@@ -1724,10 +2217,9 @@ function strictHttpDate(value) {
 }
 function retrySharedTtlSeconds(headers, revalidateInMs, assertedDefaultTtlSeconds) {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1e3));
-  const policy = cacheControlValue(headers);
-  if (policy !== null) {
-    const directives = parseCacheControl(policy);
-    if (directives === null) return 0;
+  const directives = parseCacheControlFields(headers);
+  if (directives === null) return 0;
+  if (directives !== void 0) {
     if (directives.some((directive) => directive.name === "no-cache")) {
       return 0;
     }
@@ -1766,7 +2258,10 @@ function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, 
     return response;
   }
   const originalHeaders = response.headers ?? {};
-  if (hasPerRequestCacheControl(cacheControlValue(originalHeaders))) {
+  if (parseCacheControlFields(originalHeaders) === null) {
+    return response;
+  }
+  if (hasPerRequestCacheControl(headerValues(originalHeaders, "cache-control"))) {
     return response;
   }
   if (originalHeaders["set-cookie"] !== void 0 && !opts.capSetCookieResponses) {
@@ -1797,11 +2292,32 @@ function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, 
 // src/index.ts
 function normalizedRobotsTag(xRobotsTag) {
   if (xRobotsTag === null) return null;
-  return xRobotsTag.split(",").map((directive) => directive.trim().replace(/\s+/g, " ").toLowerCase()).join(",");
+  return xRobotsTag.split(",").map((directive) => {
+    const trimmed = trimHttpOws(directive);
+    return /^[A-Za-z][A-Za-z0-9_-]*$/.test(trimmed) ? trimmed.toLowerCase() : trimmed;
+  }).join(",");
 }
 function normalizedCacheControl(policy) {
-  if (policy === null) return null;
-  return policy.split(",").map((directive) => directive.trim().toLowerCase()).sort().join(",");
+  if (policy === null || policy === void 0) return null;
+  const instances = typeof policy === "string" ? [policy] : policy;
+  const directives = [];
+  const names = /* @__PURE__ */ new Set();
+  for (const instance of instances) {
+    const parsed = splitOutsideHttpQuotesStrict(instance, ",");
+    if (parsed === null) return void 0;
+    for (const directive of parsed) {
+      const trimmed = trimHttpOws(directive);
+      if (trimmed === "") continue;
+      const equalsAt = trimmed.indexOf("=");
+      const name = (equalsAt < 0 ? trimmed : trimmed.slice(0, equalsAt)).toLowerCase();
+      if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name) || names.has(name)) {
+        return void 0;
+      }
+      names.add(name);
+      directives.push(equalsAt < 0 ? name : `${name}${trimmed.slice(equalsAt)}`);
+    }
+  }
+  return directives.sort().join(",");
 }
 function normalizedCspStructure(policy) {
   return policy.split(";").map((rawDirective) => {
@@ -1835,10 +2351,10 @@ var handler = async (event) => {
       {
         method: request.method,
         status: response.status,
-        contentType: headerValue(response.headers, "content-type"),
+        contentType: headerValues(response.headers, "content-type"),
         contentEncoding: headerValue(response.headers, "content-encoding"),
-        cacheControl: cacheControlValue(response.headers),
-        contentDisposition: combinedHeaderValue2(response.headers, "content-disposition"),
+        cacheControl: headerValues(response.headers, "cache-control"),
+        contentDisposition: headerValues(response.headers, "content-disposition"),
         hasSetCookie: response.headers["set-cookie"] !== void 0
       },
       // Ignore the first response's content-encoding — we re-fetch identity.
@@ -1846,7 +2362,7 @@ var handler = async (event) => {
     )) {
       return response;
     }
-    const xRobotsTag = combinedHeaderValue2(response.headers, "x-robots-tag");
+    const xRobotsTag = combinedHeaderValue(response.headers, "x-robots-tag");
     if (blocksIndexing(xRobotsTag)) {
       return response;
     }
@@ -1877,18 +2393,24 @@ var handler = async (event) => {
       getOriginTimeoutMs(),
       MAX_ORIGIN_BODY_BYTES,
       MAX_RESPONSE_HEADER_BYTES,
-      forwardedHeaders(request.headers)
+      {
+        ...forwardedHeaders(request.headers),
+        // CloudFront stores static origin headers outside request.headers and
+        // gives them precedence over same-named viewer headers. Replay the
+        // representation CloudFront originally fetched, not a weaker variant.
+        ...originCustomHeaders(request)
+      }
     );
     if (origin.truncated) return response;
     if (!shouldAttempt({
       method: "GET",
       status: String(origin.status),
-      contentType: origin.contentType,
+      contentType: origin.allHeaders["content-type"] ?? null,
       // Non-null despite Accept-Encoding: identity → origin ignored us; the
       // bytes are not injectable HTML.
       contentEncoding: origin.contentEncoding,
-      cacheControl: origin.cacheControl,
-      contentDisposition: origin.contentDisposition,
+      cacheControl: origin.allHeaders["cache-control"] ?? null,
+      contentDisposition: origin.allHeaders["content-disposition"] ?? null,
       hasSetCookie: origin.hasSetCookie
     })) {
       return response;
@@ -1899,15 +2421,20 @@ var handler = async (event) => {
     if (normalizedRobotsTag(xRobotsTag) !== normalizedRobotsTag(origin.xRobotsTag)) {
       return response;
     }
-    const firstCacheControl = cacheControlValue(response.headers);
-    if (normalizedCacheControl(firstCacheControl) !== normalizedCacheControl(origin.cacheControl)) {
+    const firstNormalizedCacheControl = normalizedCacheControl(
+      headerValues(response.headers, "cache-control")
+    );
+    const originNormalizedCacheControl = normalizedCacheControl(
+      origin.allHeaders["cache-control"] ?? null
+    );
+    if (firstNormalizedCacheControl === void 0 || originNormalizedCacheControl === void 0 || firstNormalizedCacheControl !== originNormalizedCacheControl) {
       return response;
     }
     if (headerValue(response.headers, "expires") !== origin.expires) {
       return response;
     }
-    const firstCsp = combinedHeaderValue2(response.headers, "content-security-policy");
-    const firstCspReportOnly = combinedHeaderValue2(
+    const firstCsp = combinedHeaderValue(response.headers, "content-security-policy");
+    const firstCspReportOnly = combinedHeaderValue(
       response.headers,
       "content-security-policy-report-only"
     );

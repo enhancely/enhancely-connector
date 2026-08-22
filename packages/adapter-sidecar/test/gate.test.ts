@@ -47,6 +47,10 @@ void test('rejects noindex/none robots directives', () => {
   assert.equal(isInjectableUpstream({ ...BASE, xRobotsTag: 'noindex' }), false);
   assert.equal(isInjectableUpstream({ ...BASE, xRobotsTag: 'googlebot: none' }), false);
   assert.equal(isInjectableUpstream({ ...BASE, xRobotsTag: 'index, follow' }), true);
+  assert.equal(
+    isInjectableUpstream({ ...BASE, xRobotsTag: 'none; max-image-preview: none' }),
+    false
+  );
 });
 
 void test('rejects non-GET, non-200, non-HTML and encoded responses', () => {
@@ -61,11 +65,20 @@ void test('rejects non-GET, non-200, non-HTML and encoded responses', () => {
   assert.equal(isInjectableUpstream({ ...BASE, contentType: undefined }), false);
   // Exact media type — "text/htmlx" must not match.
   assert.equal(isInjectableUpstream({ ...BASE, contentType: 'text/htmlx' }), false);
+  assert.equal(
+    isInjectableUpstream({ ...BASE, contentType: 'text/html; charset=utf-8, application/json' }),
+    false
+  );
+  assert.equal(
+    isInjectableUpstream({ ...BASE, contentType: 'text/html; profile="unterminated' }),
+    false
+  );
   assert.equal(isInjectableUpstream({ ...BASE, contentEncoding: 'gzip' }), false);
 });
 
 void test('rejects no-transform, attachments, and declared oversized bodies', () => {
   assert.equal(isInjectableUpstream({ ...BASE, cacheControl: 'public, no-transform' }), false);
+  assert.equal(isInjectableUpstream({ ...BASE, cacheControl: 'public; no-transform' }), false);
   assert.equal(
     isInjectableUpstream({ ...BASE, contentDisposition: 'attachment; filename="page.html"' }),
     false
@@ -78,7 +91,35 @@ void test('rejects no-transform, attachments, and declared oversized bodies', ()
     false
   );
   assert.equal(
+    isInjectableUpstream({ ...BASE, contentDisposition: 'inline; filename="unterminated' }),
+    false
+  );
+  assert.equal(
     isInjectableUpstream({ ...BASE, contentLength: String(2 * 1024 * 1024 + 1) }),
+    false
+  );
+});
+
+void test('preserves field-instance boundaries so malformed quotes cannot heal', () => {
+  assert.equal(
+    isInjectableUpstream({
+      ...BASE,
+      contentType: ['text/html; profile="unterminated', 'application/json"'],
+    }),
+    false
+  );
+  assert.equal(
+    isInjectableUpstream({
+      ...BASE,
+      cacheControl: ['public, ext="unterminated', 'no-transform"'],
+    }),
+    false
+  );
+  assert.equal(
+    isInjectableUpstream({
+      ...BASE,
+      contentDisposition: ['inline; filename="unterminated', 'attachment"'],
+    }),
     false
   );
 });

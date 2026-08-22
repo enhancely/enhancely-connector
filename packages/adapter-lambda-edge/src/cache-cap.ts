@@ -15,9 +15,9 @@ import type { CloudFrontHeaders, CloudFrontResultResponse } from 'aws-lambda';
 
 import {
   MAX_RESPONSE_HEADER_BYTES,
-  cacheControlValue,
   hasPerRequestCacheControl,
   headerValue,
+  headerValues,
   serializedHeaderBytes,
 } from './shared.js';
 
@@ -130,6 +130,22 @@ function parseCacheControl(policy: string): ParsedCacheDirective[] | null {
   return parsed;
 }
 
+/** Parse each wire field instance separately so malformed quotes cannot heal. */
+function parseCacheControlFields(
+  headers: CloudFrontHeaders
+): ParsedCacheDirective[] | null | undefined {
+  const entries = headers['cache-control'];
+  if (entries === undefined) return undefined;
+
+  const directives: ParsedCacheDirective[] = [];
+  for (const entry of entries) {
+    const parsed = parseCacheControl(entry.value);
+    if (parsed === null) return null;
+    directives.push(...parsed);
+  }
+  return directives;
+}
+
 /**
  * Parse one freshness directive without conflating absence with invalidity.
  * Duplicate or malformed values make freshness ambiguous; treating them as
@@ -233,11 +249,10 @@ export function retrySharedTtlSeconds(
   assertedDefaultTtlSeconds: number
 ): number | null {
   const retryTtl = Math.max(1, Math.ceil(revalidateInMs / 1000));
-  const policy = cacheControlValue(headers);
+  const directives = parseCacheControlFields(headers);
 
-  if (policy !== null) {
-    const directives = parseCacheControl(policy);
-    if (directives === null) return 0;
+  if (directives === null) return 0;
+  if (directives !== undefined) {
     // no-cache is an explicit "revalidate every time" — honor it with s-maxage=0.
     if (directives.some((directive) => directive.name === 'no-cache')) {
       return 0;
@@ -323,7 +338,13 @@ export function retryablePassThroughResponse(
   }
 
   const originalHeaders = response.headers ?? {};
-  if (hasPerRequestCacheControl(cacheControlValue(originalHeaders))) {
+  // Never replace an ambiguous/malformed policy. In particular, joining two
+  // individually unbalanced field instances can otherwise hide `no-store`
+  // inside a healed quoted-string and manufacture shared-cache semantics.
+  if (parseCacheControlFields(originalHeaders) === null) {
+    return response;
+  }
+  if (hasPerRequestCacheControl(headerValues(originalHeaders, 'cache-control'))) {
     return response;
   }
   if (originalHeaders['set-cookie'] !== undefined && !opts.capSetCookieResponses) {

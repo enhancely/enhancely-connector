@@ -167,6 +167,10 @@ describe('companion — permanent gates stay untouched', () => {
     ['non-GET', { method: 'POST' }],
     ['non-200', { status: '404' }],
     ['non-HTML', { responseHeaders: { 'content-type': 'application/json' } }],
+    [
+      'conflicting Content-Type instances',
+      { responseHeaders: { 'content-type': ['text/html; charset=utf-8', 'application/json'] } },
+    ],
     ['legacy charset', { responseHeaders: { 'content-type': 'text/html; charset=iso-8859-1' } }],
     [
       'noindex',

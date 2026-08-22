@@ -28,7 +28,7 @@ export function kvExpirationTtlSeconds(cacheTtlMs: number): number {
 
 /**
  * Keep a negative entry at least until its retry deadline. Register responses
- * may carry day-scale 403/429 backoffs; expiring KV after the normal 2× stale
+ * may carry day-scale URL-local 403/429 backoffs; expiring KV after the normal 2× stale
  * window would forget that deadline and resume POSTing too early.
  */
 export function kvEntryExpirationTtlSeconds(

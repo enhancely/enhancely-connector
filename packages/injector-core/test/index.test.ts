@@ -356,6 +356,10 @@ describe('lookup single-flight and cross-mode races', () => {
     return { promise, resolve };
   }
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('coalesces concurrent conditional GET misses for one cache and URL', async () => {
     const response = deferred<Response>();
     const fetchImpl = vi.fn<Fetcher>(() => response.promise);
@@ -480,6 +484,478 @@ describe('lookup single-flight and cross-mode races', () => {
     expect(getResult.snippet).toBe(SNIPPET_V2);
     expect(postResult.snippet).toBe(SNIPPET_V2);
     expect(stored).toMatchObject({ jsonldRaw: RAW_JSONLD, etag: '"v2"' });
+  });
+
+  it.each([
+    ['403 registration limit', '403', 'short-first'],
+    ['403 registration limit', '403', 'long-first'],
+    ['long 429', '429', 'short-first'],
+    ['long 429', '429', 'long-first'],
+  ] as const)(
+    'merges the longest concurrent negative backoff (%s, %s)',
+    async (_label, responseKind, order) => {
+      const now = 1_700_000_000_000;
+      let currentTime = now;
+      vi.spyOn(Date, 'now').mockImplementation(() => currentTime);
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const cache = new MemoryCache();
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      const shortResponse =
+        responseKind === '429'
+          ? new Response('', { status: 429, headers: { 'Retry-After': '86400' } })
+          : new Response('temporary', { status: 500 });
+      const longResponse = new Response('', {
+        status: responseKind === '429' ? 429 : 403,
+        headers: { 'Retry-After': '86400' },
+      });
+
+      if (order === 'short-first') {
+        getResponse.resolve(shortResponse);
+        await getLookup;
+        postResponse.resolve(longResponse);
+      } else {
+        postResponse.resolve(longResponse);
+        await postLookup;
+        getResponse.resolve(shortResponse);
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: null,
+        etag: null,
+        storedAt: 0,
+        retryNotBefore: now + 86_400_000,
+      });
+
+      // The normal negative TTL and the shared 429 circuit have both elapsed,
+      // but the URL-local register deadline must still suppress a second POST.
+      currentTime += TTL_MS + 1_000;
+      expect(await getJsonLdRegisterLookup(PAGE_URL, cache, config)).toMatchObject({
+        snippet: null,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it.each(['failure-first', 'positive-first'] as const)(
+    'never lets a concurrent 403 backoff overwrite a positive result (%s)',
+    async (order) => {
+      const now = 1_700_000_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const cache = new MemoryCache();
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      const positive = new Response(RAW_JSONLD, {
+        status: 200,
+        headers: { ETag: '"v2"' },
+      });
+      const limited = new Response('', {
+        status: 403,
+        headers: { 'Retry-After': '86400' },
+      });
+
+      if (order === 'failure-first') {
+        postResponse.resolve(limited);
+        await postLookup;
+        getResponse.resolve(positive);
+      } else {
+        getResponse.resolve(positive);
+        await getLookup;
+        postResponse.resolve(limited);
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: RAW_JSONLD,
+        etag: '"v2"',
+        storedAt: now,
+      });
+    }
+  );
+
+  it.each(['get-first', 'post-first'] as const)(
+    'merges an exact concurrent GET 404 and POST 403 result (%s)',
+    async (order) => {
+      const now = 1_700_000_000_000;
+      let currentTime = now;
+      vi.spyOn(Date, 'now').mockImplementation(() => currentTime);
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const cache = new MemoryCache();
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      if (order === 'get-first') {
+        getResponse.resolve(new Response('', { status: 404 }));
+        await getLookup;
+        postResponse.resolve(
+          new Response('', { status: 403, headers: { 'Retry-After': '86400' } })
+        );
+      } else {
+        postResponse.resolve(
+          new Response('', { status: 403, headers: { 'Retry-After': '86400' } })
+        );
+        await postLookup;
+        getResponse.resolve(new Response('', { status: 404 }));
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: null,
+        etag: null,
+        storedAt: now,
+        retryNotBefore: now + 86_400_000,
+      });
+
+      currentTime += TTL_MS + 1_000;
+      expect(await getJsonLdRegisterLookup(PAGE_URL, cache, config)).toMatchObject({
+        snippet: null,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it.each([
+    ['403', 'get-first'],
+    ['403', 'post-first'],
+    ['429', 'get-first'],
+    ['429', 'post-first'],
+  ] as const)(
+    'merges GET 404 with a limited POST over a stale positive (%s, %s)',
+    async (status, order) => {
+      const now = 1_700_000_000_000;
+      let currentTime = now;
+      vi.spyOn(Date, 'now').mockImplementation(() => currentTime);
+
+      const staleStoredAt = now - TTL_MS - 5_000;
+      const cache = new MemoryCache();
+      await cache.set(KEY, {
+        jsonldRaw: RAW_JSONLD,
+        etag: '"old"',
+        storedAt: staleStoredAt,
+      });
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      const limited = new Response('', {
+        status: Number(status),
+        headers: { 'Retry-After': '86400' },
+      });
+      if (order === 'get-first') {
+        getResponse.resolve(new Response('', { status: 404 }));
+        await getLookup;
+        postResponse.resolve(limited);
+      } else {
+        postResponse.resolve(limited);
+        await postLookup;
+        getResponse.resolve(new Response('', { status: 404 }));
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: null,
+        etag: null,
+        storedAt: now,
+        retryNotBefore: now + 86_400_000,
+      });
+
+      currentTime += TTL_MS + 61_000;
+      expect(await getJsonLdRegisterLookup(PAGE_URL, cache, config)).toMatchObject({
+        snippet: null,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it.each(['get-first', 'post-first'] as const)(
+    'lets a new 200 replace a retry-only stale-positive memo (%s)',
+    async (order) => {
+      const now = 1_700_000_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      const cache = new MemoryCache();
+      await cache.set(KEY, {
+        jsonldRaw: '{"version":1}',
+        etag: '"old"',
+        storedAt: now - TTL_MS - 5_000,
+      });
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      const updated = new Response('{"version":2}', {
+        status: 200,
+        headers: { ETag: '"new"' },
+      });
+      const limited = new Response('', {
+        status: 403,
+        headers: { 'Retry-After': '86400' },
+      });
+      if (order === 'get-first') {
+        getResponse.resolve(updated);
+        await getLookup;
+        postResponse.resolve(limited);
+      } else {
+        postResponse.resolve(limited);
+        await postLookup;
+        getResponse.resolve(updated);
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: '{"version":2}',
+        etag: '"new"',
+        storedAt: now,
+      });
+    }
+  );
+
+  it.each([
+    ['terminal-negative', '403', 'get-first'],
+    ['terminal-negative', '403', 'post-first'],
+    ['terminal-negative', '429', 'get-first'],
+    ['terminal-negative', '429', 'post-first'],
+    ['pending', '403', 'get-first'],
+    ['pending', '403', 'post-first'],
+    ['pending', '429', 'get-first'],
+    ['pending', '429', 'post-first'],
+  ] as const)(
+    'merges authoritative GET negative state with durable POST backoff (%s, %s, %s)',
+    async (getStatus, postStatus, order) => {
+      const now = 1_700_000_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      const cache = new MemoryCache();
+      await cache.set(KEY, {
+        jsonldRaw: null,
+        etag: null,
+        storedAt: now - TTL_MS - 5_000,
+      });
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      const negative =
+        getStatus === 'pending'
+          ? new Response('', { status: 202, headers: { 'Retry-After': '5' } })
+          : new Response('{}', { status: 200 });
+      const limited = new Response('', {
+        status: Number(postStatus),
+        headers: { 'Retry-After': '86400' },
+      });
+      if (order === 'get-first') {
+        getResponse.resolve(negative);
+        await getLookup;
+        postResponse.resolve(limited);
+      } else {
+        postResponse.resolve(limited);
+        await postLookup;
+        getResponse.resolve(negative);
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: null,
+        etag: null,
+        storedAt: getStatus === 'pending' ? 0 : now,
+        retryNotBefore: now + 86_400_000,
+      });
+    }
+  );
+
+  it.each([
+    ['403', 'get-first'],
+    ['403', 'post-first'],
+    ['429', 'get-first'],
+    ['429', 'post-first'],
+  ] as const)(
+    'lets a successful 304 revalidation replace a retry-only memo (%s, %s)',
+    async (status, order) => {
+      const now = 1_700_000_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      const cache = new MemoryCache();
+      await cache.set(KEY, {
+        jsonldRaw: RAW_JSONLD,
+        etag: '"old"',
+        storedAt: now - TTL_MS - 5_000,
+      });
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      const revalidated = new Response(null, { status: 304 });
+      const limited = new Response('', {
+        status: Number(status),
+        headers: { 'Retry-After': '86400' },
+      });
+      if (order === 'get-first') {
+        getResponse.resolve(revalidated);
+        await getLookup;
+        postResponse.resolve(limited);
+      } else {
+        postResponse.resolve(limited);
+        await postLookup;
+        getResponse.resolve(revalidated);
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: RAW_JSONLD,
+        etag: '"old"',
+        storedAt: now,
+      });
+    }
+  );
+
+  it.each([
+    ['403', 'get-first'],
+    ['403', 'post-first'],
+    ['429', 'get-first'],
+    ['429', 'post-first'],
+  ] as const)(
+    'merges transient GET and durable POST backoffs over stale positive data (%s, %s)',
+    async (status, order) => {
+      const now = 1_700_000_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      const staleStoredAt = now - TTL_MS - 5_000;
+      const cache = new MemoryCache();
+      await cache.set(KEY, {
+        jsonldRaw: RAW_JSONLD,
+        etag: '"old"',
+        storedAt: staleStoredAt,
+      });
+
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      const transient = new Response('', { status: 500 });
+      const limited = new Response('', {
+        status: Number(status),
+        headers: { 'Retry-After': '86400' },
+      });
+      if (order === 'get-first') {
+        getResponse.resolve(transient);
+        await getLookup;
+        postResponse.resolve(limited);
+      } else {
+        postResponse.resolve(limited);
+        await postLookup;
+        getResponse.resolve(transient);
+      }
+
+      const [getResult, postResult] = await Promise.all([getLookup, postLookup]);
+      expect(getResult.snippet ?? postResult.snippet).toContain(RAW_JSONLD);
+      expect(await cache.get(KEY)).toEqual({
+        jsonldRaw: RAW_JSONLD,
+        etag: '"old"',
+        storedAt: staleStoredAt,
+        retryNotBefore: now + 86_400_000,
+      });
+    }
+  );
+
+  it('persists a failure memo when the cache evicts its original snapshot in flight', async () => {
+    const now = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+
+    const snapshot = {
+      jsonldRaw: null,
+      etag: null,
+      storedAt: now - TTL_MS - 1,
+    };
+    let stored: (typeof snapshot & { retryNotBefore: number }) | undefined;
+    let reads = 0;
+    const cache = {
+      async get() {
+        reads += 1;
+        if (reads === 1) return snapshot;
+        if (reads === 2) return undefined;
+        return stored;
+      },
+      async set(_key: string, entry: typeof stored) {
+        stored = entry;
+      },
+    };
+    const fetchImpl = vi.fn<Fetcher>(() =>
+      Promise.resolve(new Response('', { status: 403, headers: { 'Retry-After': '86400' } }))
+    );
+
+    await getJsonLdRegisterLookup(PAGE_URL, cache, makeConfig(fetchImpl));
+
+    expect(stored).toEqual({
+      ...snapshot,
+      retryNotBefore: now + 86_400_000,
+    });
   });
 });
 

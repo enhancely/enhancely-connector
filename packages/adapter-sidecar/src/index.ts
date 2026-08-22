@@ -53,18 +53,31 @@ const config = defineConfig({
 });
 const cache = new MemoryCache();
 
-function isInjectable(req: http.IncomingMessage, res: http.IncomingMessage): boolean {
-  const robots = res.headers['x-robots-tag'];
+function combinedResponseHeader(res: http.IncomingMessage, name: string): string | undefined {
+  return res.headersDistinct[name]?.join(', ');
+}
+
+function responseHeaderValues(
+  res: http.IncomingMessage,
+  name: string
+): readonly string[] | undefined {
+  return res.headersDistinct[name];
+}
+
+function isInjectable(
+  req: http.IncomingMessage,
+  res: http.IncomingMessage,
+  contentType: readonly string[] | undefined
+): boolean {
   return isInjectableUpstream({
     method: req.method,
     status: res.statusCode,
-    contentType: res.headers['content-type'],
-    contentEncoding: res.headers['content-encoding'],
-    xRobotsTag: Array.isArray(robots) ? robots.join(', ') : robots,
-    cacheControl: res.headers['cache-control'],
-    contentDisposition:
-      res.headersDistinct['content-disposition']?.join(', ') ?? res.headers['content-disposition'],
-    contentLength: res.headers['content-length'],
+    contentType,
+    contentEncoding: combinedResponseHeader(res, 'content-encoding'),
+    xRobotsTag: combinedResponseHeader(res, 'x-robots-tag'),
+    cacheControl: responseHeaderValues(res, 'cache-control'),
+    contentDisposition: responseHeaderValues(res, 'content-disposition'),
+    contentLength: combinedResponseHeader(res, 'content-length'),
     apiKeyPresent: ENHANCELY_API_KEY !== '',
   });
 }
@@ -99,10 +112,15 @@ export const server = http.createServer((req, res) => {
       headers,
     },
     (proxyRes) => {
-      const responseHeaders = forwardableHeaders(proxyRes.headers);
+      // Preserve every upstream field instance on pass-through. Node's
+      // `headers` view may discard duplicate singleton fields; `headersDistinct`
+      // retains what arrived on the wire and lets the gates reject ambiguity.
+      const responseHeaders = forwardableHeaders(proxyRes.headersDistinct);
       const status = proxyRes.statusCode ?? 502;
+      const contentTypeValues = responseHeaderValues(proxyRes, 'content-type');
+      const contentType = contentTypeValues?.length === 1 ? contentTypeValues[0] : undefined;
 
-      if (!isInjectable(req, proxyRes)) {
+      if (!isInjectable(req, proxyRes, contentTypeValues)) {
         // Streaming passthrough for everything that is not injectable HTML.
         res.writeHead(status, responseHeaders);
         proxyRes.pipe(res);
@@ -139,13 +157,13 @@ export const server = http.createServer((req, res) => {
           // mislabeled legacy body may contain a perfectly visible </head>
           // after lossy decode, but injecting would then re-encode and corrupt
           // customer bytes.
-          if (isUtf8SafeHtmlBytes(originalBody, proxyRes.headers['content-type'] ?? '')) {
+          if (isUtf8SafeHtmlBytes(originalBody, contentType ?? '')) {
             try {
               html = await handleHtml(
                 {
                   html: originalHtml,
                   url: pageUrl(req),
-                  contentType: proxyRes.headers['content-type'] ?? null,
+                  contentType: contentType ?? null,
                   status,
                 },
                 cache,

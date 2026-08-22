@@ -212,11 +212,34 @@ describe('fetchJsonLd — response handling', () => {
     });
   });
 
+  it('429 prefers Retry-After over RateLimit-Reset when both are present', async () => {
+    const { config } = withMockFetch(
+      new Response('', {
+        status: 429,
+        headers: { 'Retry-After': '17', 'RateLimit-Reset': '42' },
+      })
+    );
+    expect(await fetchJsonLd(config, PAGE_URL)).toEqual({
+      status: 'rate-limited',
+      retryAfterSeconds: 17,
+    });
+  });
+
   it('429 without Retry-After → rate-limited with null', async () => {
     const { config } = withMockFetch(new Response('', { status: 429 }));
     expect(await fetchJsonLd(config, PAGE_URL)).toEqual({
       status: 'rate-limited',
       retryAfterSeconds: null,
+    });
+  });
+
+  it('403 ignores RateLimit-Reset without the registration Retry-After hint', async () => {
+    const { config } = withMockFetch(
+      new Response('', { status: 403, headers: { 'RateLimit-Reset': '7200' } })
+    );
+    expect(await registerOrRevalidate(config, PAGE_URL)).toEqual({
+      status: 'terminal-negative',
+      reason: 'rejected',
     });
   });
 

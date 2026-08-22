@@ -39,6 +39,34 @@ describe('injectIntoHead', () => {
     expect(injectIntoHead(html, SNIPPET)).toBe(`<head>${SNIPPET}</head >`);
   });
 
+  it.each([
+    '<!DOCTYPE html PUBLIC "x><head><title>real</title></head>"><head><title>fake</title></head>',
+    "<!DOCTYPE html SYSTEM 'x><head><title>real</title></head>'><head><title>fake</title></head>",
+  ])('ends malformed quoted DOCTYPE identifiers at the tokenizer first >: %s', (html) => {
+    const firstHeadClose = html.indexOf('</head>');
+    expect(findHeadInjectionPoint(html)).toBe(firstHeadClose);
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      html.slice(0, firstHeadClose) + SNIPPET + html.slice(firstHeadClose)
+    );
+  });
+
+  it.each(['<!DOCTYPEhtml><head></head>', '<!DOCTYPE/html><head></head>'])(
+    'recognizes a DOCTYPE even when whitespace before its name is missing: %s',
+    (html) => {
+      const headClose = html.indexOf('</head>');
+      expect(findHeadInjectionPoint(html)).toBe(headClose);
+      expect(injectIntoHead(html, SNIPPET)).toBe(
+        html.slice(0, headClose) + SNIPPET + html.slice(headClose)
+      );
+    }
+  );
+
+  it('does not hide post-DOCTYPE text behind a source-level identifier quote', () => {
+    const html = '<!DOCTYPE html PUBLIC "x>"><head></head><body>x</body>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
   it('returns the HTML unchanged when there is no </head> (fail-open)', () => {
     const html = '<body>no head here</body>';
     expect(injectIntoHead(html, SNIPPET)).toBe(html);
@@ -66,6 +94,28 @@ describe('injectIntoHead', () => {
     // state; the following </head> is still script text, not the head closer.
     expect(findHeadInjectionPoint(html)).toBeNull();
     expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('scans many false script end-tag prefixes in linear time', () => {
+    const falseClosers = '</scriptx>'.repeat(50_000);
+    const html = `<head><script>${falseClosers}</script></head><body>x</body>`;
+    const realHeadClose = html.indexOf('</head>');
+
+    expect(findHeadInjectionPoint(html)).toBe(realHeadClose);
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      html.slice(0, realHeadClose) + SNIPPET + html.slice(realHeadClose)
+    );
+  });
+
+  it('scans many separate script elements in linear time', () => {
+    const scripts = '<script></script>'.repeat(40_000);
+    const html = `<head>${scripts}</head><body>x</body>`;
+    const realHeadClose = html.indexOf('</head>');
+
+    expect(findHeadInjectionPoint(html)).toBe(realHeadClose);
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      html.slice(0, realHeadClose) + SNIPPET + html.slice(realHeadClose)
+    );
   });
 
   it('fails open instead of injecting at an inert </head> inside template contents', () => {
@@ -167,6 +217,77 @@ describe('injectIntoHead', () => {
     const html = '<head><!-- </head> --></head><body></body>';
     expect(injectIntoHead(html, SNIPPET)).toBe(
       `<head><!-- </head> -->${SNIPPET}</head><body></body>`
+    );
+  });
+
+  it('recognizes --!> as a real comment closer before an implicit head close', () => {
+    const html = '<head><!-- --!><body> --></head><p>x</p>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('does not let --!> overlap the comment opener', () => {
+    const html = '<head><!--!></head>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('scans many separate comments in linear time', () => {
+    const comments = '<!---->'.repeat(40_000);
+    const html = `<head>${comments}</head><body>x</body>`;
+    const realHeadClose = html.indexOf('</head>');
+
+    expect(findHeadInjectionPoint(html)).toBe(realHeadClose);
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      html.slice(0, realHeadClose) + SNIPPET + html.slice(realHeadClose)
+    );
+  });
+
+  it('validates --!> comments inside head noscript under scripting-disabled parsing', () => {
+    const html = '<head><noscript><!-- --!><body> --></noscript></head><p>x</p>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('does not let a quote in an attribute name hide the tokenizer first >', () => {
+    const html = "<head foo'><body>'></head><p>x</p>";
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it.each(['<head a="v"b="x></head>"></head>', '<head /b="x></head>"></head>'])(
+    'reconsumes malformed attribute bytes before choosing the head closer: %s',
+    (html) => {
+      const realHeadClose = html.lastIndexOf('</head>');
+      expect(findHeadInjectionPoint(html)).toBe(realHeadClose);
+      expect(injectIntoHead(html, SNIPPET)).toBe(
+        html.slice(0, realHeadClose) + SNIPPET + html.slice(realHeadClose)
+      );
+    }
+  );
+
+  it.each([
+    '<head><!--><meta content="--> </head>"><title>x</title></head><body>x</body>',
+    '<head><!---><script>const marker = "--> </head>";</script></head><body>x</body>',
+  ])(
+    'does not extend an abruptly closed comment into a later attribute or raw-text marker: %s',
+    (html) => {
+      const realHeadClose = html.lastIndexOf('</head>');
+      expect(findHeadInjectionPoint(html)).toBe(realHeadClose);
+      expect(injectIntoHead(html, SNIPPET)).toBe(
+        html.slice(0, realHeadClose) + SNIPPET + html.slice(realHeadClose)
+      );
+    }
+  );
+
+  it('accepts an abruptly closed comment inside safe head noscript content', () => {
+    const html =
+      '<head><noscript><!--><meta content="-->"></noscript><title>x</title></head><body>x</body>';
+    const realHeadClose = html.lastIndexOf('</head>');
+
+    expect(findHeadInjectionPoint(html)).toBe(realHeadClose);
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      html.slice(0, realHeadClose) + SNIPPET + html.slice(realHeadClose)
     );
   });
 

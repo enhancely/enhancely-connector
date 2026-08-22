@@ -132,6 +132,26 @@ beforeAll(async () => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('{}');
       },
+      '/conflicting-content-type': () => {
+        res.writeHead(200, [
+          'Content-Type',
+          'text/html; charset=utf-8',
+          'Content-Type',
+          'application/json',
+        ]);
+        res.end(PAGE_HTML);
+      },
+      '/conflicting-content-disposition': () => {
+        res.writeHead(200, [
+          'Content-Type',
+          'text/html; charset=utf-8',
+          'Content-Disposition',
+          'inline',
+          'Content-Disposition',
+          'attachment; filename="page.html"',
+        ]);
+        res.end(PAGE_HTML);
+      },
       '/created': () => {
         res.writeHead(201, { 'content-type': 'text/html; charset=utf-8' });
         res.end(PAGE_HTML);
@@ -714,6 +734,32 @@ describe('origin-request — safe origin answers are returned verbatim, not re-f
     expect(Buffer.from(response.body ?? '', 'base64').toString('utf8')).toBe('{}');
     expect(originHits).toBe(1);
     expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('combines conflicting origin Content-Type instances and preserves them verbatim', async () => {
+    const response = asResponse(
+      await invoke(makeRequestEvent({ uri: '/conflicting-content-type' }))
+    );
+    expect(response.headers?.['content-type']?.map((entry) => entry.value)).toEqual([
+      'text/html; charset=utf-8',
+      'application/json',
+    ]);
+    expect(response.bodyEncoding).toBe('base64');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(originHits).toBe(1);
+  });
+
+  it('combines every origin Content-Disposition instance before gating', async () => {
+    const response = asResponse(
+      await invoke(makeRequestEvent({ uri: '/conflicting-content-disposition' }))
+    );
+    expect(response.headers?.['content-disposition']?.map((entry) => entry.value)).toEqual([
+      'inline',
+      'attachment; filename="page.html"',
+    ]);
+    expect(response.bodyEncoding).toBe('base64');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(originHits).toBe(1);
   });
 
   it.each([

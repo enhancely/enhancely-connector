@@ -24,8 +24,8 @@ The origin response is returned **untouched** whenever any of these holds:
 
 - request method is not `GET`, or the origin response is not exactly 200
 - origin `Content-Type` is not `text/html`
-- the response is encoded, marked `no-transform`, served as an attachment, or
-  carries `X-Robots-Tag: noindex|none`
+- the response is encoded, marked `no-transform`, carries a valid non-`inline`
+  `Content-Disposition`, or carries `X-Robots-Tag: noindex|none`
 - the body exceeds 2 MiB or its bytes cannot be proven safe to decode/re-emit
   as UTF-8
 - `ENHANCELY_API_KEY` is not configured
@@ -60,8 +60,8 @@ entry per normalized URL in Workers KV (shared across all edge locations) and
 revalidates expired entries cheaply via `ETag` / `If-None-Match` → 304.
 Entries are kept in KV for at least `max(60s, 2 × cacheTtlMs)` so a stale entry
 can still be served while Enhancely is slow, rate-limited, or down. A longer
-server retry deadline extends that lifetime, preventing a day-scale 403/429
-backoff from being forgotten after ten minutes. Without the KV binding the
+URL-local server retry deadline extends that lifetime, preventing a day-scale
+403/429 backoff from being forgotten after ten minutes. Without the KV binding the
 worker falls back to a per-isolate in-memory cache bounded by both entry count
 and a conservative 16 MiB retained-string estimate (fine for dev, modest hit
 rates in production).
@@ -79,13 +79,13 @@ silently failing every KV read/write.
 
 ## Env vars & bindings
 
-| Name                     | Kind           | Default                    | Notes                                                                                   |
-| ------------------------ | -------------- | -------------------------- | --------------------------------------------------------------------------------------- |
-| `ENHANCELY_API_KEY`      | **secret**     | — (required)               | `sk-…` / `sk-org-…`. `wrangler secret put` — never in wrangler.toml, never client-side. |
-| `ENHANCELY_BASE`         | var (optional) | `https://app.enhancely.ai` | Confirmed production API base; override only for an explicitly selected environment.    |
-| `ENHANCELY_TIMEOUT_MS`   | var (optional) | `800`                      | Per-call `AbortSignal.timeout` for the Enhancely API.                                   |
-| `ENHANCELY_CACHE_TTL_MS` | var (optional) | `300000` (5 min)           | Cache freshness window; ETag revalidation afterwards.                                   |
-| `JSONLD_CACHE`           | KV (optional)  | — (memory fallback)        | Distributed JSON-LD cache; strongly recommended in production.                          |
+| Name                     | Kind           | Default                    | Notes                                                                                                                               |
+| ------------------------ | -------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `ENHANCELY_API_KEY`      | **secret**     | — (required)               | `sk-…` / `sk-org-…`. `wrangler secret put` — never in wrangler.toml, never client-side.                                             |
+| `ENHANCELY_BASE`         | var (optional) | `https://app.enhancely.ai` | Listed by the [official Enhancely API endpoints](https://docs.enhancely.ai/); override only for an explicitly selected environment. |
+| `ENHANCELY_TIMEOUT_MS`   | var (optional) | `800`                      | Per-call `AbortSignal.timeout` for the Enhancely API.                                                                               |
+| `ENHANCELY_CACHE_TTL_MS` | var (optional) | `300000` (5 min)           | Cache freshness window; ETag revalidation afterwards.                                                                               |
+| `JSONLD_CACHE`           | KV (optional)  | — (memory fallback)        | Distributed JSON-LD cache; strongly recommended in production.                                                                      |
 
 ## Deploy
 

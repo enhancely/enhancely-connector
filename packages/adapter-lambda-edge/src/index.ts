@@ -49,7 +49,10 @@ import {
   injectIntoHead,
   matchesExcludedPath,
   MemoryCache,
+  splitOutsideHttpQuotesStrict,
+  trimHttpOws,
 } from '@enhancely/injector-core';
+import type { HttpFieldValue } from '@enhancely/injector-core';
 import {
   getAssertedDefaultTtlSeconds,
   getCapSetCookieResponses,
@@ -64,18 +67,19 @@ import {
   blocksIndexing,
   buildOriginUrl,
   buildPageUrl,
-  cacheControlValue,
   combinedHeaderValue,
   customHeaderValue,
   forwardedHeaders,
   GENERATED_HTML_CONTENT_TYPE,
   GENERATED_RESPONSE_SAFETY_MARGIN_BYTES,
   headerValue,
+  headerValues,
   INJECTED_MARKER_HEADER,
   isUtf8SafeHtmlBytes,
   MAX_GENERATED_RESPONSE_BYTES,
   MAX_ORIGIN_BODY_BYTES,
   MAX_RESPONSE_HEADER_BYTES,
+  originCustomHeaders,
   PAGE_HOST_HEADER,
   serializedHeaderBytes,
   shouldAttempt,
@@ -122,18 +126,38 @@ function normalizedRobotsTag(xRobotsTag: string | null): string | null {
   if (xRobotsTag === null) return null;
   return xRobotsTag
     .split(',')
-    .map((directive) => directive.trim().replace(/\s+/g, ' ').toLowerCase())
+    .map((directive) => {
+      const trimmed = trimHttpOws(directive);
+      // Bare directive names are case-insensitive. Arguments of scoped,
+      // dated, or proprietary directives remain byte/case stable.
+      return /^[A-Za-z][A-Za-z0-9_-]*$/.test(trimmed) ? trimmed.toLowerCase() : trimmed;
+    })
     .join(',');
 }
 
-/** Compare Cache-Control semantically enough to ignore order/casing/spacing. */
-function normalizedCacheControl(policy: string | null): string | null {
-  if (policy === null) return null;
-  return policy
-    .split(',')
-    .map((directive) => directive.trim().toLowerCase())
-    .sort()
-    .join(',');
+/** Compare Cache-Control without splitting commas inside quoted extensions. */
+function normalizedCacheControl(policy: HttpFieldValue): string | null | undefined {
+  if (policy === null || policy === undefined) return null;
+  const instances = typeof policy === 'string' ? [policy] : policy;
+  const directives: string[] = [];
+  const names = new Set<string>();
+  for (const instance of instances) {
+    const parsed = splitOutsideHttpQuotesStrict(instance, ',');
+    if (parsed === null) return undefined;
+    for (const directive of parsed) {
+      const trimmed = trimHttpOws(directive);
+      if (trimmed === '') continue;
+      const equalsAt = trimmed.indexOf('=');
+      const name = (equalsAt < 0 ? trimmed : trimmed.slice(0, equalsAt)).toLowerCase();
+      if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name) || names.has(name)) {
+        return undefined;
+      }
+      names.add(name);
+      // Directive names are case-insensitive; extension values are not.
+      directives.push(equalsAt < 0 ? name : `${name}${trimmed.slice(equalsAt)}`);
+    }
+  }
+  return directives.sort().join(',');
 }
 
 /**
@@ -205,10 +229,10 @@ export const handler: CloudFrontResponseHandler = async (event) => {
         {
           method: request.method,
           status: response.status,
-          contentType: headerValue(response.headers, 'content-type'),
+          contentType: headerValues(response.headers, 'content-type'),
           contentEncoding: headerValue(response.headers, 'content-encoding'),
-          cacheControl: cacheControlValue(response.headers),
-          contentDisposition: combinedHeaderValue(response.headers, 'content-disposition'),
+          cacheControl: headerValues(response.headers, 'cache-control'),
+          contentDisposition: headerValues(response.headers, 'content-disposition'),
           hasSetCookie: response.headers['set-cookie'] !== undefined,
         },
         // Ignore the first response's content-encoding — we re-fetch identity.
@@ -290,7 +314,13 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       getOriginTimeoutMs(),
       MAX_ORIGIN_BODY_BYTES,
       MAX_RESPONSE_HEADER_BYTES,
-      forwardedHeaders(request.headers)
+      {
+        ...forwardedHeaders(request.headers),
+        // CloudFront stores static origin headers outside request.headers and
+        // gives them precedence over same-named viewer headers. Replay the
+        // representation CloudFront originally fetched, not a weaker variant.
+        ...originCustomHeaders(request),
+      }
     );
     // Over the conservative fetch cap — a body that large can never be
     // returned, not even under the most favorable header set.
@@ -299,12 +329,12 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       !shouldAttempt({
         method: 'GET',
         status: String(origin.status),
-        contentType: origin.contentType,
+        contentType: origin.allHeaders['content-type'] ?? null,
         // Non-null despite Accept-Encoding: identity → origin ignored us; the
         // bytes are not injectable HTML.
         contentEncoding: origin.contentEncoding,
-        cacheControl: origin.cacheControl,
-        contentDisposition: origin.contentDisposition,
+        cacheControl: origin.allHeaders['cache-control'] ?? null,
+        contentDisposition: origin.allHeaders['content-disposition'] ?? null,
         hasSetCookie: origin.hasSetCookie,
       })
     ) {
@@ -329,8 +359,17 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // representation we re-fetch. Choosing either side of a mismatch can make
     // the viewer response more cacheable than the other one intended, so the
     // only fail-open choice is to leave the first response untouched.
-    const firstCacheControl = cacheControlValue(response.headers);
-    if (normalizedCacheControl(firstCacheControl) !== normalizedCacheControl(origin.cacheControl)) {
+    const firstNormalizedCacheControl = normalizedCacheControl(
+      headerValues(response.headers, 'cache-control')
+    );
+    const originNormalizedCacheControl = normalizedCacheControl(
+      origin.allHeaders['cache-control'] ?? null
+    );
+    if (
+      firstNormalizedCacheControl === undefined ||
+      originNormalizedCacheControl === undefined ||
+      firstNormalizedCacheControl !== originNormalizedCacheControl
+    ) {
       return response;
     }
     if (headerValue(response.headers, 'expires') !== origin.expires) {

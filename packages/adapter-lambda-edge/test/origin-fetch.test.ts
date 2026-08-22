@@ -13,11 +13,15 @@ import { MAX_RESPONSE_HEADER_BYTES } from '../src/shared.js';
 
 const h = vi.hoisted(() => {
   const captured: { https?: Record<string, unknown>; http?: Record<string, unknown> } = {};
-  const scenario: { ready: boolean; error: Error & { code?: string } } = {
+  const scenario: {
+    ready: boolean;
+    error: Error & { code?: string };
+    responseHeadersDistinct?: Record<string, string[]>;
+  } = {
     ready: false,
     error: new Error('stub'),
   };
-  const makeReq = (protocol: 'http' | 'https') => {
+  const makeReq = (protocol: 'http' | 'https', responseCallback?: (response: unknown) => void) => {
     const requestHandlers: Record<string, ((arg: unknown) => void) | undefined> = {};
     const socketHandlers: Record<string, (() => void) | undefined> = {};
     const socket = {
@@ -44,6 +48,21 @@ const h = vi.hoisted(() => {
             socket.connecting = false;
             socketHandlers[protocol === 'https' ? 'secureConnect' : 'connect']?.();
           }
+          if (scenario.responseHeadersDistinct !== undefined && responseCallback !== undefined) {
+            const responseHandlers: Record<string, ((arg?: unknown) => void) | undefined> = {};
+            const response: Record<string, unknown> = {
+              statusCode: 200,
+              headersDistinct: scenario.responseHeadersDistinct,
+              on: (event: string, cb: (arg?: unknown) => void) => {
+                responseHandlers[event] = cb;
+                return response;
+              },
+              destroy: () => {},
+            };
+            responseCallback(response);
+            setImmediate(() => responseHandlers['end']?.());
+            return;
+          }
           requestHandlers['error']?.(scenario.error);
         });
       },
@@ -54,13 +73,13 @@ const h = vi.hoisted(() => {
   return {
     captured,
     scenario,
-    httpsRequest: vi.fn((opts: unknown) => {
+    httpsRequest: vi.fn((opts: unknown, callback?: (response: unknown) => void) => {
       captured.https = opts as Record<string, unknown>;
-      return makeReq('https');
+      return makeReq('https', callback);
     }),
-    httpRequest: vi.fn((opts: unknown) => {
+    httpRequest: vi.fn((opts: unknown, callback?: (response: unknown) => void) => {
       captured.http = opts as Record<string, unknown>;
-      return makeReq('http');
+      return makeReq('http', callback);
     }),
   };
 });
@@ -76,6 +95,7 @@ describe('fetchOriginHtml TLS SNI', () => {
     delete h.captured.http;
     h.scenario.ready = false;
     h.scenario.error = new Error('stub');
+    delete h.scenario.responseHeadersDistinct;
   });
 
   it('sets servername to the public Host for an https origin, not the origin DNS name', async () => {
@@ -124,6 +144,36 @@ describe('fetchOriginHtml TLS SNI', () => {
       MAX_RESPONSE_HEADER_BYTES
     ).catch(() => undefined);
     expect((h.captured.https ?? {})['maxHeaderSize']).toBe(32_768);
+  });
+
+  it('uses headersDistinct for gates and preserves every origin field instance', async () => {
+    h.scenario.ready = true;
+    h.scenario.responseHeadersDistinct = {
+      'content-type': ['text/html; charset=utf-8', 'application/json'],
+      'content-disposition': ['inline', 'attachment; filename="page.html"'],
+      'cache-control': ['public', 'no-transform'],
+      'x-robots-tag': ['follow', 'noindex'],
+      'set-cookie': ['a=1', 'b=2'],
+    };
+
+    const result = await fetchOriginHtml(
+      'http://origin.internal/page',
+      'www.example.com',
+      1000,
+      1000,
+      MAX_RESPONSE_HEADER_BYTES
+    );
+
+    expect(result.contentType).toBe('text/html; charset=utf-8, application/json');
+    expect(result.contentDisposition).toBe('inline, attachment; filename="page.html"');
+    expect(result.cacheControl).toBe('public, no-transform');
+    expect(result.xRobotsTag).toBe('follow, noindex');
+    expect(result.hasSetCookie).toBe(true);
+    expect(result.allHeaders['content-type']).toEqual([
+      'text/html; charset=utf-8',
+      'application/json',
+    ]);
+    expect(result.allHeaders['set-cookie']).toEqual(['a=1', 'b=2']);
   });
 
   it.each(['ENOTFOUND', 'ECONNREFUSED', 'ABORT_ERR'])(

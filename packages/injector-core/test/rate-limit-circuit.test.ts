@@ -15,7 +15,52 @@ const NOW = 1_700_000_000_000;
 const TTL_MS = 60_000;
 const URL_A = 'https://example.com/a';
 const URL_B = 'https://example.com/b';
+const URL_C = 'https://example.com/c';
 const RAW_JSONLD = '{"@context":"https://schema.org","@type":"Product"}';
+
+const REGISTER_429_HEADER_CASES: ReadonlyArray<{
+  name: string;
+  headers: HeadersInit;
+  localMs: number;
+  sharedMs: number;
+}> = [
+  {
+    name: 'Retry-After delay-seconds',
+    headers: { 'Retry-After': '7200' },
+    localMs: 7_200_000,
+    sharedMs: 60_000,
+  },
+  {
+    name: 'Retry-After HTTP-date',
+    headers: { 'Retry-After': new Date(NOW + 7_200_000).toUTCString() },
+    localMs: 7_200_000,
+    sharedMs: 60_000,
+  },
+  {
+    name: 'RateLimit-Reset fallback after an invalid Retry-After',
+    headers: { 'Retry-After': 'invalid', 'RateLimit-Reset': '7200' },
+    localMs: 7_200_000,
+    sharedMs: 60_000,
+  },
+  {
+    name: 'Retry-After precedence over RateLimit-Reset',
+    headers: { 'Retry-After': '17', 'RateLimit-Reset': '7200' },
+    localMs: 17_000,
+    sharedMs: 17_000,
+  },
+  {
+    name: 'path caps for an excessive Retry-After',
+    headers: { 'Retry-After': '999999999' },
+    localMs: 86_400_000,
+    sharedMs: 60_000,
+  },
+  {
+    name: 'default backoff without a usable header',
+    headers: {},
+    localMs: 10_000,
+    sharedMs: 10_000,
+  },
+];
 
 function config(fetchImpl: Fetcher, apiKey = 'sk-shared') {
   return defineConfig({ apiKey, cacheTtlMs: TTL_MS, fetchImpl });
@@ -56,7 +101,7 @@ describe('API-key-wide rate-limit circuit', () => {
     expect(fetchImpl.mock.calls[1]?.[1].method).toBe('POST');
   });
 
-  it('retains a legacy GET-404 follow-up POST rate limit across other URLs', async () => {
+  it('caps a long legacy POST 429 to 60 s globally while retaining its URL-local hint', async () => {
     const fetchImpl = vi
       .fn<Fetcher>()
       .mockResolvedValueOnce(new Response('', { status: 404 }))
@@ -70,36 +115,132 @@ describe('API-key-wide rate-limit circuit', () => {
       cacheTtlMs: TTL_MS,
       fetchImpl,
     });
+    const cacheA = new MemoryCache();
+    const cacheB = new MemoryCache();
 
-    const first = await getJsonLdLookup(URL_A, new MemoryCache(), sharedConfig);
-    const blocked = await getJsonLdLookup(URL_B, new MemoryCache(), sharedConfig);
+    const first = await getJsonLdLookup(URL_A, cacheA, sharedConfig);
+    const blocked = await getJsonLdLookup(URL_B, cacheB, sharedConfig);
 
     expect(first).toEqual({ snippet: null, revalidateInMs: 7_200_000 });
-    expect(blocked).toEqual({ snippet: null, revalidateInMs: 7_200_000 });
+    expect(blocked).toEqual({ snippet: null, revalidateInMs: 60_000 });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(fetchImpl.mock.calls[0]?.[1].method).toBe('GET');
     expect(fetchImpl.mock.calls[1]?.[1].method).toBe('POST');
+
+    vi.advanceTimersByTime(60_001);
+    await expect(getJsonLdLookup(URL_A, cacheA, sharedConfig)).resolves.toEqual({
+      snippet: null,
+      revalidateInMs: 7_139_999,
+    });
+    const recovered = await getJsonLdLookup(URL_B, cacheB, sharedConfig);
+    expect(recovered.snippet).toBe(buildScriptTag(RAW_JSONLD, null));
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl.mock.calls[2]?.[1].method).toBe('GET');
   });
 
-  it('uses the already capped register deadline for a 403 across the GET path', async () => {
-    const fetchImpl = vi.fn<Fetcher>(() =>
-      Promise.resolve(
+  describe.each(['direct', 'legacy'] as const)('%s register 429 header handling', (mode) => {
+    it.each(REGISTER_429_HEADER_CASES)('$name', async ({ headers, localMs, sharedMs }) => {
+      const fetchImpl = vi.fn<Fetcher>();
+      if (mode === 'legacy') {
+        fetchImpl.mockResolvedValueOnce(new Response('', { status: 404 }));
+      }
+      fetchImpl
+        .mockResolvedValueOnce(new Response('rate limited', { status: 429, headers }))
+        .mockResolvedValue(new Response(RAW_JSONLD, { status: 200 }));
+
+      const sharedConfig = defineConfig({
+        apiKey: 'sk-shared',
+        autoRegister: mode === 'legacy',
+        cacheTtlMs: TTL_MS,
+        fetchImpl,
+      });
+      const lookup = mode === 'direct' ? getJsonLdRegisterLookup : getJsonLdLookup;
+      const cacheA = new MemoryCache();
+      const cacheB = new MemoryCache();
+
+      await expect(lookup(URL_A, cacheA, sharedConfig)).resolves.toEqual({
+        snippet: null,
+        revalidateInMs: localMs,
+      });
+      await expect(lookup(URL_B, cacheB, sharedConfig)).resolves.toEqual({
+        snippet: null,
+        revalidateInMs: sharedMs,
+      });
+      expect(fetchImpl.mock.calls.map((call) => call[1].method)).toEqual(
+        mode === 'direct' ? ['POST'] : ['GET', 'POST']
+      );
+
+      if (localMs > 60_000) {
+        vi.advanceTimersByTime(60_001);
+        const recovered = await lookup(URL_B, cacheB, sharedConfig);
+        expect(recovered.snippet).toBe(buildScriptTag(RAW_JSONLD, null));
+        await expect(lookup(URL_A, cacheA, sharedConfig)).resolves.toEqual({
+          snippet: null,
+          revalidateInMs: localMs - 60_001,
+        });
+        expect(fetchImpl.mock.calls.map((call) => call[1].method)).toEqual(
+          mode === 'direct' ? ['POST', 'POST'] : ['GET', 'POST', 'GET']
+        );
+      }
+    });
+  });
+
+  it('keeps a Retry-After register 403 URL-local while cold GET and POST records still load', async () => {
+    const fetchImpl = vi
+      .fn<Fetcher>()
+      .mockResolvedValueOnce(
         new Response('hard cap', { status: 403, headers: { 'Retry-After': '999999999' } })
       )
-    );
+      .mockResolvedValueOnce(new Response(RAW_JSONLD, { status: 200 }))
+      .mockResolvedValueOnce(new Response(RAW_JSONLD, { status: 200 }));
     const sharedConfig = config(fetchImpl);
+    const limitedCache = new MemoryCache();
 
-    await getJsonLdRegisterLookup(URL_A, new MemoryCache(), sharedConfig);
-    const blocked = await getJsonLdLookup(URL_B, new MemoryCache(), sharedConfig);
+    const limited = await getJsonLdRegisterLookup(URL_A, limitedCache, sharedConfig);
+    const viaGet = await getJsonLdLookup(URL_B, new MemoryCache(), sharedConfig);
+    const viaPost = await getJsonLdRegisterLookup(URL_C, new MemoryCache(), sharedConfig);
 
-    expect(blocked).toEqual({ snippet: null, revalidateInMs: 86_400_000 });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(limited).toEqual({ snippet: null, revalidateInMs: 86_400_000 });
+    expect(viaGet.snippet).toBe(buildScriptTag(RAW_JSONLD, null));
+    expect(viaPost.snippet).toBe(buildScriptTag(RAW_JSONLD, null));
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl.mock.calls.map((call) => call[1].method)).toEqual(['POST', 'GET', 'POST']);
+
+    vi.advanceTimersByTime(3_600_000);
+    await expect(getJsonLdRegisterLookup(URL_A, limitedCache, sharedConfig)).resolves.toEqual({
+      snippet: null,
+      revalidateInMs: 82_800_000,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
-  it('extends a fresh negative result to the later org-wide circuit deadline', async () => {
+  it('keeps a compatibility GET→404→POST 403 local to the attempted URL', async () => {
+    const fetchImpl = vi
+      .fn<Fetcher>()
+      .mockResolvedValueOnce(new Response('', { status: 404 }))
+      .mockResolvedValueOnce(
+        new Response('hard cap', { status: 403, headers: { 'Retry-After': '86400' } })
+      )
+      .mockResolvedValueOnce(new Response(RAW_JSONLD, { status: 200 }));
+    const sharedConfig = defineConfig({
+      apiKey: 'sk-shared',
+      autoRegister: true,
+      cacheTtlMs: TTL_MS,
+      fetchImpl,
+    });
+
+    const limited = await getJsonLdLookup(URL_A, new MemoryCache(), sharedConfig);
+    const other = await getJsonLdLookup(URL_B, new MemoryCache(), sharedConfig);
+
+    expect(limited).toEqual({ snippet: null, revalidateInMs: 86_400_000 });
+    expect(other.snippet).toBe(buildScriptTag(RAW_JSONLD, null));
+    expect(fetchImpl.mock.calls.map((call) => call[1].method)).toEqual(['GET', 'POST', 'GET']);
+  });
+
+  it('extends a fresh negative only to the 60 s shared POST-429 deadline', async () => {
     const fetchImpl = vi.fn<Fetcher>(() =>
       Promise.resolve(
-        new Response('hard cap', { status: 403, headers: { 'Retry-After': '86400' } })
+        new Response('rate limited', { status: 429, headers: { 'Retry-After': '86400' } })
       )
     );
     const sharedConfig = config(fetchImpl);
@@ -110,10 +251,11 @@ describe('API-key-wide rate-limit circuit', () => {
       storedAt: NOW,
     });
 
+    vi.advanceTimersByTime(30_000);
     await getJsonLdRegisterLookup(URL_A, new MemoryCache(), sharedConfig);
     const blocked = await getJsonLdLookup(URL_B, cache, sharedConfig);
 
-    expect(blocked).toEqual({ snippet: null, revalidateInMs: 86_400_000 });
+    expect(blocked).toEqual({ snippet: null, revalidateInMs: 60_000 });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 

@@ -721,10 +721,10 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       !shouldAttemptGeneratedResponse({
         method: 'GET',
         status: String(origin.status),
-        contentType: origin.contentType,
+        contentType: origin.allHeaders['content-type'] ?? null,
         contentEncoding: origin.contentEncoding,
-        cacheControl: origin.cacheControl,
-        contentDisposition: origin.contentDisposition,
+        cacheControl: origin.allHeaders['cache-control'] ?? null,
+        contentDisposition: origin.allHeaders['content-disposition'] ?? null,
         hasSetCookie: origin.hasSetCookie,
       })
     ) {

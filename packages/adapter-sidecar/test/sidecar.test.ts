@@ -28,6 +28,7 @@ const UTF8_HTML = '<html><head><title>ok</title></head><body>utf-8 page</body></
 let origin: http.Server;
 let enhancelyStub: http.Server;
 let sidecar: http.Server;
+let enhancelyHits = 0;
 
 function portOf(server: http.Server): number {
   const address = server.address();
@@ -42,7 +43,12 @@ function listen(server: http.Server): Promise<void> {
 function get(
   port: number,
   path: string
-): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
+): Promise<{
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  headersDistinct: NodeJS.Dict<string[]>;
+  body: Buffer;
+}> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: '127.0.0.1', port, path, method: 'GET', agent: false },
@@ -53,6 +59,7 @@ function get(
           resolve({
             status: res.statusCode ?? 0,
             headers: res.headers,
+            headersDistinct: res.headersDistinct,
             body: Buffer.concat(chunks),
           })
         );
@@ -75,6 +82,24 @@ before(async () => {
     } else if (req.url === '/utf8') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(UTF8_HTML);
+    } else if (req.url === '/conflicting-content-type') {
+      res.writeHead(200, [
+        'Content-Type',
+        'text/html; charset=utf-8',
+        'Content-Type',
+        'application/json',
+      ]);
+      res.end(UTF8_HTML);
+    } else if (req.url === '/conflicting-disposition') {
+      res.writeHead(200, [
+        'Content-Type',
+        'text/html; charset=utf-8',
+        'Content-Disposition',
+        'inline',
+        'Content-Disposition',
+        'attachment; filename="page.html"',
+      ]);
+      res.end(UTF8_HTML);
     } else {
       res.writeHead(404, { 'content-type': 'text/plain' });
       res.end('not found');
@@ -83,6 +108,7 @@ before(async () => {
   await listen(origin);
 
   enhancelyStub = http.createServer((req, res) => {
+    enhancelyHits += 1;
     // GET /api/v1/jsonld/{encodeURIComponent(rawPageUrl)}
     const segment = decodeURIComponent(req.url ?? '');
     if (segment.includes('/utf8')) {
@@ -139,4 +165,26 @@ void test('utf-8 page gets the JSON-LD snippet injected before </head>', async (
   assert.equal(html, UTF8_HTML.replace('</head>', `${SNIPPET}</head>`));
   assert.equal(Number(res.headers['content-length']), res.body.byteLength);
   assert.equal(res.headers['content-type'], 'text/html; charset=utf-8');
+});
+
+void test('conflicting Content-Type instances veto injection and survive pass-through', async () => {
+  const hitsBefore = enhancelyHits;
+  const res = await get(portOf(sidecar), '/conflicting-content-type');
+  assert.equal(Buffer.compare(res.body, Buffer.from(UTF8_HTML)), 0);
+  assert.deepEqual(res.headersDistinct['content-type'], [
+    'text/html; charset=utf-8',
+    'application/json',
+  ]);
+  assert.equal(enhancelyHits, hitsBefore);
+});
+
+void test('every Content-Disposition instance reaches the gate and pass-through', async () => {
+  const hitsBefore = enhancelyHits;
+  const res = await get(portOf(sidecar), '/conflicting-disposition');
+  assert.equal(Buffer.compare(res.body, Buffer.from(UTF8_HTML)), 0);
+  assert.deepEqual(res.headersDistinct['content-disposition'], [
+    'inline',
+    'attachment; filename="page.html"',
+  ]);
+  assert.equal(enhancelyHits, hitsBefore);
 });

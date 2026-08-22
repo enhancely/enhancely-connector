@@ -37,7 +37,17 @@ export {
 } from './encoding.js';
 export { matchesExcludedPath } from './exclude.js';
 export { blocksIndexing } from './robots.js';
-export { isAttachmentDisposition } from './representation.js';
+export {
+  hasNoTransformDirective,
+  isAttachmentDisposition,
+  isHtmlMediaType,
+} from './representation.js';
+export type { HttpFieldValue } from './representation.js';
+export {
+  hasCommaInsideHttpQuotes,
+  splitOutsideHttpQuotesStrict,
+  trimHttpOws,
+} from './header-value.js';
 export { __resetRateLimitCircuitForTests } from './rate-limit-circuit.js';
 
 import type {
@@ -53,6 +63,7 @@ import { isFresh } from './cache.js';
 import { fetchJsonLd, registerOrRevalidate } from './client.js';
 import { buildScriptTag, findHeadInjectionPoint, injectIntoHead } from './inject.js';
 import { getRateLimitDeadline, recordRateLimitDeadline } from './rate-limit-circuit.js';
+import { isHtmlMediaType } from './representation.js';
 
 /** Positive entry → script tag, negative entry (404 memo) → null. */
 function snippetFromEntry(entry: CacheEntry): string | null {
@@ -84,26 +95,16 @@ function lookupFromEntry(
   };
 }
 
-/**
- * True only for the EXACT `text/html` media type (parameters stripped).
- * A prefix check would wrongly match e.g. `text/htmlx` (repo rule 5).
- * Shared with the adapters so the gate logic has one source of truth.
- */
-export function isHtmlMediaType(contentType: string | null): boolean {
-  if (contentType === null) return false;
-  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'text/html';
-}
-
 /** Backoff after an upstream error/timeout (or a 429 without Retry-After). */
 const DEFAULT_RETRY_BACKOFF_MS = 10_000;
-/** Upper bound for honoring 429 Retry-After (keeps memos short-lived). */
+/** Upper bound for GET backoff and every API-key-wide 429 circuit. */
 const MAX_RETRY_BACKOFF_MS = 60_000;
 /**
  * Upper bound for honoring Retry-After on the register-or-revalidate path.
- * Durable server states (plan hard cap 403, monthly limit 429) send day-scale
- * values; honoring them only up to 60 s would re-POST every URL every TTL for
- * the rest of a billing cycle. Still bounded so a bogus header cannot park a
- * URL forever.
+ * Durable server states (plan hard cap 403, monthly limit 429) may send
+ * day-scale values. These long memos are URL-local; a genuine 429 additionally
+ * opens the API-key-wide circuit for at most MAX_RETRY_BACKOFF_MS so one URL
+ * cannot suppress paid/known records across a whole execution environment.
  */
 const MAX_REGISTER_BACKOFF_MS = 86_400_000;
 
@@ -193,6 +194,20 @@ function sameCacheEntry(left: CacheEntry | undefined, right: CacheEntry | undefi
   );
 }
 
+/** True when an in-flight error only decorated its original snapshot with a retry deadline. */
+function sameCacheEntryIgnoringRetry(
+  left: CacheEntry | undefined,
+  right: CacheEntry | undefined
+): boolean {
+  if (left === undefined || right === undefined) return false;
+  return (
+    left.jsonldRaw === right.jsonldRaw &&
+    left.etag === right.etag &&
+    left.storedAt === right.storedAt &&
+    left.registrationPending === right.registrationPending
+  );
+}
+
 /**
  * Store a result only if no other lookup advanced this key in the meantime.
  * There is no atomic CAS in CacheBackend, but this closes the important local
@@ -207,6 +222,27 @@ async function storeIfSnapshotUnchanged(
 ): Promise<CacheEntry> {
   return withCacheWriteLock(cache, key, async () => {
     const current = await cache.get(key);
+    const isConcurrentRetryOnlyMemo =
+      current !== undefined &&
+      current.retryNotBefore !== undefined &&
+      !sameCacheEntry(current, snapshot) &&
+      sameCacheEntryIgnoringRetry(current, snapshot);
+
+    if (isConcurrentRetryOnlyMemo) {
+      // A successful positive response authoritatively clears retry-only
+      // state. A successful negative response is authoritative about the
+      // record fields but must inherit the longest independent backoff.
+      const resolved: CacheEntry =
+        entry.jsonldRaw === null
+          ? {
+              ...entry,
+              retryNotBefore: Math.max(entry.retryNotBefore ?? 0, current.retryNotBefore ?? 0),
+            }
+          : entry;
+      await cache.set(key, resolved);
+      return resolved;
+    }
+
     if (
       current !== undefined &&
       !sameCacheEntry(current, snapshot) &&
@@ -216,6 +252,78 @@ async function storeIfSnapshotUnchanged(
     }
     await cache.set(key, entry);
     return entry;
+  });
+}
+
+/**
+ * Commit a transient-failure memo without losing a longer deadline written by
+ * the other lookup mode. A concurrently stored positive is authoritative and
+ * remains byte-for-byte untouched. Concurrent negatives describe the same
+ * lack of a snippet, so retain their newer state and atomically merge only the
+ * latest retry deadline. If an adapter evicted the snapshot while the request
+ * was in flight, restore the memo so the next view does not immediately retry.
+ */
+async function storeBackoffMemo(
+  cache: CacheBackend,
+  key: string,
+  snapshot: CacheEntry | undefined,
+  memo: CacheEntry & { retryNotBefore: number }
+): Promise<CacheEntry> {
+  return withCacheWriteLock(cache, key, async () => {
+    const current = await cache.get(key);
+    if (sameCacheEntry(current, snapshot) || current === undefined) {
+      await cache.set(key, memo);
+      return memo;
+    }
+
+    const isRetryOnlySnapshotMemo =
+      current.retryNotBefore !== undefined && sameCacheEntryIgnoringRetry(current, snapshot);
+    if (current.jsonldRaw !== null && !isRetryOnlySnapshotMemo) return current;
+
+    const merged: CacheEntry = {
+      ...current,
+      retryNotBefore: Math.max(current.retryNotBefore ?? 0, memo.retryNotBefore),
+    };
+    await cache.set(key, merged);
+    return merged;
+  });
+}
+
+/**
+ * Commit a successful 404 without discarding a transient deadline that the
+ * register flight stored from the same initial snapshot. The fresh 404 time
+ * and the registration backoff are independent facts, so their merge must be
+ * commutative: keep the 404 fields and the longest concurrent retry deadline.
+ */
+async function storeNotFoundMergingConcurrentBackoff(
+  cache: CacheBackend,
+  key: string,
+  snapshot: CacheEntry | undefined,
+  entry: CacheEntry & { jsonldRaw: null }
+): Promise<CacheEntry> {
+  return withCacheWriteLock(cache, key, async () => {
+    const current = await cache.get(key);
+    if (sameCacheEntry(current, snapshot) || current === undefined) {
+      await cache.set(key, entry);
+      return entry;
+    }
+
+    const isRetryOnlySnapshotMemo =
+      current.retryNotBefore !== undefined && sameCacheEntryIgnoringRetry(current, snapshot);
+    if (
+      current.retryNotBefore === undefined ||
+      (current.jsonldRaw !== null && !isRetryOnlySnapshotMemo)
+    ) {
+      return current;
+    }
+
+    const merged: CacheEntry = {
+      ...entry,
+      ...(current.registrationPending === true && { registrationPending: true }),
+      retryNotBefore: Math.max(entry.retryNotBefore ?? 0, current.retryNotBefore),
+    };
+    await cache.set(key, merged);
+    return merged;
   });
 }
 
@@ -258,15 +366,15 @@ function lookupDuringRateLimit(
  * for adapters that manage a downstream page cache.
  *
  * - Fresh cache entry → answered locally (positive → snippet, negative → null).
- * - Entry carrying a retry backoff memo (previous 429/error) that has not
+ * - Entry carrying a retry backoff memo (previous 429/403/error) that has not
  *   elapsed → answered locally too, so page views never hammer a rate-limited
  *   or down API (nor pay the fetch timeout each time).
  * - Concurrent requests for the same cache, normalized URL and lookup mode
  *   share one in-flight operation.
- * - A rate limit opens an execution-environment-local circuit for the same
+ * - Only HTTP 429 opens an execution-environment-local circuit for the same
  *   Enhancely base/API-key/fetch scope. Other stale or missing URLs then
- *   answer locally until the already-capped retry deadline; GET and register
- *   POST share that scope.
+ *   answer locally for at most 60 seconds; GET and register POST share that
+ *   scope. A registration-limit 403 always remains URL-local.
  * - Stale/missing → one upstream call (`call`: conditional GET for the lookup
  *   path, register-or-revalidate POST for the discovery path; both send
  *   If-None-Match when we hold an ETag):
@@ -280,8 +388,9 @@ function lookupDuringRateLimit(
  *     for a full TTL, never re-registered
  *   - 429/403/error/timeout → serve the stale entry as-is if we have one
  *     (without touching storedAt) and record a retryNotBefore memo:
- *     min(Retry-After, maxBackoffMs) when sent, 10 s otherwise. Rate-limited
- *     results also open the API-key-wide circuit; plain errors remain URL-local.
+ *     min(Retry-After, maxBackoffMs) when sent, 10 s otherwise. Only 429
+ *     results also open the separately 60-second-capped API-key-wide circuit;
+ *     registration-limit 403 and plain errors remain URL-local.
  *
  * The API request carries the strictly validated, query-stripped URL
  * (`normalizeLite` semantics, = the cache key), never a locally computed hash.
@@ -447,27 +556,32 @@ async function resolveLookup(
             }
 
             // The compatibility POST is still an Enhancely call: retain its
-            // Retry-After and open the shared org circuit exactly like the
-            // one-call register path. Treat the impossible hint-less 412 as a
-            // short transient error rather than caching the GET 404 for a full
-            // TTL and silently discarding the registration outcome.
+            // URL-local Retry-After. Only a real 429 opens the shared circuit,
+            // and that circuit is capped separately at 60 s; a plan-limit 403
+            // must not suppress reads for other URLs. Treat the impossible
+            // hint-less 412 as a short transient error rather than caching the
+            // GET 404 for a full TTL and discarding the registration outcome.
             if (
               registration.status === 'rate-limited' ||
+              registration.status === 'registration-limited' ||
               registration.status === 'error' ||
               registration.status === 'not-modified'
             ) {
               const backoffMs =
-                registration.status === 'rate-limited' && registration.retryAfterSeconds !== null
+                (registration.status === 'rate-limited' ||
+                  registration.status === 'registration-limited') &&
+                registration.retryAfterSeconds !== null
                   ? Math.min(
                       Math.max(registration.retryAfterSeconds, 1) * 1000,
                       MAX_REGISTER_BACKOFF_MS
                     )
                   : DEFAULT_RETRY_BACKOFF_MS;
-              const retryNotBefore = Date.now() + backoffMs;
+              const now = Date.now();
+              const retryNotBefore = now + backoffMs;
               if (registration.status === 'rate-limited') {
-                recordRateLimitDeadline(config, retryNotBefore);
+                recordRateLimitDeadline(config, now + Math.min(backoffMs, MAX_RETRY_BACKOFF_MS));
               }
-              const entry = await storeIfSnapshotUnchanged(cache, key, cached, {
+              const entry = await storeBackoffMemo(cache, key, cached, {
                 jsonldRaw: null,
                 etag: null,
                 storedAt: 0,
@@ -476,7 +590,7 @@ async function resolveLookup(
               return lookupFromEntry(entry, config.cacheTtlMs);
             }
           }
-          const entry = await storeIfSnapshotUnchanged(cache, key, cached, {
+          const entry = await storeNotFoundMergingConcurrentBackoff(cache, key, cached, {
             jsonldRaw: null,
             etag: null,
             storedAt: Date.now(),
@@ -484,38 +598,32 @@ async function resolveLookup(
           });
           return lookupFromEntry(entry, config.cacheTtlMs);
         }
+        case 'registration-limited':
         case 'rate-limited':
         case 'error': {
           // Serve stale rather than nothing, but do NOT refresh storedAt: after
           // the backoff below, the next request retries Enhancely instead of
           // trusting this entry for another full TTL.
           const backoffMs =
-            result.status === 'rate-limited' && result.retryAfterSeconds !== null
+            (result.status === 'rate-limited' || result.status === 'registration-limited') &&
+            result.retryAfterSeconds !== null
               ? Math.min(Math.max(result.retryAfterSeconds, 1) * 1000, opts.maxBackoffMs)
               : DEFAULT_RETRY_BACKOFF_MS;
-          const retryNotBefore = Date.now() + backoffMs;
+          const now = Date.now();
+          const retryNotBefore = now + backoffMs;
           if (result.status === 'rate-limited') {
-            recordRateLimitDeadline(config, retryNotBefore);
+            recordRateLimitDeadline(config, now + Math.min(backoffMs, MAX_RETRY_BACKOFF_MS));
           }
-          const memo: CacheEntry = {
+          const memo: CacheEntry & { retryNotBefore: number } = {
             jsonldRaw: cached?.jsonldRaw ?? null,
             etag: cached?.etag ?? null,
             storedAt: cached?.storedAt ?? 0,
             ...(cached?.registrationPending === true && { registrationPending: true }),
             retryNotBefore,
           };
-          let served = memo;
+          let served: CacheEntry = memo;
           try {
-            served = await withCacheWriteLock(cache, key, async () => {
-              const current = await cache.get(key);
-              if (sameCacheEntry(current, cached)) {
-                await cache.set(key, memo);
-                return memo;
-              }
-              // A different-mode flight completed while ours was failing. Use
-              // its newer result for this response and never overwrite it.
-              return current ?? memo;
-            });
+            served = await storeBackoffMemo(cache, key, cached, memo);
           } catch {
             // The memo is best-effort; serving stale must not depend on it.
           }
@@ -547,8 +655,9 @@ export async function getJsonLdLookup(
  * pair — unknown URLs are registered, known ones are revalidated (412) or
  * fetched (200) in the same round-trip, and the entry this stores makes the
  * NEXT miss inject. `autoRegister` is irrelevant here: the call itself is the
- * registration. Rate-limit backoffs honor day-scale Retry-After values
- * (plan caps), bounded by MAX_REGISTER_BACKOFF_MS.
+ * registration. URL-local register backoffs honor day-scale Retry-After
+ * values, bounded by MAX_REGISTER_BACKOFF_MS; the shared 429 circuit remains
+ * capped at 60 seconds and a plan-limit 403 never opens it.
  *
  * Never throws.
  */

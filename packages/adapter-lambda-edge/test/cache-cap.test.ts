@@ -1,7 +1,7 @@
 import type { CloudFrontHeaders } from 'aws-lambda';
 import { describe, expect, it, vi } from 'vitest';
 
-import { retrySharedTtlSeconds } from '../src/cache-cap.js';
+import { retryablePassThroughResponse, retrySharedTtlSeconds } from '../src/cache-cap.js';
 
 function headers(values: Record<string, string[]>): CloudFrontHeaders {
   return Object.fromEntries(
@@ -127,6 +127,32 @@ describe('retrySharedTtlSeconds — ambiguous origin freshness', () => {
         86_400
       )
     ).toBe(0);
+  });
+
+  it('does not let separate malformed field instances heal each other', () => {
+    expect(
+      retrySharedTtlSeconds(
+        headers({ 'cache-control': ['foo="unterminated', '", max-age=3600'] }),
+        600_000,
+        86_400
+      )
+    ).toBe(0);
+  });
+
+  it('leaves an ambiguous multi-instance policy byte-for-byte untouched', () => {
+    const response = {
+      status: '200',
+      headers: headers({
+        'cache-control': ['foo="unterminated', 'no-store", max-age=600'],
+      }),
+    };
+
+    expect(
+      retryablePassThroughResponse(response, {}, 30_000, {
+        assertedDefaultTtlSeconds: 86_400,
+        capSetCookieResponses: false,
+      })
+    ).toBe(response);
   });
 
   it('accepts a strict IMF-fixdate and caps it to the retry window', () => {

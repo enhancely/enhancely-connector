@@ -16,7 +16,14 @@
  *   - no Content-Encoding (TODO(gzip): no decode support).
  */
 
-import { blocksIndexing, charsetOf, isAttachmentDisposition } from '@enhancely/injector-core';
+import {
+  blocksIndexing,
+  charsetOf,
+  hasNoTransformDirective,
+  isAttachmentDisposition,
+  isHtmlMediaType,
+} from '@enhancely/injector-core';
+import type { HttpFieldValue } from '@enhancely/injector-core';
 export { charsetOf } from '@enhancely/injector-core';
 
 /** Hard buffering cap; larger HTML stays on the streaming pass-through path. */
@@ -31,15 +38,15 @@ export interface UpstreamGateInput {
   /** Upstream response status code. */
   status: number | undefined;
   /** Upstream Content-Type header (may include a charset parameter). */
-  contentType: string | undefined;
+  contentType: HttpFieldValue;
   /** Upstream Content-Encoding header (any value → pass through). */
   contentEncoding: string | undefined;
   /** Combined upstream X-Robots-Tag header. */
   xRobotsTag: string | undefined;
   /** Upstream Cache-Control, used for the no-transform directive. */
-  cacheControl: string | undefined;
+  cacheControl: HttpFieldValue;
   /** Download responses are not page HTML even when mislabeled text/html. */
-  contentDisposition: string | undefined;
+  contentDisposition: HttpFieldValue;
   /** Valid upstream Content-Length, if present, enables a zero-buffer veto. */
   contentLength: string | undefined;
   /** Whether an Enhancely API key is configured. */
@@ -52,13 +59,11 @@ export function isInjectableUpstream(input: UpstreamGateInput): boolean {
   if (input.method !== 'GET') return false;
   if (input.status !== 200) return false;
 
-  const contentType = input.contentType ?? '';
-  // Compare the media type exactly (parameters stripped) — a prefix check
-  // would wrongly match e.g. "text/htmlx".
-  const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase();
-  if (mediaType !== 'text/html') return false;
+  if (!isHtmlMediaType(input.contentType)) return false;
+  const contentType =
+    typeof input.contentType === 'string' ? input.contentType : (input.contentType?.[0] ?? '');
   if (blocksIndexing(input.xRobotsTag)) return false;
-  if (/(?:^|[\s,])no-transform(?:$|[\s,=])/i.test(input.cacheControl ?? '')) return false;
+  if (hasNoTransformDirective(input.cacheControl)) return false;
   if (isAttachmentDisposition(input.contentDisposition)) return false;
 
   const contentLength = input.contentLength?.trim();

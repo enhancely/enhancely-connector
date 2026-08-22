@@ -66,7 +66,8 @@ docker run --rm -p 8080:8080 \
 - **Passed through untouched (streaming)**: everything else — non-HTML,
   non-200, non-GET, non-UTF-8 declared charsets (no transcoding support),
   ambiguous/invalid bytes, `Content-Encoding` present (an origin may ignore the
-  identity request), `no-transform`, attachment/noindex responses, oversized
+  identity request), `no-transform`, valid non-`inline` disposition/noindex
+  responses, oversized
   bodies, any Enhancely API failure/timeout (fail-open), and everything when
   `ENHANCELY_API_KEY` is missing. An unsafe or normalization-unstable page URL
   (notably multiple literal trailing slashes) also skips cache/API work so the

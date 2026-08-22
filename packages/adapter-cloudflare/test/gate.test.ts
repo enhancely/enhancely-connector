@@ -61,6 +61,76 @@ describe('shouldAttemptInjection', () => {
     ).toBe(false);
   });
 
+  it('rejects folded quoted commas because Workers hides field-instance boundaries', () => {
+    const folded = (name: string, values: string[]): string | null => {
+      const headers = new Headers();
+      for (const value of values) headers.append(name, value);
+      return headers.get(name);
+    };
+
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        contentType: folded('content-type', [
+          'text/html; profile="unterminated',
+          'application/json"',
+        ]),
+      })
+    ).toBe(false);
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        cacheControl: folded('cache-control', ['public, ext="unterminated', 'no-transform"']),
+      })
+    ).toBe(false);
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        contentDisposition: folded('content-disposition', [
+          'inline; filename="unterminated',
+          'attachment"',
+        ]),
+      })
+    ).toBe(false);
+
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        contentType: folded('content-type', [
+          'text/html; profile="unterminated' + '\\',
+          'application/json"',
+        ]),
+      })
+    ).toBe(false);
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        cacheControl: folded('cache-control', [
+          'public, ext="unterminated' + '\\',
+          'no-transform"',
+        ]),
+      })
+    ).toBe(false);
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        contentDisposition: folded('content-disposition', [
+          'inline; filename="unterminated' + '\\',
+          'attachment"',
+        ]),
+      })
+    ).toBe(false);
+
+    // A legitimate quoted comma is indistinguishable after Fetch folding and
+    // therefore deliberately under-injects on this adapter.
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        contentType: 'text/html; profile="one,two"',
+      })
+    ).toBe(false);
+  });
+
   it('rejects noindex/none robots directives', () => {
     for (const xRobotsTag of ['noindex', 'index, nofollow, none', 'googlebot: noindex']) {
       expect(shouldAttemptInjection({ ...okInput, xRobotsTag })).toBe(false);

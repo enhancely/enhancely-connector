@@ -30,9 +30,8 @@ import { matchesExcludedPath } from '@enhancely/injector-core';
 import {
   blocksIndexing,
   buildOriginUrl,
-  cacheControlValue,
   combinedHeaderValue,
-  headerValue,
+  headerValues,
   INJECTED_MARKER_HEADER,
   NON_HTML_EXTENSION,
   shouldAttemptGeneratedResponse,
@@ -94,10 +93,10 @@ export const handler = async (
     const input: AttemptInput = {
       method: request.method,
       status: response.status,
-      contentType: headerValue(response.headers, 'content-type'),
+      contentType: headerValues(response.headers, 'content-type'),
       contentEncoding: null,
-      cacheControl: cacheControlValue(response.headers),
-      contentDisposition: combinedHeaderValue(response.headers, 'content-disposition'),
+      cacheControl: headerValues(response.headers, 'cache-control'),
+      contentDisposition: headerValues(response.headers, 'content-disposition'),
       hasSetCookie: response.headers['set-cookie'] !== undefined,
     };
     if (!shouldAttemptGeneratedResponse(input)) return response;

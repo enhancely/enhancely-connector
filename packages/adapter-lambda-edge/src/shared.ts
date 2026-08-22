@@ -11,7 +11,13 @@
  * consumers and tests keep their import paths.
  */
 import type { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda';
-import { charsetOf, isAttachmentDisposition } from '@enhancely/injector-core';
+import type { HttpFieldValue } from '@enhancely/injector-core';
+import {
+  charsetOf,
+  hasNoTransformDirective,
+  isAttachmentDisposition,
+  isHtmlMediaType,
+} from '@enhancely/injector-core';
 export {
   blocksIndexing,
   charsetOf,
@@ -118,24 +124,25 @@ export interface AttemptInput {
   /** CloudFront response status — a STRING in Lambda@Edge events. */
   status: string;
   /** Response Content-Type header value (may include a charset). */
-  contentType: string | null;
+  contentType: HttpFieldValue;
   /** Response Content-Encoding header value. */
   contentEncoding: string | null;
   /** Response Cache-Control header value. */
-  cacheControl: string | null;
+  cacheControl: HttpFieldValue;
   /** Response Content-Disposition header value. */
-  contentDisposition: string | null;
+  contentDisposition: HttpFieldValue;
   /** True when the response carries any Set-Cookie header. */
   hasSetCookie: boolean;
 }
 
 /** `private` / `no-store` as Cache-Control directives (not substrings). */
 const PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
-const NO_TRANSFORM_CACHE_CONTROL = /(?:^|[\s,])no-transform(?:$|[\s,=])/i;
 
 /** True when the Cache-Control marks a per-request representation. */
-export function hasPerRequestCacheControl(cacheControl: string | null): boolean {
-  return cacheControl !== null && PER_REQUEST_CACHE_CONTROL.test(cacheControl);
+export function hasPerRequestCacheControl(cacheControl: HttpFieldValue): boolean {
+  if (cacheControl === null || cacheControl === undefined) return false;
+  const instances = typeof cacheControl === 'string' ? [cacheControl] : cacheControl;
+  return instances.some((value) => PER_REQUEST_CACHE_CONTROL.test(value));
 }
 
 /**
@@ -166,15 +173,13 @@ function isInjectableRepresentation(input: AttemptInput): boolean {
   if (input.method !== 'GET') return false;
   if (input.status !== '200') return false;
 
-  const contentType = input.contentType ?? '';
-  // Exact media-type match (parameters stripped) — a prefix check would
-  // wrongly match e.g. "text/htmlx".
-  const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase();
-  if (mediaType !== 'text/html') return false;
+  if (!isHtmlMediaType(input.contentType)) return false;
+  const contentType =
+    typeof input.contentType === 'string' ? input.contentType : (input.contentType?.[0] ?? '');
 
   const charset = charsetOf(contentType);
   if (charset !== null && !UTF8_COMPATIBLE_CHARSETS.has(charset)) return false;
-  if (NO_TRANSFORM_CACHE_CONTROL.test(input.cacheControl ?? '')) return false;
+  if (hasNoTransformDirective(input.cacheControl)) return false;
   if (isAttachmentDisposition(input.contentDisposition)) return false;
   return true;
 }
@@ -360,6 +365,12 @@ export function cacheControlValue(headers: CloudFrontHeaders): string | null {
 export function combinedHeaderValue(headers: CloudFrontHeaders, name: string): string | null {
   const entries = headers[name];
   return entries === undefined ? null : entries.map((entry) => entry.value).join(', ');
+}
+
+/** Preserve field-instance boundaries for strict representation gates. */
+export function headerValues(headers: CloudFrontHeaders, name: string): readonly string[] | null {
+  const entries = headers[name];
+  return entries === undefined ? null : entries.map((entry) => entry.value);
 }
 
 /**

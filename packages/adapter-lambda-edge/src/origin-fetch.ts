@@ -101,12 +101,6 @@ function isEndpointSetupFailure(error: unknown): boolean {
   );
 }
 
-/** Node http headers are string | string[] | undefined; preserve every value. */
-function combinedHeaderValue(value: string | string[] | undefined): string | null {
-  if (Array.isArray(value)) return value.join(', ');
-  return value ?? null;
-}
-
 export interface OriginFetchResult {
   status: number;
   contentType: string | null;
@@ -115,7 +109,7 @@ export interface OriginFetchResult {
   cacheControl: string | null;
   /** Expires of the re-fetched answer, synchronized with its generated body. */
   expires: string | null;
-  /** Every Content-Disposition value combined for conservative gating. */
+  /** Convenience combined value; strict gates use the instances in allHeaders. */
   contentDisposition: string | null;
   /** True when the re-fetched answer carries any Set-Cookie header. */
   hasSetCookie: boolean;
@@ -220,17 +214,6 @@ export function fetchOriginHtml(
         // Any later reset, timeout or parser/body error may be path-specific.
         transportReady = true;
         const status = response.statusCode ?? 0;
-        const contentType = response.headers['content-type'] ?? null;
-        const contentEncoding = response.headers['content-encoding'] ?? null;
-        const cacheControl = response.headers['cache-control'] ?? null;
-        const expires = response.headers['expires'] ?? null;
-        const contentDisposition = combinedHeaderValue(response.headers['content-disposition']);
-        const hasSetCookie = response.headers['set-cookie'] !== undefined;
-        const csp = combinedHeaderValue(response.headers['content-security-policy']);
-        const cspReportOnly = combinedHeaderValue(
-          response.headers['content-security-policy-report-only']
-        );
-        const xRobotsTag = combinedHeaderValue(response.headers['x-robots-tag']);
 
         // node lowercases header names already; keep multi-value headers as
         // separate entries so the caller can emit them faithfully.
@@ -244,11 +227,26 @@ export function fetchOriginHtml(
           return Buffer.from(utf8, 'utf8').toString('latin1') === raw ? utf8 : raw;
         };
         const allHeaders: Record<string, string[]> = {};
-        for (const [name, value] of Object.entries(response.headers)) {
-          if (value === undefined) continue;
-          const values = Array.isArray(value) ? value : [String(value)];
+        for (const [name, values] of Object.entries(response.headersDistinct)) {
+          if (values === undefined) continue;
           allHeaders[name.toLowerCase()] = values.map(decodeHeaderValue);
         }
+        const combinedHeader = (name: string): string | null =>
+          allHeaders[name]?.join(', ') ?? null;
+
+        // `response.headers` applies Node's singleton duplicate-discard rules.
+        // Gates must instead see every wire instance: conflicting Content-Type
+        // or Content-Disposition values are ambiguous and therefore veto
+        // rewriting rather than being hidden behind whichever value came first.
+        const contentType = combinedHeader('content-type');
+        const contentEncoding = combinedHeader('content-encoding');
+        const cacheControl = combinedHeader('cache-control');
+        const expires = combinedHeader('expires');
+        const contentDisposition = combinedHeader('content-disposition');
+        const hasSetCookie = allHeaders['set-cookie'] !== undefined;
+        const csp = combinedHeader('content-security-policy');
+        const cspReportOnly = combinedHeader('content-security-policy-report-only');
+        const xRobotsTag = combinedHeader('x-robots-tag');
 
         const chunks: Buffer[] = [];
         let size = 0;

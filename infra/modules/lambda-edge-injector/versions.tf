@@ -3,8 +3,9 @@ terraform {
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = ">= 5.0"
+      source = "hashicorp/aws"
+      # nodejs22.x entered the provider's Lambda runtime validation in 5.77.
+      version = ">= 5.77"
     }
     archive = {
       source  = "hashicorp/archive"

@@ -31,7 +31,7 @@ function pruneExpired(scopes: Map<string, number>, now: number): void {
   }
 }
 
-/** Active org/API-key rate-limit deadline, or null when the circuit is closed. */
+/** Active API-key-wide HTTP-429 deadline, or null when the circuit is closed. */
 export function getRateLimitDeadline(config: InjectorConfig, now?: number): number | null {
   const owner = fetchOwner(config);
   const scopes = rateLimitDeadlines.get(owner);
@@ -55,9 +55,9 @@ export function getRateLimitDeadline(config: InjectorConfig, now?: number): numb
 }
 
 /**
- * Open or extend the circuit for one Enhancely base/API-key scope. Callers pass
- * the already path-capped deadline so GET and register POST share the exact
- * retry instant selected by the orchestrator.
+ * Open or extend the HTTP-429 circuit for one Enhancely base/API-key scope.
+ * Callers cap this shared deadline at 60 seconds independently of any longer
+ * URL-local register memo. Registration-limit 403 responses never reach here.
  */
 export function recordRateLimitDeadline(config: InjectorConfig, deadline: number): void {
   const now = Date.now();

@@ -291,9 +291,10 @@ export async function fetchJsonLd(
  * - 400 → terminal-negative `rejected` (denylist or unregistered hostname;
  *   self-heals after a TTL once the operator fixes the domain registration)
  * - 429 → rate-limited (Retry-After, else RateLimit-Reset)
- * - 403 with Retry-After (plan hard cap sends 86400) → rate-limited, honored
- *   by the register orchestrator's larger backoff cap; 403 WITHOUT a hint
- *   (unvalidated-domain limit) → terminal-negative, resting a full TTL
+ * - 403 with Retry-After (plan hard cap sends 86400) → registration-limited,
+ *   honored as a URL-local backoff by the register orchestrator; it must not
+ *   suppress reads for other URLs. 403 WITHOUT Retry-After (unvalidated-domain
+ *   limit) → terminal-negative, resting a full TTL
  */
 export async function registerOrRevalidate(
   config: InjectorConfig,
@@ -339,19 +340,25 @@ export async function registerOrRevalidate(
     cancelResponseBody(response, 'rejected');
     return { status: 'terminal-negative', reason: 'rejected' };
   }
-  if (response.status === 429 || response.status === 403) {
+  if (response.status === 429) {
     const retryAfterSeconds = rateLimitBackoffSeconds(response);
     cancelResponseBody(response, 'rate-limited');
-    // A 403 WITHOUT any backoff hint is a durable operator-state (the server's
+    return { status: 'rate-limited', retryAfterSeconds };
+  }
+  if (response.status === 403) {
+    // Registration hard-cap 403s use Retry-After. RateLimit-Reset belongs to
+    // HTTP 429 and may be added generically by a proxy; it must not turn a
+    // domain-validation 403 without Retry-After into a registration-limit backoff.
+    const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after'));
+    cancelResponseBody(response, 'registration-limited');
+    // A 403 WITHOUT Retry-After is a durable operator-state (the server's
     // unvalidated-domain limit sends no Retry-After — only the plan hard cap
-    // does). Mapping it to 'rate-limited' would fall through to the 10 s error
-    // backoff and re-POST every URL six times a minute for as long as the
-    // state lasts. Rest for a full TTL instead; it self-heals once the
-    // operator validates the domain (same shape as the 400 rejections).
-    if (response.status === 403 && retryAfterSeconds === null) {
+    // does). Rest for a full TTL instead; it self-heals once the operator
+    // validates the domain (same shape as the 400 rejections).
+    if (retryAfterSeconds === null) {
       return { status: 'terminal-negative', reason: 'rejected' };
     }
-    return { status: 'rate-limited', retryAfterSeconds };
+    return { status: 'registration-limited', retryAfterSeconds };
   }
   if (response.status !== 200) {
     cancelResponseBody(response, `http-${response.status}`);

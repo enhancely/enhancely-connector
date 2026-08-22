@@ -118,6 +118,22 @@ describe('shouldAttempt', () => {
       shouldAttempt(attempt({ contentDisposition: 'inline, attachment; filename="page.html"' }))
     ).toBe(false);
   });
+
+  it('preserves field-instance boundaries so malformed quotes cannot heal', () => {
+    expect(
+      shouldAttempt(
+        attempt({ contentType: ['text/html; profile="unterminated', 'application/json"'] })
+      )
+    ).toBe(false);
+    expect(
+      shouldAttempt(attempt({ cacheControl: ['public, ext="unterminated', 'no-transform"'] }))
+    ).toBe(false);
+    expect(
+      shouldAttempt(
+        attempt({ contentDisposition: ['inline; filename="unterminated', 'attachment"'] })
+      )
+    ).toBe(false);
+  });
 });
 
 describe('charsetOf', () => {

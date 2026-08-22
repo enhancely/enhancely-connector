@@ -12,16 +12,29 @@ its own cache or the Enhancely API and injects it as
 ```
 
 immediately before `</head>`. If anything goes wrong — timeout, missing record,
-rate limit, non-HTML response, `Cache-Control: no-transform`, attachment
-disposition, or no parser-safe document-head close — the connector **fails
+rate limit, non-HTML response, `Cache-Control: no-transform`, a valid non-`inline`
+`Content-Disposition`, or no parser-safe document-head close — the connector **fails
 open** and serves the original HTML untouched. The shared scanner accounts for
 HTML's scripting-dependent head-level `noscript` rules rather than trusting a
-later lexical `</head>`. The customer's site is never at risk. A plain API
-error creates a URL-local 10-second backoff. A `429`, or a register-path `403`
-with a retry hint, additionally opens an execution-environment-local circuit
-for the same Enhancely base/API key: other URLs serve stale data or a bounded
-miss locally until the already-capped retry deadline. Conditional GET limits
-that hint to 60 seconds; register-or-revalidate honors up to 24 hours.
+later lexical `</head>`. Ambiguous duplicate media types, unbalanced HTTP
+quoted strings, and malformed separators that still expose an explicit
+`no-transform`, `noindex`, or `none` directive also fail locally before any
+Enhancely call. On Cloudflare, where Fetch folds field instances before exposing
+them, any comma inside a quoted gate value is conservatively ambiguous and also
+skips injection. The customer's site is never at risk. A plain API
+error creates a URL-local 10-second backoff. A `429` follows `Retry-After`
+(delay-seconds or HTTP-date), falling back to `RateLimit-Reset` when needed.
+Only HTTP `429` additionally opens
+an execution-environment-local circuit for the same Enhancely base/API key:
+other URLs serve stale data or a bounded miss locally for at most 60 seconds.
+Register-or-revalidate may retain a longer URL-local `429` or `403` `Retry-After`
+backoff for up to 24 hours; a registration-limit `403` never suppresses reads
+or registrations for other URLs.
+When separate GET and register lookups race for one URL, a newly successful
+`200`/`304`/`412` wins over retry-only state. A successful `404` may retire a
+stale positive while inheriting the longest concurrent retry deadline; racing
+transient results retain stale positive data and that longest deadline. Thus a
+day-scale `Retry-After` cannot be shortened to the normal cache TTL.
 The in-process cache is bounded by entry count and a conservative 16 MiB
 retained-string budget, so large valid JSON-LD records cannot exhaust an edge
 runtime before fail-open handling can run.
@@ -82,7 +95,7 @@ The API key is a secret — it must never be exposed client-side or committed. `
 | Setting                     | Default                    | Notes                                                                                                                                                                                                                                                          |
 | --------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ENHANCELY_API_KEY`         | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.                                                                                                                                                                                             |
-| `ENHANCELY_BASE`            | `https://app.enhancely.ai` | Confirmed by the [public Enhancely API specification](https://docs.enhancely.ai/); override only for an explicitly selected environment.                                                                                                                       |
+| `ENHANCELY_BASE`            | `https://app.enhancely.ai` | The [official Enhancely API endpoint definitions](https://docs.enhancely.ai/) list `https://app.enhancely.ai/api/v1/jsonld`; override only for an explicitly selected environment.                                                                             |
 | `timeoutMs`                 | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call. In the Lambda module, omitted `timeout_ms` means 800 ms for the default pair and the historical 2000 ms for standalone origin-response; its effective sum with `originTimeoutMs` must be ≤ 6000 ms. |
 | `originTimeoutMs`           | `2000`                     | Lambda@Edge-only origin fetch/re-fetch timeout. Together with `timeoutMs`, limited to 6000 ms by the Terraform module.                                                                                                                                         |
 | `ssmTimeoutMs`              | `2000`                     | Lambda@Edge-only SSM config timeout. The module's API + origin + SSM budget is at most 8000 ms under Lambda's fixed 10-second limit, leaving at least 2000 ms for fail-open settlement.                                                                        |

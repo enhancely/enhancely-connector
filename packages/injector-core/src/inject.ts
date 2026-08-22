@@ -69,22 +69,127 @@ const PLAINTEXT_ELEMENT = 'plaintext';
 
 /**
  * Index just past the `>` that closes the start/end tag beginning at `start`
- * (which must point at `<`), skipping `>` inside quoted attribute values.
- * Returns -1 for an unterminated tag.
+ * (which must point at `<`), skipping `>` only while the HTML tokenizer is in
+ * a quoted attribute VALUE. A quote in a tag/attribute name is ordinary
+ * parse-error data and must not hide the real closing `>`.
  */
 function endOfTag(html: string, start: number): number {
-  let quote = '';
+  type State =
+    | 'tag-name'
+    | 'before-attribute-name'
+    | 'attribute-name'
+    | 'after-attribute-name'
+    | 'before-attribute-value'
+    | 'attribute-value-double'
+    | 'attribute-value-single'
+    | 'attribute-value-unquoted'
+    | 'after-attribute-value-quoted'
+    | 'self-closing-start-tag';
+
+  let state: State = 'tag-name';
   for (let i = start + 1; i < html.length; i++) {
-    const c = html[i];
-    if (quote !== '') {
-      if (c === quote) quote = '';
-    } else if (c === '"' || c === "'") {
-      quote = c;
-    } else if (c === '>') {
-      return i + 1;
+    const char = html[i] ?? '';
+    const whitespace = /[\t\n\f\r ]/.test(char);
+
+    switch (state) {
+      case 'tag-name':
+        if (whitespace) state = 'before-attribute-name';
+        else if (char === '/') state = 'self-closing-start-tag';
+        else if (char === '>') return i + 1;
+        break;
+      case 'before-attribute-name':
+        if (whitespace) break;
+        if (char === '/') state = 'self-closing-start-tag';
+        else if (char === '>') return i + 1;
+        else state = 'attribute-name';
+        break;
+      case 'attribute-name':
+        if (whitespace) state = 'after-attribute-name';
+        else if (char === '/') state = 'self-closing-start-tag';
+        else if (char === '=') state = 'before-attribute-value';
+        else if (char === '>') return i + 1;
+        break;
+      case 'after-attribute-name':
+        if (whitespace) break;
+        if (char === '/') state = 'self-closing-start-tag';
+        else if (char === '=') state = 'before-attribute-value';
+        else if (char === '>') return i + 1;
+        else state = 'attribute-name';
+        break;
+      case 'before-attribute-value':
+        if (whitespace) break;
+        if (char === '"') state = 'attribute-value-double';
+        else if (char === "'") state = 'attribute-value-single';
+        else if (char === '>') return i + 1;
+        else state = 'attribute-value-unquoted';
+        break;
+      case 'attribute-value-double':
+        if (char === '"') state = 'after-attribute-value-quoted';
+        break;
+      case 'attribute-value-single':
+        if (char === "'") state = 'after-attribute-value-quoted';
+        break;
+      case 'attribute-value-unquoted':
+        if (whitespace) state = 'before-attribute-name';
+        else if (char === '>') return i + 1;
+        break;
+      case 'after-attribute-value-quoted':
+        if (whitespace) state = 'before-attribute-name';
+        else if (char === '/') state = 'self-closing-start-tag';
+        else if (char === '>') return i + 1;
+        else {
+          state = 'before-attribute-name';
+          i -= 1; // reconsume the parse-error byte in the new state
+        }
+        break;
+      case 'self-closing-start-tag':
+        if (char === '>') return i + 1;
+        state = 'before-attribute-name';
+        i -= 1; // reconsume exactly as the HTML tokenizer does
+        break;
     }
   }
   return -1;
+}
+
+/** End of a WHATWG comment, including the `--!>` parse-error closer. */
+function endOfComment(html: string, start: number): number {
+  // These two parse-error forms close inside their opener. No other closer
+  // may overlap the four-byte `<!--` opener (`<!--!>` stays unterminated).
+  if (html.startsWith('<!-->', start)) return start + 5;
+  if (html.startsWith('<!--->', start)) return start + 6;
+
+  // One forward pass is important: two independent `indexOf` calls would
+  // rescan the entire remaining document for every short comment when one of
+  // the two closer shapes is absent.
+  for (let index = start + 4; index < html.length - 1; index += 1) {
+    if (html[index] !== '-' || html[index + 1] !== '-') continue;
+    if (html[index + 2] === '>') return index + 3;
+    if (html[index + 2] === '!' && html[index + 3] === '>') return index + 4;
+  }
+  return -1;
+}
+
+/** The tokenizer recognizes the DOCTYPE keyword before validating its name boundary. */
+function startsDoctype(html: string, start: number): boolean {
+  return (
+    html
+      .slice(start, start + '<!doctype'.length)
+      .replace(/[A-Z]/g, (char) => char.toLowerCase()) === '<!doctype'
+  );
+}
+
+/**
+ * HTML token boundary used by the structural scanners. Unlike normal start
+ * tags, the tokenizer terminates a DOCTYPE at the first `>` even while it is
+ * inside a quoted PUBLIC/SYSTEM identifier (the abrupt-doctype state).
+ */
+function endOfStructuralToken(html: string, start: number): number {
+  if (startsDoctype(html, start)) {
+    const end = html.indexOf('>', start + 2);
+    return end < 0 ? -1 : end + 1;
+  }
+  return endOfTag(html, start);
 }
 
 /**
@@ -105,6 +210,12 @@ function endOfRawTextElement(
     const close = lower.indexOf(needle, from);
     if (close < 0) return -1;
 
+    const after = html[close + needle.length];
+    if (after === undefined || !/[\t\n\f\r />]/.test(after)) {
+      from = close + needle.length;
+      continue;
+    }
+
     // The HTML tokenizer has escaped and double-escaped SCRIPT states. After
     // `<!-- ... <script`, the first lexical `</script>` can merely leave the
     // double-escaped state instead of closing the element. A plain `<!--`
@@ -112,23 +223,22 @@ function endOfRawTextElement(
     // end tag still closes the element. Implementing every tokenizer state
     // would defeat this deliberately small scanner, so the exact shape that
     // can enter double-escaped mode is conservatively uninjectable.
+    // Search only the current raw-text span, after finding its boundary-valid
+    // closer once. This keeps both many false close prefixes in one script and
+    // many separate scripts linear in the document size.
     if (tag === 'script') {
-      const escaped = lower.indexOf('<!--', start);
-      if (escaped >= 0 && escaped < close) {
-        let nested = lower.indexOf('<script', escaped + 4);
-        while (nested >= 0 && nested < close) {
-          if (startsElement(lower, nested, 'script')) return -1;
-          nested = lower.indexOf('<script', nested + 7);
+      const rawTextSpan = lower.slice(start, close);
+      const escaped = rawTextSpan.indexOf('<!--');
+      if (escaped >= 0) {
+        let nested = rawTextSpan.indexOf('<script', escaped + 4);
+        while (nested >= 0) {
+          if (startsElement(rawTextSpan, nested, 'script')) return -1;
+          nested = rawTextSpan.indexOf('<script', nested + 7);
         }
       }
     }
 
-    const after = html[close + needle.length];
-    if (after !== undefined && /[\t\n\f\r />]/.test(after)) {
-      return endOfTag(html, close);
-    }
-
-    from = close + needle.length;
+    return endOfTag(html, close);
   }
 
   return -1;
@@ -185,13 +295,13 @@ function endOfSafeHeadNoscript(html: string, lower: string, contentStart: number
     if (textEnd === close) return closeEnd;
 
     if (lower.startsWith('<!--', lt)) {
-      const commentEnd = html.indexOf('-->', lt + 4);
-      if (commentEnd < 0 || commentEnd + 3 > close) return -1;
-      i = commentEnd + 3;
+      const commentEnd = endOfComment(html, lt);
+      if (commentEnd < 0 || commentEnd > close) return -1;
+      i = commentEnd;
       continue;
     }
 
-    const tagEnd = endOfTag(html, lt);
+    const tagEnd = endOfStructuralToken(html, lt);
     if (tagEnd < 0 || tagEnd > close) return -1;
 
     const endTagName = plainEndTagName(lower, lt, tagEnd);
@@ -203,7 +313,7 @@ function endOfSafeHeadNoscript(html: string, lower: string, contentStart: number
       continue;
     }
 
-    if (/^<!doctype(?:[\t\n\f\r >])/i.test(html.slice(lt, tagEnd))) {
+    if (startsDoctype(html, lt)) {
       i = tagEnd;
       continue;
     }
@@ -262,13 +372,13 @@ export function findHeadInjectionPoint(html: string): number | null {
     if (/[^\t\n\f\r ]/.test(structuralText)) return null;
 
     if (lower.startsWith('<!--', lt)) {
-      const end = html.indexOf('-->', lt + 4);
+      const end = endOfComment(html, lt);
       if (end < 0) return null; // unterminated comment → no real </head> follows
-      i = end + 3;
+      i = end;
       continue;
     }
 
-    const tagEnd = endOfTag(html, lt);
+    const tagEnd = endOfStructuralToken(html, lt);
     if (tagEnd < 0) return null; // unterminated tag
     const endTagName = plainEndTagName(lower, lt, tagEnd);
 
@@ -308,7 +418,7 @@ export function findHeadInjectionPoint(html: string): number | null {
         i = tagEnd;
         continue;
       }
-      if (/^<!doctype(?:[\t\n\f\r >])/i.test(html.slice(lt, tagEnd))) {
+      if (startsDoctype(html, lt)) {
         if (sawBodyOpen) return null;
         i = tagEnd;
         continue;

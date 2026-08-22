@@ -10,7 +10,13 @@
  *   - an Enhancely API key is configured.
  * Anything else → serve the origin response untouched (fail-open).
  */
-import { blocksIndexing, isAttachmentDisposition } from '@enhancely/injector-core';
+import {
+  blocksIndexing,
+  hasCommaInsideHttpQuotes,
+  hasNoTransformDirective,
+  isAttachmentDisposition,
+  isHtmlMediaType,
+} from '@enhancely/injector-core';
 
 export interface GateInput {
   /** HTTP method of the incoming page request. */
@@ -34,12 +40,19 @@ export interface GateInput {
 export function shouldAttemptInjection(input: GateInput): boolean {
   if (input.method !== 'GET') return false;
   if (input.status !== 200) return false;
-  // Compare the media type exactly (parameters like charset stripped) — a
-  // prefix check would wrongly match e.g. "text/htmlx".
-  const mediaType = (input.contentType ?? '').split(';', 1)[0]?.trim().toLowerCase();
-  if (mediaType !== 'text/html') return false;
+  // Workers Fetch exposes only folded values, not raw field instances. A
+  // comma inside quotes could therefore be legitimate data OR the boundary
+  // between two malformed instances whose quotes healed during folding.
+  if (
+    hasCommaInsideHttpQuotes(input.contentType) ||
+    hasCommaInsideHttpQuotes(input.cacheControl) ||
+    hasCommaInsideHttpQuotes(input.contentDisposition)
+  ) {
+    return false;
+  }
+  if (!isHtmlMediaType(input.contentType)) return false;
   if (input.contentEncoding !== null) return false;
-  if (/(?:^|[\s,])no-transform(?:$|[\s,=])/i.test(input.cacheControl ?? '')) return false;
+  if (hasNoTransformDirective(input.cacheControl)) return false;
   if (isAttachmentDisposition(input.contentDisposition)) return false;
   if (blocksIndexing(input.xRobotsTag)) return false;
   if (input.apiKey === undefined || input.apiKey === '') return false;

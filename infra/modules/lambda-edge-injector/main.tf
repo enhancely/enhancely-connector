@@ -6,7 +6,7 @@
 #
 # Default (`deployment_mode = "origin-request"`):
 #   - origin-request injector: fetches the origin once, then generates the page
-#   - origin-response companion: registration/cache-cap safety net, never injects
+#   - origin-response companion: cache-cap only, never calls Enhancely or injects
 #
 # Compatibility (`deployment_mode = "origin-response"`):
 #   - standalone origin-response injector with the legacy re-fetch pattern
@@ -200,7 +200,7 @@ resource "aws_lambda_function" "injector" {
 
   lifecycle {
     precondition {
-      condition     = data.aws_region.current.region == "us-east-1"
+      condition     = data.aws_region.current.name == "us-east-1"
       error_message = "Lambda@Edge functions must be created in us-east-1 — pass an us-east-1 aliased provider to this module (providers = { aws = aws.us_east_1 })."
     }
 
@@ -233,7 +233,7 @@ resource "aws_lambda_function" "companion" {
 
   lifecycle {
     precondition {
-      condition     = data.aws_region.current.region == "us-east-1"
+      condition     = data.aws_region.current.name == "us-east-1"
       error_message = "Lambda@Edge functions must be created in us-east-1 — pass an us-east-1 aliased provider to this module (providers = { aws = aws.us_east_1 })."
     }
 

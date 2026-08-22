@@ -18,8 +18,8 @@ normal CloudFront fetch.
 | `origin-response`          | standalone origin-response injector                 | origin-response only                      | Existing directly reachable Custom Origins that intentionally retain the legacy two-fetch flow |
 
 The default injector fetches the origin first. Only an exact `200` UTF-8-safe
-`text/html` response that is indexable, permits transformation, is not served
-as an attachment, and passes the remaining policy/quota gates can trigger an
+`text/html` response that is indexable, permits transformation, has no valid
+non-`inline` content disposition, and passes the remaining policy/quota gates can trigger an
 Enhancely lookup. It then generates either the injected page or the origin's
 unmodified HTML, so both paths normally cost one origin request.
 
@@ -201,6 +201,9 @@ could replay one visitor's `Set-Cookie` to another visitor.
 
 ## Requirements and trade-offs
 
+- AWS provider `>= 5.77`. Provider 6 currently emits a deprecation warning for
+  the region attribute retained for 5.77 compatibility; validation and tests
+  support both major versions.
 - Pass an `us-east-1` provider; the module enforces this at plan/apply time.
 - The distribution's origin request policy should forward the viewer `Host`
   header. Origins that cannot receive it, such as S3 website endpoints, can use

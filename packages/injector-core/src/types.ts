@@ -61,7 +61,8 @@ export interface CacheEntry {
    */
   registrationPending?: boolean;
   /**
-   * Backoff memo (epoch ms), set after a 429 or an upstream error/timeout.
+   * Backoff memo (epoch ms), set after a 429, registration-limit 403, or an
+   * upstream error/timeout.
    * While `Date.now() < retryNotBefore` the orchestrator answers from this
    * entry (stale positive → snippet, negative → nothing) WITHOUT calling
    * Enhancely, so a rate-limited or down API is not re-hit — and the page
@@ -103,6 +104,9 @@ export interface CacheBackend {
  *   `{}`), or a rejected registration (denylist / unregistered hostname).
  *   Stored as a negative entry for a full TTL and — unlike `not-found` —
  *   NEVER triggers auto-registration: the server already knows the URL.
+ * - `registration-limited`: the register endpoint refused this URL because a
+ *   plan/registration cap was reached (HTTP 403 with `Retry-After`). The
+ *   deadline is URL-local: it must never open the API-key-wide read circuit.
  */
 export type JsonLdFetchResult =
   | { status: 'ok'; jsonldRaw: string; etag: string | null }
@@ -111,6 +115,7 @@ export type JsonLdFetchResult =
   | { status: 'pending'; retryAfterSeconds: number | null }
   | { status: 'terminal-negative'; reason: 'ignored' | 'empty-record' | 'rejected' }
   | { status: 'rate-limited'; retryAfterSeconds: number | null }
+  | { status: 'registration-limited'; retryAfterSeconds: number }
   | { status: 'error'; reason: string };
 
 /** Everything the orchestrator needs to know about the upstream response. */
