@@ -51,14 +51,27 @@ unknowable:
 
 Origin-first avoids spending Enhancely calls on extension-less non-pages while retaining the local extension fast path.
 
-| path                           | origin hits                                  |
-| ------------------------------ | -------------------------------------------- |
-| HTML + snippet                 | 1 (we fetch, we generate)                    |
-| HTML, no snippet               | 1 (we fetch, we generate the origin's bytes) |
-| not HTML / vetoed / over quota | 2 (we fetch, then hand back)                 |
+| path                           | origin hits                                     |
+| ------------------------------ | ----------------------------------------------- |
+| HTML + snippet                 | 1 (we fetch, we generate)                       |
+| HTML, no snippet               | 1 (we fetch, we generate the origin's bytes)    |
+| not HTML / vetoed / over quota | 2 on the FIRST request, 1 afterwards (memoized) |
 
-Only the third line pays twice, and it is reserved for representations this
-adapter must not touch. Two things follow that the old order could not deliver:
+Only the third line pays twice, it is reserved for representations this adapter
+must not touch, and only the FIRST request for such a URL pays it: the verdict
+is memoized per execution environment, so repeats skip our fetch and cost
+exactly what they cost before origin-first — one CloudFront fetch, nothing else.
+
+**Cheaper still: keep the function off those paths entirely.** A Lambda@Edge
+association lives on a _cache behavior_, and CloudFront picks the behavior by
+path pattern — so an ordered behavior for `*.css`, `*.js`, `/api/*` … _without_
+the association means the function is never invoked for them at all: no
+invocation billed, no latency, no code involved. That is strictly better than
+any in-function filter for anything you can express as a path pattern (up to
+the 25-behaviors-per-distribution quota). What it cannot express is the class
+that motivated origin-first in the first place — extension-less URLs that turn
+out to be redirects or 404s — because no component in the chain knows that
+before the origin answers. Two things follow that the old order could not deliver:
 `auto_register` is precise (the adapter knows it is HTML), and the retry cache
 cap applies to the un-injected response because that response is now ours.
 

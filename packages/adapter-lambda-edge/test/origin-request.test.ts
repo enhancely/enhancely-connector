@@ -539,6 +539,45 @@ describe('origin-request — multi-value and wildcard headers', () => {
   });
 });
 
+describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1)', () => {
+  // Origin-first pays one extra origin hit for things it must not touch: it
+  // fetches to find out, then hands back so CloudFront fetches again. The
+  // first time that is unavoidable; the second time it is pure waste.
+  for (const [name, uri] of [
+    ['a redirect', '/redirect'],
+    ['a non-HTML body', '/json'],
+  ] as const) {
+    it(`${name}: the repeat costs no adapter fetch at all`, async () => {
+      const first = await invoke(makeRequestEvent({ uri }));
+      expect(isPassThrough(first)).toBe(true);
+      expect(originHits).toBe(1);
+
+      const second = await invoke(makeRequestEvent({ uri }));
+      expect(isPassThrough(second)).toBe(true);
+      // Still 1: the verdict was remembered, so this request costs exactly
+      // what it cost before origin-first — one CloudFront fetch, nothing else.
+      expect(originHits).toBe(1);
+    });
+  }
+
+  it('remembers per URL, not globally', async () => {
+    await invoke(makeRequestEvent({ uri: '/json' }));
+    expect(originHits).toBe(1);
+    // A DIFFERENT url must still be examined.
+    const other = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
+    expect(other.body).toContain(SNIPPET);
+    expect(originHits).toBe(2);
+  });
+
+  it('never memoizes a real page', async () => {
+    const first = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
+    expect(first.body).toContain(SNIPPET);
+    const second = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
+    expect(second.body).toContain(SNIPPET);
+    expect(originHits).toBe(2);
+  });
+});
+
 describe('origin-request — registration is precise on this trigger (v0.9.0)', () => {
   function enableRegistration(): void {
     __resetAdapterConfigForTests();
