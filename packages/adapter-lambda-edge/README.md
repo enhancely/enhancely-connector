@@ -64,6 +64,42 @@ reproduce, and only the FIRST request for such a URL pays it: the verdict
 is memoized per execution environment, so repeats skip our fetch and cost
 exactly what they cost before origin-first — one CloudFront fetch, nothing else.
 
+#### Keeping the function off asset paths
+
+The single biggest saving is not in the function at all. A Lambda@Edge
+association lives on a **cache behavior**, and CloudFront picks the behavior by
+**path pattern** — never by response Content-Type, which does not exist yet at
+that point. So the only way to stop the function being invoked for stylesheets,
+fonts and images is to give those paths their own behavior _without_ the
+association.
+
+It is worth doing, and not mainly for money: on a typical page load the HTML is
+one request and the assets are dozens. Every one of them invokes the function
+just to be rejected by the extension filter — and a Lambda@Edge throttle or
+crash on an asset request is a **viewer-facing 5xx**. Assets that never reach
+the function cannot be broken by it.
+
+To find the right patterns for a given site:
+
+```bash
+pnpm asset-paths https://www.example.com/ https://www.example.com/some/page
+# basic-auth staging:
+ASSET_PATHS_AUTH='user:pass' pnpm asset-paths https://staging.example.com/
+```
+
+It reads every asset the pages reference (including `srcset` and CSS `url()`),
+keeps only extensions this adapter already rejects — the list is read from
+`origin-request.ts`, so the tool cannot drift from the code — and reports the
+smallest set of behaviors that covers them, comparing a path-prefix strategy
+against an extension strategy. Two traps it guards against: CloudFront allows
+only 25 behaviors per distribution, and shortening `*.js` to `*.js*` also
+matches `.jsp` (as `*.as*` matches `.aspx`) — both server-rendered HTML, which
+would silently stop the injector seeing real pages.
+
+Behaviors match on **path only, never on host**, so a pattern applies to every
+alias the distribution serves; check that no real page lives under a prefix
+before routing it away.
+
 **Cheaper still: keep the function off those paths entirely.** A Lambda@Edge
 association lives on a _cache behavior_, and CloudFront picks the behavior by
 path pattern — so an ordered behavior for `*.css`, `*.js`, `/api/*` … _without_
