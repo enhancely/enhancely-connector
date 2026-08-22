@@ -70,6 +70,13 @@ export const DEFAULT_ORIGIN_TIMEOUT_MS = 2000;
 export const DEFAULT_SSM_TIMEOUT_MS = 2000;
 
 /**
+ * Default lifetime of the origin-request "this URL is not a page" memo.
+ * 30 minutes: long, because the verdict is stable, and being wrong is bounded
+ * (see `nonPageMemoTtlMs` in BakedConnectorConfig).
+ */
+export const DEFAULT_NON_PAGE_MEMO_TTL_MS = 1_800_000;
+
+/**
  * Shape of the deploy-time generated `connector-config.json` (all optional).
  *
  * NOTE for hand-rolled deployments: `excludePaths` and
@@ -129,6 +136,22 @@ export interface BakedConnectorConfig {
    */
   capSetCookieResponses?: boolean;
   /**
+   * How long the origin-request entrypoint remembers that a URL is NOT an
+   * injectable page (a redirect, a 404, JSON, a binary or over-quota body).
+   * Default 1 800 000 ms = 30 minutes.
+   *
+   * Deliberately independent of `cacheTtlMs`, and much longer: that TTL
+   * governs a JSON-LD record, which changes when someone edits content, while
+   * this one governs "this URL is not a page at all", which is stable for
+   * months. On a no-store origin, repeated requests can otherwise repay the classification fetch before the trigger can identify the URL.
+   *
+   * Raising it costs nothing in correctness: a URL that later becomes a real
+   * page is still registered (the hand-back makes CloudFront fetch, which
+   * fires the companion) and is still injected by every execution environment
+   * that has not memoized it — the memo is per environment, never global.
+   */
+  nonPageMemoTtlMs?: number;
+  /**
    * Request paths the connector must not touch AT ALL (login/account areas,
    * robots.txt-disallowed or noindex-by-policy sections): no Enhancely
    * lookup, no auto-registration, no cache-TTL rewriting, no origin re-fetch
@@ -156,6 +179,7 @@ const NEGATIVE_TTL_MS = 30_000;
 let resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
 let resolvedAssertedDefaultTtlSeconds = 0;
 let resolvedCapSetCookieResponses = false;
+let resolvedNonPageMemoTtlMs = DEFAULT_NON_PAGE_MEMO_TTL_MS;
 // The baked FILE read is memoized separately from key resolution: exclusion
 // checks must work synchronously before (and without) any SSM call.
 let bakedCache: BakedConnectorConfig | null | undefined;
@@ -205,6 +229,8 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   if (assertedDefaultTtlSeconds !== undefined && assertedDefaultTtlSeconds >= 1) {
     baked.assertedDefaultTtlSeconds = Math.floor(assertedDefaultTtlSeconds);
   }
+  const nonPageMemoTtlMs = positiveNumber(source['nonPageMemoTtlMs']);
+  if (nonPageMemoTtlMs !== undefined) baked.nonPageMemoTtlMs = nonPageMemoTtlMs;
   if (typeof source['capSetCookieResponses'] === 'boolean') {
     baked.capSetCookieResponses = source['capSetCookieResponses'];
   }
@@ -290,6 +316,7 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
     // responses too.
     resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
     resolvedCapSetCookieResponses = baked?.capSetCookieResponses ?? false;
+    resolvedNonPageMemoTtlMs = baked?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
 
     let apiKey = baked?.apiKey;
     if (apiKey === undefined) {
@@ -408,6 +435,11 @@ export function getCapSetCookieResponses(): boolean {
   return resolvedCapSetCookieResponses;
 }
 
+/** Lifetime of the origin-request non-page memo (baked `nonPageMemoTtlMs`). */
+export function getNonPageMemoTtlMs(): number {
+  return resolvedNonPageMemoTtlMs;
+}
+
 /**
  * Operator exclude patterns (baked config `excludePaths`). Read directly from
  * the memoized baked file so the handler can skip excluded requests BEFORE
@@ -430,6 +462,7 @@ function __resetMemoForTests(): void {
   resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
   resolvedAssertedDefaultTtlSeconds = 0;
   resolvedCapSetCookieResponses = false;
+  resolvedNonPageMemoTtlMs = DEFAULT_NON_PAGE_MEMO_TTL_MS;
 }
 
 /** TEST-ONLY: bypass the connector-config.json file read (`null` = no file). */

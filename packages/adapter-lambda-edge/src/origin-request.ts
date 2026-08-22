@@ -108,6 +108,7 @@ import {
   getAssertedDefaultTtlSeconds,
   getCapSetCookieResponses,
   getExcludePaths,
+  getNonPageMemoTtlMs,
   getOriginTimeoutMs,
   resolveAdapterConfig,
 } from './config.js';
@@ -319,8 +320,12 @@ let cache = new MemoryCache();
  */
 let nonPageMemo = new Map<string, number>();
 
-/** Bounded so a scan of unique dead URLs cannot grow the map without limit. */
-const NON_PAGE_MEMO_MAX_ENTRIES = 2_000;
+/**
+ * Bounded so a scan of unique dead URLs cannot grow the map without limit.
+ * 10 000 entries is a few hundred KB against the function's 256 MB — cheap
+ * enough that the cap only ever exists as a runaway guard.
+ */
+const NON_PAGE_MEMO_MAX_ENTRIES = 10_000;
 
 function rememberNonPage(url: string, ttlMs: number): void {
   // Map preserves insertion order — drop the oldest entry when over cap.
@@ -435,7 +440,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // better than the origin-response path's equivalent: CloudFront fetches it
     // itself and streams it with no generated-response quota at all.
     if (origin.truncated) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
 
@@ -458,13 +463,13 @@ export const handler: CloudFrontRequestHandler = async (event) => {
         hasSetCookie: origin.hasSetCookie,
       })
     ) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
 
     // A page the origin marks noindex is not schema-markup territory.
     if (blocksIndexing(origin.xRobotsTag)) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
 
@@ -473,7 +478,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // the bytes — a lossy decode would put U+FFFD into a body CloudFront then
     // caches.
     if (!Buffer.from(originalHtml, 'utf8').equals(origin.body)) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
     const originCharset = charsetOf(origin.contentType ?? '');
@@ -482,7 +487,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // those bytes form valid UTF-8, so only genuinely ASCII source bytes are
     // safe under an `ascii`/`us-ascii` label.
     if ((originCharset === 'ascii' || originCharset === 'us-ascii') && !asciiBody) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
     // With no header charset, valid UTF-8 bytes are not proof of UTF-8 intent:
@@ -495,7 +500,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       !hasUtf8Bom(origin.body) &&
       !declaresUtf8MetaInPrescan(origin.body)
     ) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
 
@@ -547,7 +552,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // quota; exceeding it is a viewer-facing 502 after Lambda has completed.
     const responseHeaderBytes = serializedHeaderBytes(headers, String(origin.status));
     if (responseHeaderBytes > MAX_RESPONSE_HEADER_BYTES) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
 
@@ -555,7 +560,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     const bodyBudgetBytes =
       MAX_GENERATED_RESPONSE_BYTES - responseHeaderBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
     if (Buffer.byteLength(injected, 'utf8') > bodyBudgetBytes) {
-      rememberNonPage(pageUrl, config.cacheTtlMs);
+      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
 

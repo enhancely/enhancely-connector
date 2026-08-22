@@ -3,6 +3,7 @@
   "enhancelyBase": "https://app.enhancely.ai",
   "timeoutMs": 800,
   "cacheTtlMs": 300000,
+  "nonPageMemoTtlMs": 1800000,
   "autoRegister": false,
   "assertedDefaultTtlSeconds": 0,
   "capSetCookieResponses": false,
