@@ -60,11 +60,14 @@
  *
  *   HTML + snippet    → 1 own fetch, no CloudFront fetch  = 1
  *   HTML, no snippet  → 1 own fetch, response generated   = 1
- *   not HTML / vetoed → 1 own fetch + 1 CloudFront fetch  = 2
+ *   not HTML / vetoed → 1 own fetch + 1 CloudFront fetch  = 2  (first time)
+ *                     → 0 own fetches + 1 CloudFront      = 1  (remembered)
  *
- * Only the third line costs a second origin hit, and it is reserved for
+ * Only the third line costs a second origin hit, it is reserved for
  * representations this adapter must not touch (non-2xx, non-HTML, noindex,
- * non-UTF-8, over quota). Two consequences follow, both of which the previous
+ * non-UTF-8, over quota), and only the FIRST request for such a URL pays it:
+ * the verdict is memoized per execution environment (see nonPageMemo), so
+ * repeats skip the fetch and cost exactly what they cost before origin-first. Two consequences follow, both of which the previous
  * order could not deliver:
  *   - REGISTRATION is precise. The adapter knows the response is real HTML, so
  *     autoRegister no longer has to be forced off (v0.7.0/v0.8.0 could only
@@ -294,9 +297,52 @@ function canonicalHeaderName(lowercase: string): string {
  */
 let cache = new MemoryCache();
 
+/**
+ * Per-execution-environment memo of URLs the origin answered with something
+ * this adapter must not touch — a redirect, a 404, JSON, a compressed or
+ * non-UTF-8 body, an over-quota page.
+ *
+ * WHY. Origin-first buys precision at the cost of ONE extra origin hit for
+ * exactly that class: we fetch to find out what it is, then hand the request
+ * back so CloudFront fetches it again. The first time that is unavoidable —
+ * nothing in the request tells us. The SECOND time it is pure waste, and on a
+ * site being scanned for dead URLs, or one with many trailing-slash redirects,
+ * the second time is most of the traffic.
+ *
+ * So the verdict is remembered and the fetch is skipped: repeats hand back
+ * immediately and cost exactly what they cost before origin-first — one
+ * CloudFront fetch, nothing else. The memo is per execution environment
+ * (Lambda@Edge cannot share state), bounded in size, and expires, so a URL
+ * that later becomes a real page is picked up again; until then it is served
+ * un-injected, which is the same bounded staleness the core's negative cache
+ * already accepts.
+ */
+let nonPageMemo = new Map<string, number>();
+
+/** Bounded so a scan of unique dead URLs cannot grow the map without limit. */
+const NON_PAGE_MEMO_MAX_ENTRIES = 2_000;
+
+function rememberNonPage(url: string, ttlMs: number): void {
+  // Map preserves insertion order — drop the oldest entry when over cap.
+  if (!nonPageMemo.has(url) && nonPageMemo.size >= NON_PAGE_MEMO_MAX_ENTRIES) {
+    const oldest = nonPageMemo.keys().next().value;
+    if (oldest !== undefined) nonPageMemo.delete(oldest);
+  }
+  nonPageMemo.set(url, Date.now() + ttlMs);
+}
+
+function isRememberedNonPage(url: string): boolean {
+  const until = nonPageMemo.get(url);
+  if (until === undefined) return false;
+  if (Date.now() < until) return true;
+  nonPageMemo.delete(url);
+  return false;
+}
+
 /** TEST-ONLY: fresh cache between tests. */
 export function __resetOriginRequestStateForTests(): void {
   cache = new MemoryCache();
+  nonPageMemo = new Map();
 }
 
 export const handler: CloudFrontRequestHandler = async (event) => {
@@ -347,6 +393,10 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
     const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
 
+    // Already known not to be an injectable page: skip our fetch entirely, so
+    // this costs exactly one CloudFront fetch and nothing else.
+    if (isRememberedNonPage(pageUrl)) return request;
+
     // ORIGIN FIRST (v0.9.0 — see the module header). The trigger cannot know
     // from the request alone whether this URL is an HTML page: the extension
     // pre-filter catches assets, but an extension-less URI may just as well be
@@ -384,7 +434,10 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // Over the conservative fetch cap. Handing the request back is strictly
     // better than the origin-response path's equivalent: CloudFront fetches it
     // itself and streams it with no generated-response quota at all.
-    if (origin.truncated) return request;
+    if (origin.truncated) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
+      return request;
+    }
 
     // The ONE response gate. On the origin-response trigger this same check
     // has to run twice — here there is only one representation, and it is the
@@ -405,23 +458,31 @@ export const handler: CloudFrontRequestHandler = async (event) => {
         hasSetCookie: origin.hasSetCookie,
       })
     ) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
       return request;
     }
 
     // A page the origin marks noindex is not schema-markup territory.
-    if (blocksIndexing(origin.xRobotsTag)) return request;
+    if (blocksIndexing(origin.xRobotsTag)) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
+      return request;
+    }
 
     const originalHtml = origin.body.toString('utf8');
     // Charset gate, part 2: prove the utf8 decode was lossless before touching
     // the bytes — a lossy decode would put U+FFFD into a body CloudFront then
     // caches.
-    if (!Buffer.from(originalHtml, 'utf8').equals(origin.body)) return request;
+    if (!Buffer.from(originalHtml, 'utf8').equals(origin.body)) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
+      return request;
+    }
     const originCharset = charsetOf(origin.contentType ?? '');
     const asciiBody = containsOnlyAscii(origin.body);
     // Relabeling non-ASCII bytes as UTF-8 can change visible text even when
     // those bytes form valid UTF-8, so only genuinely ASCII source bytes are
     // safe under an `ascii`/`us-ascii` label.
     if ((originCharset === 'ascii' || originCharset === 'us-ascii') && !asciiBody) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
       return request;
     }
     // With no header charset, valid UTF-8 bytes are not proof of UTF-8 intent:
@@ -434,6 +495,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       !hasUtf8Bom(origin.body) &&
       !declaresUtf8MetaInPrescan(origin.body)
     ) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
       return request;
     }
 
@@ -484,12 +546,18 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // CloudFront caps response headers at 32 KB independently of the 1 MB
     // quota; exceeding it is a viewer-facing 502 after Lambda has completed.
     const responseHeaderBytes = serializedHeaderBytes(headers, String(origin.status));
-    if (responseHeaderBytes > MAX_RESPONSE_HEADER_BYTES) return request;
+    if (responseHeaderBytes > MAX_RESPONSE_HEADER_BYTES) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
+      return request;
+    }
 
     // The 1 MB generated-response quota counts headers AND body together.
     const bodyBudgetBytes =
       MAX_GENERATED_RESPONSE_BYTES - responseHeaderBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
-    if (Buffer.byteLength(injected, 'utf8') > bodyBudgetBytes) return request;
+    if (Buffer.byteLength(injected, 'utf8') > bodyBudgetBytes) {
+      rememberNonPage(pageUrl, config.cacheTtlMs);
+      return request;
+    }
 
     const result: CloudFrontResultResponse = {
       status: String(origin.status),
