@@ -32,6 +32,9 @@ Requires Node 22.22.0 (`.nvmrc`) and pnpm (pinned via `packageManager` in `packa
 pnpm install
 pnpm -r build
 pnpm -r test
+
+# Which CloudFront path patterns keep the injector off asset traffic?
+pnpm asset-paths https://www.example.com/ [more urls…]
 ```
 
 Run the Cloudflare reference adapter locally:

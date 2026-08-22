@@ -18,6 +18,11 @@ pnpm lint                # ESLint (flat config, typescript-eslint)
 pnpm format              # Prettier format
 pnpm format:check        # Prettier check
 
+# Analysis (not runtime)
+pnpm asset-paths <url>…  # smallest set of CloudFront cache behaviors that keeps the
+                         # injector off asset traffic; reads the adapter's own
+                         # NON_HTML_EXTENSION list so it cannot drift from the code
+
 # Adapter development
 pnpm --filter @enhancely/adapter-cloudflare dev       # wrangler dev (needs .dev.vars with ENHANCELY_API_KEY)
 pnpm --filter @enhancely/adapter-lambda-edge package  # three esbuild bundles + three zips:
