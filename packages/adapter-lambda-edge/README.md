@@ -51,14 +51,16 @@ unknowable:
 
 Origin-first avoids spending Enhancely calls on extension-less non-pages while retaining the local extension fast path.
 
-| path                           | origin hits                                     |
-| ------------------------------ | ----------------------------------------------- |
-| HTML + snippet                 | 1 (we fetch, we generate)                       |
-| HTML, no snippet               | 1 (we fetch, we generate the origin's bytes)    |
-| not HTML / vetoed / over quota | 2 on the FIRST request, 1 afterwards (memoized) |
+| path                        | origin hits                                            |
+| --------------------------- | ------------------------------------------------------ |
+| HTML + snippet              | 1 (we fetch, we generate)                              |
+| HTML, no snippet            | 1 (we fetch, we generate the origin's bytes)           |
+| non-2xx (404, redirect …)   | 1 — returned byte-for-byte from the fetch already made |
+| other non-HTML / over quota | 2 on the FIRST request, 1 afterwards (memoized)        |
 
-Only the third line pays twice, it is reserved for representations this adapter
-must not touch, and only the FIRST request for such a URL pays it: the verdict
+A reproducible non-2xx answer is returned from the fetch already made, so it never pays twice. Only the last line pays
+twice, it is reserved for representations this adapter can neither inject nor
+reproduce, and only the FIRST request for such a URL pays it: the verdict
 is memoized per execution environment, so repeats skip our fetch and cost
 exactly what they cost before origin-first — one CloudFront fetch, nothing else.
 
