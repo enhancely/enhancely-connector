@@ -59,6 +59,7 @@ The API key is a secret — it must never be exposed client-side or committed. `
 | `autoRegister`              | `false`                    | Register unknown pages (companion: one register-or-revalidate POST; GET-path adapters: POST after a 404); always fail open.                                                                              |
 | `excludePaths`              | `[]`                       | Lambda@Edge-only path exclusions, checked before config/API work.                                                                                                                                        |
 | `assertedDefaultTtlSeconds` | `0` (off)                  | Asserted minimum DefaultTTL for bounded retry caching. Applied by the `origin-response` adapter and by the **companion**; inert on `origin-request` alone (it never sees the cached response).           |
+| `nonPageMemoTtlMs`          | `1800000` (30 min)         | origin-request only: how long a "not a page" verdict is remembered so repeats skip the origin fetch that trigger needs to classify a URL.                                                                |
 | `capSetCookieResponses`     | `false`                    | Companion only: extend the retry cap to `Set-Cookie` responses (credential-less requests only). Never enable on origins minting session cookies for anonymous requests (TF: `cap_set_cookie_responses`). |
 
 Lambda@Edge path exclusions use CloudFront-style `*`/`?` patterns. Before

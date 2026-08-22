@@ -608,6 +608,7 @@ var DEFAULT_SSM_REGION = "us-east-1";
 var CONFIG_FILE_NAME = "connector-config.json";
 var DEFAULT_ORIGIN_TIMEOUT_MS = 2e3;
 var DEFAULT_SSM_TIMEOUT_MS = 2e3;
+var DEFAULT_NON_PAGE_MEMO_TTL_MS = 18e5;
 var resolvedConfig = null;
 var negativeUntil = 0;
 var inflight = null;
@@ -615,6 +616,7 @@ var NEGATIVE_TTL_MS = 3e4;
 var resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
 var resolvedAssertedDefaultTtlSeconds = 0;
 var resolvedCapSetCookieResponses = false;
+var resolvedNonPageMemoTtlMs = DEFAULT_NON_PAGE_MEMO_TTL_MS;
 var bakedCache;
 var bakedOverride;
 var configOverrides = null;
@@ -649,6 +651,8 @@ function parseBaked(raw) {
   if (assertedDefaultTtlSeconds !== void 0 && assertedDefaultTtlSeconds >= 1) {
     baked.assertedDefaultTtlSeconds = Math.floor(assertedDefaultTtlSeconds);
   }
+  const nonPageMemoTtlMs = positiveNumber(source["nonPageMemoTtlMs"]);
+  if (nonPageMemoTtlMs !== void 0) baked.nonPageMemoTtlMs = nonPageMemoTtlMs;
   if (typeof source["capSetCookieResponses"] === "boolean") {
     baked.capSetCookieResponses = source["capSetCookieResponses"];
   }
@@ -705,6 +709,7 @@ async function resolveOnce() {
     resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
     resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
     resolvedCapSetCookieResponses = baked?.capSetCookieResponses ?? false;
+    resolvedNonPageMemoTtlMs = baked?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
     let apiKey = baked?.apiKey;
     if (apiKey === void 0) {
       apiKey = await fetchApiKeyFromSsm(

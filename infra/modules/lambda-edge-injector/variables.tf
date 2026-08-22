@@ -50,6 +50,12 @@ variable "asserted_default_ttl_seconds" {
   }
 }
 
+variable "non_page_memo_ttl_ms" {
+  type        = number
+  default     = 1800000
+  description = "origin-request only: how long the function remembers that a URL is NOT an injectable page (redirect, 404, JSON, binary, over-quota), so repeats skip the origin fetch that trigger needs in order to classify a URL. Default 30 minutes. Deliberately independent of cache_ttl_ms: that governs a JSON-LD record, which changes when content is edited; this governs 'not a page at all', which is stable. Costs nothing in correctness - a URL that later becomes a page is still registered via the hand-back, and every execution environment that has not memoized it still injects."
+}
+
 variable "cap_set_cookie_responses" {
   type        = bool
   default     = false

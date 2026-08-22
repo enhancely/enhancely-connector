@@ -569,6 +569,25 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
     expect(originHits).toBe(2);
   });
 
+  it('outlives the JSON-LD cache TTL — the verdict is stable, a record is not', async () => {
+    __resetAdapterConfigForTests();
+    __resetOriginRequestStateForTests();
+    __resetUpstreamMemoForTests();
+    // Record TTL 1 ms, memo TTL 60 s: the two must not share a lifetime.
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      cacheTtlMs: 1,
+      nonPageMemoTtlMs: 60_000,
+    });
+    __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
+
+    await invoke(makeRequestEvent({ uri: '/json' }));
+    expect(originHits).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await invoke(makeRequestEvent({ uri: '/json' }));
+    expect(originHits).toBe(1);
+  });
+
   it('never memoizes a real page', async () => {
     const first = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
     expect(first.body).toContain(SNIPPET);
