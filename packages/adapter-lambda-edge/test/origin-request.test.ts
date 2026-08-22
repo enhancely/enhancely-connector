@@ -444,7 +444,6 @@ describe('origin-request — pass-through gates', () => {
     ['non-UTF-8 charset', '/latin1'],
     ['noindex', '/noindex'],
     ['body over the fetch cap', '/big'],
-    ['non-200 origin answer', '/redirect'],
   ];
   for (const [name, uri] of afterFetch) {
     it(`${name} → request (one discarded fetch)`, async () => {
@@ -543,10 +542,7 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
   // Origin-first pays one extra origin hit for things it must not touch: it
   // fetches to find out, then hands back so CloudFront fetches again. The
   // first time that is unavoidable; the second time it is pure waste.
-  for (const [name, uri] of [
-    ['a redirect', '/redirect'],
-    ['a non-HTML body', '/json'],
-  ] as const) {
+  for (const [name, uri] of [['a non-HTML body', '/json']] as const) {
     it(`${name}: the repeat costs no adapter fetch at all`, async () => {
       const first = await invoke(makeRequestEvent({ uri }));
       expect(isPassThrough(first)).toBe(true);
@@ -597,6 +593,34 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
   });
 });
 
+describe('origin-request — a non-2xx answer is returned verbatim, not re-fetched', () => {
+  it('returns the origin answer with ONE origin hit and no Enhancely call', async () => {
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/redirect' })));
+    expect(response.status).toBe('302');
+    expect(headerValue(response, 'location')).toBe('/elsewhere');
+    expect(originHits).toBe(1);
+    // An error is not a page: Enhancely is never asked.
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('never marks such a response as injected', async () => {
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/redirect' })));
+    expect(response.headers?.['x-enhancely-injected']).toBeUndefined();
+  });
+
+  it('leaves 2xx non-HTML alone (could be large or binary)', async () => {
+    const result = await invoke(makeRequestEvent({ uri: '/json' }));
+    expect(isPassThrough(result)).toBe(true);
+  });
+
+  it('hands back a Range request rather than substituting a full body', async () => {
+    const result = await invoke(
+      makeRequestEvent({ uri: '/redirect', requestHeaders: { range: 'bytes=0-99' } })
+    );
+    expect(isPassThrough(result)).toBe(true);
+  });
+});
+
 describe('origin-request — registration is precise on this trigger (v0.9.0)', () => {
   function enableRegistration(): void {
     __resetAdapterConfigForTests();
@@ -619,18 +643,20 @@ describe('origin-request — registration is precise on this trigger (v0.9.0)', 
     expect(calls[0]?.url).toMatch(/\/api\/v1\/jsonld$/);
   });
 
-  for (const [name, uri] of [
-    ['a redirect', '/redirect'],
-    ['a non-HTML body', '/json'],
-  ] as const) {
-    it(`never registers ${name} — the response is gated before any API call`, async () => {
-      enableRegistration();
-      const result = await invoke(makeRequestEvent({ uri }));
-      expect(isPassThrough(result)).toBe(true);
-      // The decisive property of origin-first: NOTHING reached Enhancely.
-      expect(enhancelyFetch).not.toHaveBeenCalled();
-    });
-  }
+  it('never registers a non-HTML body — gated before any API call', async () => {
+    enableRegistration();
+    const result = await invoke(makeRequestEvent({ uri: '/json' }));
+    expect(isPassThrough(result)).toBe(true);
+    // The decisive property of origin-first: NOTHING reached Enhancely.
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('never registers a redirect — it is returned verbatim, unasked', async () => {
+    enableRegistration();
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/redirect' })));
+    expect(response.status).toBe('302');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
 
   it('never contacts Enhancely for an extension-filtered asset', async () => {
     enableRegistration();

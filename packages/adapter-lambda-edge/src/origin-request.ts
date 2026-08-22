@@ -60,14 +60,17 @@
  *
  *   HTML + snippet    → 1 own fetch, no CloudFront fetch  = 1
  *   HTML, no snippet  → 1 own fetch, response generated   = 1
- *   not HTML / vetoed → 1 own fetch + 1 CloudFront fetch  = 2  (first time)
+ *   non-2xx (404, 3xx) → 1 own fetch, returned verbatim   = 1
+ *   other non-HTML    → 1 own fetch + 1 CloudFront fetch  = 2  (first time)
  *                     → 0 own fetches + 1 CloudFront      = 1  (remembered)
  *
- * Only the third line costs a second origin hit, it is reserved for
- * representations this adapter must not touch (non-2xx, non-HTML, noindex,
- * non-UTF-8, over quota), and only the FIRST request for such a URL pays it:
- * the verdict is memoized per execution environment (see nonPageMemo), so
- * repeats skip the fetch and cost exactly what they cost before origin-first. Two consequences follow, both of which the previous
+ * A non-2xx answer never costs two hits: it is reproduced byte-for-byte from
+ * the fetch already made (verbatimNonOkResponse) — measured safe, CloudFront
+ * still substitutes an operator's custom error page for it. Only the last
+ * line pays a second hit, it is reserved for representations this adapter can
+ * neither inject nor reproduce (2xx non-HTML, oversized, unreproducible
+ * encodings), and only the FIRST request for such a URL pays it: the verdict
+ * is memoized per execution environment (see nonPageMemo). Two consequences follow, both of which the previous
  * order could not deliver:
  *   - REGISTRATION is precise. The adapter knows the response is real HTML, so
  *     autoRegister no longer has to be forced off (v0.7.0/v0.8.0 could only
@@ -91,8 +94,10 @@
  * the origin-response entrypoint comes from ./shared.js, so the two triggers
  * cannot drift apart.
  */
+import type { OriginFetchResult } from './origin-fetch.js';
 import type {
   CloudFrontHeaders,
+  CloudFrontRequest,
   CloudFrontRequestHandler,
   CloudFrontResultResponse,
 } from 'aws-lambda';
@@ -259,9 +264,20 @@ function isDisallowedResponseHeader(name: string): boolean {
  * dropping an origin header would be a behavior (and possibly security)
  * regression that no test on the injected markup would catch.
  */
+/**
+ * How faithfully the body we are about to return reproduces the origin's.
+ * - `injected`  — bytes changed: validators and digests are now wrong, and the
+ *   body is re-emitted as identity text, so Content-Encoding must go too.
+ * - `decoded`   — bytes unchanged but re-emitted as text after an identity
+ *   fetch: validators still describe them truthfully, Content-Encoding does not.
+ * - `verbatim`  — the exact bytes, base64-framed: every header the origin sent
+ *   still describes the body, Content-Encoding included.
+ */
+export type BodyFidelity = 'injected' | 'decoded' | 'verbatim';
+
 export function buildResponseHeaders(
   allHeaders: Record<string, string[]>,
-  bodyWasModified = true
+  fidelity: BodyFidelity = 'injected'
 ): CloudFrontHeaders {
   const headers: CloudFrontHeaders = {};
   for (const [name, values] of Object.entries(allHeaders)) {
@@ -271,9 +287,8 @@ export function buildResponseHeaders(
     // pass-through path only Content-Encoding must go — the fetch asked for
     // identity, so the bytes we return are uncompressed whatever the origin
     // labelled them.
-    if (bodyWasModified ? STALE_BODY_HEADERS.includes(name) : name === 'content-encoding') {
-      continue;
-    }
+    if (fidelity === 'injected' && STALE_BODY_HEADERS.includes(name)) continue;
+    if (fidelity === 'decoded' && name === 'content-encoding') continue;
     // CloudFront expects the canonical casing in `key` and lowercase keys in
     // the map; the origin's own casing is not preserved by node anyway.
     // EVERY value, not just the first: Set-Cookie is the case that matters —
@@ -342,6 +357,52 @@ function isRememberedNonPage(url: string): boolean {
   if (Date.now() < until) return true;
   nonPageMemo.delete(url);
   return false;
+}
+
+/**
+ * Return a non-2xx origin answer straight from the fetch we already made,
+ * instead of handing the request back for CloudFront to fetch it again.
+ * Returns null when that is not safe or not enabled, and the caller then
+ * hands back as before.
+ *
+ * An error is not a page: no Enhancely call is made, the body is never
+ * inspected, and every origin header is preserved — the bytes are framed as
+ * base64 so the response is reproduced exactly, whatever its encoding or
+ * charset.
+ *
+ * CloudFront applies configured custom error responses to generated error statuses as well; generating saves the second origin fetch.
+ *
+ * Excluded regardless:
+ * - 204/304 — a generated 204 carrying a body is a viewer-facing 502, and a
+ *   304 must not be manufactured from a full fetch.
+ * - Range requests — our fetch drops Range, so the origin answered in full;
+ *   returning that as a 200/206 substitute would be wrong.
+ * - Anything over the generated-response quota.
+ */
+function verbatimNonOkResponse(
+  origin: OriginFetchResult,
+  request: CloudFrontRequest
+): CloudFrontResultResponse | null {
+  if (origin.status >= 200 && origin.status <= 299) return null;
+  if (origin.status === 204 || origin.status === 304) return null;
+  if (origin.status < 200 || origin.status > 599) return null;
+  if (request.headers['range'] !== undefined) return null;
+
+  const headers = buildResponseHeaders(origin.allHeaders, 'verbatim');
+  const headerBytes = serializedHeaderBytes(headers, String(origin.status));
+  if (headerBytes > MAX_RESPONSE_HEADER_BYTES) return null;
+
+  const body = origin.body.toString('base64');
+  const budget =
+    MAX_GENERATED_RESPONSE_BYTES - headerBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
+  // base64 is what CloudFront counts, so measure the encoded length.
+  if (body.length > budget) return null;
+
+  return {
+    status: String(origin.status),
+    headers,
+    ...(body === '' ? {} : { body, bodyEncoding: 'base64' as const }),
+  };
 }
 
 /** TEST-ONLY: fresh cache between tests. */
@@ -463,6 +524,13 @@ export const handler: CloudFrontRequestHandler = async (event) => {
         hasSetCookie: origin.hasSetCookie,
       })
     ) {
+      // A non-2xx answer we can reproduce exactly goes straight back: one
+      // origin hit, and nothing to remember, because handing it back would
+      // have cost the same one hit via CloudFront.
+      const verbatim = verbatimNonOkResponse(origin, request);
+      if (verbatim !== null) return verbatim;
+      // Everything else (2xx non-HTML, oversized, unreproducible) hands back
+      // and IS worth remembering: that path costs a second origin fetch.
       rememberNonPage(pageUrl, getNonPageMemoTtlMs());
       return request;
     }
@@ -535,7 +603,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
 
     // Validators describe the ORIGINAL bytes. They stay accurate on the
     // pass-through path and must go on the injected one.
-    const headers = buildResponseHeaders(origin.allHeaders, didInject);
+    const headers = buildResponseHeaders(origin.allHeaders, didInject ? 'injected' : 'decoded');
     if (didInject) {
       // The generated text is UTF-8 regardless of what the origin declared, so
       // Unicode in the injected JSON-LD can never be decoded under a stale label.
