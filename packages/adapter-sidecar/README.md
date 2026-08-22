@@ -5,7 +5,7 @@ origin's HTML responses. Put it between your TLS terminator (nginx, Apache,
 ALB, …) and your origin server — no code changes in your application.
 
 > **Status: functional skeleton, not production-hardened.**
-> Works: HTTP/1.1 proxying, HTML detection (2xx + `text/html` only),
+> Works: HTTP/1.1 proxying, HTML detection (exact 200 + `text/html` only),
 > bounded body buffering, injection via `@enhancely/injector-core`
 > (in-memory cache + ETag revalidation, fail-open), streaming passthrough
 > for everything else.
@@ -55,17 +55,22 @@ docker run --rm -p 8080:8080 \
 
 ## Behavior
 
-- **Injected**: `GET` requests whose upstream response is 2xx,
-  `Content-Type: text/html` (declaring no charset or a UTF-8-compatible one),
-  **not** content-encoded, and ≤ 2 MB. The body is buffered, `</head>`
-  injection is done by `injector-core`, and `Content-Length` is recalculated.
-  When nothing is injected, the original upstream bytes are served verbatim.
+- **Injected**: `GET` requests whose upstream response is exactly 200,
+  `Content-Type: text/html`, **not** content-encoded, indexing-allowed,
+  transformable, and ≤ 2 MiB. Declared UTF-8 is validated strictly; a missing
+  charset needs positive UTF-8 evidence (ASCII-only bytes, BOM, or an early
+  UTF-8 meta declaration). The sidecar requests `Accept-Encoding: identity`
+  from the origin. After injection it declares UTF-8, recalculates
+  `Content-Length`, and removes stale validators/digests/range metadata. When
+  nothing is injected, the original upstream bytes are served verbatim.
 - **Passed through untouched (streaming)**: everything else — non-HTML,
-  non-2xx, non-GET, non-UTF-8 declared charsets (no transcoding support),
-  `Content-Encoding` present (TODO gzip support: disable compression between
-  origin and sidecar; compress at the edge instead), oversized bodies, any
-  Enhancely API failure/timeout (fail-open), and everything when
-  `ENHANCELY_API_KEY` is missing.
+  non-200, non-GET, non-UTF-8 declared charsets (no transcoding support),
+  ambiguous/invalid bytes, `Content-Encoding` present (an origin may ignore the
+  identity request), `no-transform`, attachment/noindex responses, oversized
+  bodies, any Enhancely API failure/timeout (fail-open), and everything when
+  `ENHANCELY_API_KEY` is missing. An unsafe or normalization-unstable page URL
+  (notably multiple literal trailing slashes) also skips cache/API work so the
+  cache key can never refer to a different upstream record URL.
 
 ## Fronting proxy examples
 

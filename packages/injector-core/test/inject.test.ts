@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildScriptTag, injectIntoHead } from '../src/index.js';
+import { buildScriptTag, findHeadInjectionPoint, injectIntoHead } from '../src/index.js';
 
 const SNIPPET =
   '<script type="application/ld+json" data-source="Enhancely.ai">{"@type":"Thing"}</script>';
@@ -23,8 +23,10 @@ describe('injectIntoHead', () => {
   });
 
   it('only touches the FIRST </head> when several appear', () => {
-    const html = '<head>a</head><head>b</head>';
-    expect(injectIntoHead(html, SNIPPET)).toBe(`<head>a${SNIPPET}</head><head>b</head>`);
+    const html = '<head><title>a</title></head><head><title>b</title></head>';
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      `<head><title>a</title>${SNIPPET}</head><head><title>b</title></head>`
+    );
   });
 
   it('matches </HEAD> case-insensitively', () => {
@@ -57,7 +59,23 @@ describe('injectIntoHead', () => {
     );
   });
 
-  it.each(['script', 'style', 'title', 'textarea', 'noscript'])(
+  it('fails open when a script double-escaped state makes an apparent closer inert', () => {
+    const html = '<head><script><!--<script></script></head>--></script></head><body>x</body>';
+
+    // The first </script> only exits the HTML tokenizer's double-escaped
+    // state; the following </head> is still script text, not the head closer.
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('fails open instead of injecting at an inert </head> inside template contents', () => {
+    const html = '<head><template></head></template></head><body>x</body>';
+
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it.each(['script', 'style', 'title'])(
     'does not treat </%sx> as the raw-text closing tag',
     (tag) => {
       const html = `<head><${tag}>literal </${tag}x> then </head></${tag}></head>`;
@@ -66,6 +84,77 @@ describe('injectIntoHead', () => {
       );
     }
   );
+
+  it.each(['textarea', 'iframe', 'xmp', 'noembed'])(
+    'fails open when the body element <%s> implicitly closes the head',
+    (tag) => {
+      const html = `<head><${tag}>literal </head> text</${tag}></head><body>x</body>`;
+      expect(findHeadInjectionPoint(html)).toBeNull();
+      expect(injectIntoHead(html, SNIPPET)).toBe(html);
+    }
+  );
+
+  it('fails open for foreign-content CDATA whose </head> is inert', () => {
+    const html = '<html><head><svg><![CDATA[x > </head> y]]></svg></head><body>x</body></html>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('fails open for foreign-content CDATA before an apparent document head', () => {
+    const html = '<html><svg><![CDATA[x > <head></head> y]]></svg></html>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('fails open when non-whitespace text implicitly closes the head', () => {
+    const html = '<html><head>body text</head><body>x</body></html>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('treats everything after <plaintext> as text and fails open', () => {
+    const html = '<head><plaintext>literal </head></plaintext></head><body>x</body>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('does not use an orphaned </head> without a real <head> opener', () => {
+    const html = '<html><body>stray closer</head><p>x</p></body></html>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('does not use a </head> after <body> implicitly closed the head', () => {
+    const html = '<html><head><title>x</title><body>stray closer</head></body></html>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('keeps source indices stable across Unicode with length-changing lowercase forms', () => {
+    const html = '<html><!--İ--><HEAD><title>x</title></HEAD><body>x</body></html>';
+    expect(findHeadInjectionPoint(html)).toBe(html.indexOf('</HEAD>'));
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      `<html><!--İ--><HEAD><title>x</title>${SNIPPET}</HEAD><body>x</body></html>`
+    );
+  });
+
+  it('accepts one leading UTF-8 BOM as an encoding signature', () => {
+    const html = '\uFEFF  <html><head><title>x</title></head><body>x</body></html>';
+    expect(findHeadInjectionPoint(html)).toBe(html.indexOf('</head>'));
+    expect(injectIntoHead(html, SNIPPET)).toContain(`${SNIPPET}</head>`);
+  });
+
+  it('rejects a later lexical head after a closer already created an implicit head', () => {
+    const html = '</head><html><head><title>x</title></head><body>x</body></html>';
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
+  });
+
+  it('ignores an ordinary stray end tag before the real document head', () => {
+    const html = '</p><html><head><title>x</title></head><body>x</body></html>';
+    expect(findHeadInjectionPoint(html)).toBe(html.indexOf('</head>'));
+    expect(injectIntoHead(html, SNIPPET)).toContain(`${SNIPPET}</head>`);
+  });
 
   it('does not treat non-ASCII whitespace as a raw-text end-tag boundary', () => {
     const html = '<head><script>literal </script\u00a0foo> then </head></script></head>';
@@ -98,8 +187,52 @@ describe('injectIntoHead', () => {
     expect(injectIntoHead(html, SNIPPET)).toBe(html);
   });
 
-  it('does not treat <scripty…> as a script opener (word boundary)', () => {
+  it('fails open for an unknown <scripty> element that implicitly closes the head', () => {
     const html = '<head><scripty></scripty></head>';
-    expect(injectIntoHead(html, SNIPPET)).toBe(`<head><scripty></scripty>${SNIPPET}</head>`);
+    expect(findHeadInjectionPoint(html)).toBeNull();
+    expect(injectIntoHead(html, SNIPPET)).toBe(html);
   });
+
+  it('ignores an ordinary stray end tag while the HTML parser remains in head', () => {
+    const html = '<head><link rel="canonical" href="/"></p><title>x</title></head><body>x</body>';
+
+    expect(findHeadInjectionPoint(html)).toBe(html.indexOf('</head>'));
+    expect(injectIntoHead(html, SNIPPET)).toBe(
+      `<head><link rel="canonical" href="/"></p><title>x</title>${SNIPPET}</head><body>x</body>`
+    );
+  });
+
+  it('accepts metadata-only noscript content that stays safe in both scripting modes', () => {
+    const html =
+      '<head><noscript><link rel="stylesheet" href="/no-js.css"></noscriptx></noscript><title>x</title></head>';
+    expect(findHeadInjectionPoint(html)).toBe(html.indexOf('</head>'));
+    expect(injectIntoHead(html, SNIPPET)).toContain(`${SNIPPET}</head>`);
+  });
+
+  it.each(['plain text', '<div>body token</div>'])(
+    'fails open for noscript content that can close head when scripting is disabled: %s',
+    (content) => {
+      const html = `<head><noscript>${content}</noscript><title>x</title></head>`;
+      expect(findHeadInjectionPoint(html)).toBeNull();
+      expect(injectIntoHead(html, SNIPPET)).toBe(html);
+    }
+  );
+
+  it.each(['body', 'html', 'br'])(
+    'does not ignore </%s>, which implicitly closes an open head',
+    (tag) => {
+      const html = `<head><link rel="canonical" href="/"></${tag}><title>x</title></head>`;
+      expect(findHeadInjectionPoint(html)).toBeNull();
+      expect(injectIntoHead(html, SNIPPET)).toBe(html);
+    }
+  );
+
+  it.each(['svg', 'div', 'template'])(
+    'keeps <%s> as a conservative structural veto inside head',
+    (tag) => {
+      const html = `<head><${tag}></${tag}></head><body>x</body>`;
+      expect(findHeadInjectionPoint(html)).toBeNull();
+      expect(injectIntoHead(html, SNIPPET)).toBe(html);
+    }
+  );
 });

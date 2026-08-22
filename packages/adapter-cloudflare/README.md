@@ -22,12 +22,19 @@ Workers primitives: `fetch` pass-through, env/bindings → config, KV →
 
 The origin response is returned **untouched** whenever any of these holds:
 
-- request method is not `GET`, or the origin response is not 2xx
+- request method is not `GET`, or the origin response is not exactly 200
 - origin `Content-Type` is not `text/html`
+- the response is encoded, marked `no-transform`, served as an attachment, or
+  carries `X-Robots-Tag: noindex|none`
+- the body exceeds 2 MiB or its bytes cannot be proven safe to decode/re-emit
+  as UTF-8
 - `ENHANCELY_API_KEY` is not configured
+- the page URL is unsafe or not a normalization fixed point (notably two or
+  more literal trailing slashes), so cache key and upstream record cannot be
+  proven identical
 - the Enhancely API times out (default 800 ms `AbortSignal.timeout`), errors,
   answers 404 (no record) or 429 (rate limit)
-- the document has no `<head>` (HTMLRewriter simply never fires)
+- the document has no real `<head>` insertion slot
 - anything else throws — the whole post-fetch path is wrapped in try/catch
 
 The customer's site can never break because of the connector; the worst case
@@ -38,12 +45,12 @@ is a page without JSON-LD.
 `HTMLRewriter.transform()` returns a _streamed_ response: a parse or handler
 error while the body streams out happens after the worker has already started
 responding, and the client can receive a **truncated page** — a fail-open
-violation. The adapter therefore clones the origin response first, fully
-buffers the rewritten HTML (`src/inject.ts`), and only then responds; any
-error during buffering serves the untouched origin clone instead. Buffering
-trades streaming latency for this hard guarantee, which is acceptable for
-HTML documents (size-bounded). A streaming mode could become an opt-in later
-for callers who prefer latency over the guarantee.
+violation. The adapter therefore clones the origin response first, reads the
+origin and rewritten streams with a strict 2 MiB byte cap (`src/inject.ts`),
+and only then responds; any error during buffering serves the untouched origin
+clone instead. Encoding safety and a real `<head>` slot are proven before the
+snippet provider touches cache or Enhancely, so malformed, legacy-encoded,
+headless, and oversized pages cost no API call.
 
 ## Why a KV cache?
 
@@ -51,10 +58,18 @@ The Enhancely read API deliberately responds `Cache-Control: no-store` — the
 connector is expected to bring its **own** cache. This adapter stores one JSON
 entry per normalized URL in Workers KV (shared across all edge locations) and
 revalidates expired entries cheaply via `ETag` / `If-None-Match` → 304.
-Entries are kept in KV for `max(60s, 2 × cacheTtlMs)` so a stale entry can
-still be served while Enhancely is slow, rate-limited, or down. Without the KV
-binding the worker falls back to a per-isolate in-memory cache (fine for dev,
-modest hit rates in production).
+Entries are kept in KV for at least `max(60s, 2 × cacheTtlMs)` so a stale entry
+can still be served while Enhancely is slow, rate-limited, or down. A longer
+server retry deadline extends that lifetime, preventing a day-scale 403/429
+backoff from being forgotten after ten minutes. Without the KV binding the
+worker falls back to a per-isolate in-memory cache bounded by both entry count
+and a conservative 16 MiB retained-string estimate (fine for dev, modest hit
+rates in production).
+
+Workers KV is eventually consistent and has no compare-and-swap operation.
+The core prevents positive/negative write races inside one isolate, but a rare
+cross-isolate conflict cannot be made atomic with KV alone; choosing a cache
+with CAS/transaction semantics is part of the later distributed-cache phase.
 
 Workers KV limits keys to 512 bytes. Cache keys longer than 400 UTF-8 bytes
 (very long URLs) are transparently replaced by a stable
@@ -67,7 +82,7 @@ silently failing every KV read/write.
 | Name                     | Kind           | Default                    | Notes                                                                                   |
 | ------------------------ | -------------- | -------------------------- | --------------------------------------------------------------------------------------- |
 | `ENHANCELY_API_KEY`      | **secret**     | — (required)               | `sk-…` / `sk-org-…`. `wrangler secret put` — never in wrangler.toml, never client-side. |
-| `ENHANCELY_BASE`         | var (optional) | `https://app.enhancely.ai` | **TODO: confirm** final production API base URL.                                        |
+| `ENHANCELY_BASE`         | var (optional) | `https://app.enhancely.ai` | Confirmed production API base; override only for an explicitly selected environment.    |
 | `ENHANCELY_TIMEOUT_MS`   | var (optional) | `800`                      | Per-call `AbortSignal.timeout` for the Enhancely API.                                   |
 | `ENHANCELY_CACHE_TTL_MS` | var (optional) | `300000` (5 min)           | Cache freshness window; ETag revalidation afterwards.                                   |
 | `JSONLD_CACHE`           | KV (optional)  | — (memory fallback)        | Distributed JSON-LD cache; strongly recommended in production.                          |

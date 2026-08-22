@@ -30,6 +30,77 @@
 import * as http from 'node:http';
 import * as https from 'node:https';
 
+export type OriginFetchFailureScope = 'endpoint' | 'request';
+
+/**
+ * A failed origin fetch annotated with the widest scope it is safe to memoize.
+ * `endpoint` is reserved for DNS/connect/TLS failures observed before the
+ * transport became usable; everything after that point is representation- or
+ * request-specific and must not suppress healthy paths on the same origin.
+ */
+export class OriginFetchError extends Error {
+  readonly scope: OriginFetchFailureScope;
+
+  constructor(scope: OriginFetchFailureScope, cause: unknown) {
+    super(cause instanceof Error ? cause.message : 'Origin fetch failed', { cause });
+    this.name = 'OriginFetchError';
+    this.scope = scope;
+  }
+}
+
+/** Unknown failures are deliberately request-scoped to limit blast radius. */
+export function originFetchFailureScope(error: unknown): OriginFetchFailureScope {
+  return error instanceof OriginFetchError ? error.scope : 'request';
+}
+
+const ENDPOINT_SETUP_ERROR_CODES = new Set([
+  // DNS.
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  // TCP/routing. AbortSignal timeouts surface as ABORT_ERR on Node 20/22.
+  'ABORT_ERR',
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENETDOWN',
+  'ENETUNREACH',
+  'EHOSTDOWN',
+  'EHOSTUNREACH',
+  'EADDRNOTAVAIL',
+  'EPIPE',
+  // TLS/OpenSSL codes without a shared prefix.
+  'EPROTO',
+  'CERT_HAS_EXPIRED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+]);
+
+function errorCode(error: unknown): string | null {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : null;
+}
+
+/** Only known network/TLS setup failures may open the endpoint-wide circuit. */
+function isEndpointSetupFailure(error: unknown): boolean {
+  if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+    return true;
+  }
+  const code = errorCode(error);
+  if (code === null) return false;
+  return (
+    ENDPOINT_SETUP_ERROR_CODES.has(code) ||
+    code.startsWith('ERR_TLS_') ||
+    code.startsWith('ERR_SSL_') ||
+    code.startsWith('ERR_OSSL_') ||
+    code.startsWith('CERT_')
+  );
+}
+
 /** Node http headers are string | string[] | undefined; preserve every value. */
 function combinedHeaderValue(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) return value.join(', ');
@@ -44,6 +115,8 @@ export interface OriginFetchResult {
   cacheControl: string | null;
   /** Expires of the re-fetched answer, synchronized with its generated body. */
   expires: string | null;
+  /** Every Content-Disposition value combined for conservative gating. */
+  contentDisposition: string | null;
   /** True when the re-fetched answer carries any Set-Cookie header. */
   hasSetCookie: boolean;
   /**
@@ -82,11 +155,18 @@ export function fetchOriginHtml(
   hostHeader: string,
   timeoutMs: number,
   maxBytes: number,
+  maxHeaderBytes: number,
   extraHeaders: Record<string, string> = {}
 ): Promise<OriginFetchResult> {
   return new Promise((resolve, reject) => {
     const url = new URL(originUrl);
     const lib = url.protocol === 'https:' ? https : http;
+    let transportReady = false;
+
+    const rejectScoped = (error: unknown): void => {
+      const scope = !transportReady && isEndpointSetupFailure(error) ? 'endpoint' : 'request';
+      reject(new OriginFetchError(scope, error));
+    };
 
     // The request path is taken from the ORIGINAL string, never from
     // `url.pathname`: `new URL` resolves dot-segments, so a URI containing
@@ -106,6 +186,10 @@ export function fetchOriginHtml(
         path: rawPath,
         method: 'GET',
         agent: false,
+        // Node's client default is 16 KiB, but CloudFront accepts 32 KiB.
+        // The caller supplies the connector's single quota constant so this
+        // low-level module neither duplicates it nor imports shared.ts.
+        maxHeaderSize: maxHeaderBytes,
         // TLS SNI (and cert-hostname verification) must present the PUBLIC
         // host, not the origin's own DNS name. A CloudFront custom origin is
         // usually addressed by an internal name (for example an ALB under
@@ -132,11 +216,15 @@ export function fetchOriginHtml(
         signal: AbortSignal.timeout(timeoutMs),
       },
       (response) => {
+        // Receiving a response proves DNS, TCP and (for HTTPS) TLS succeeded.
+        // Any later reset, timeout or parser/body error may be path-specific.
+        transportReady = true;
         const status = response.statusCode ?? 0;
         const contentType = response.headers['content-type'] ?? null;
         const contentEncoding = response.headers['content-encoding'] ?? null;
         const cacheControl = response.headers['cache-control'] ?? null;
         const expires = response.headers['expires'] ?? null;
+        const contentDisposition = combinedHeaderValue(response.headers['content-disposition']);
         const hasSetCookie = response.headers['set-cookie'] !== undefined;
         const csp = combinedHeaderValue(response.headers['content-security-policy']);
         const cspReportOnly = combinedHeaderValue(
@@ -177,6 +265,7 @@ export function fetchOriginHtml(
               contentEncoding,
               cacheControl,
               expires,
+              contentDisposition,
               hasSetCookie,
               contentSecurityPolicy: csp,
               contentSecurityPolicyReportOnly: cspReportOnly,
@@ -200,6 +289,7 @@ export function fetchOriginHtml(
             contentEncoding,
             cacheControl,
             expires,
+            contentDisposition,
             hasSetCookie,
             contentSecurityPolicy: csp,
             contentSecurityPolicyReportOnly: cspReportOnly,
@@ -213,12 +303,29 @@ export function fetchOriginHtml(
         response.on('error', (error) => {
           if (settled) return;
           settled = true;
-          reject(error);
+          rejectScoped(error);
         });
       }
     );
 
-    request.on('error', reject); // no-op if resolve/reject already happened
+    request.once('socket', (socket) => {
+      if (url.protocol === 'https:') {
+        // TCP connect alone is insufficient for HTTPS: certificate validation
+        // and SNI selection complete only at `secureConnect`.
+        socket.once('secureConnect', () => {
+          transportReady = true;
+        });
+        return;
+      }
+      if (!socket.connecting) {
+        transportReady = true;
+        return;
+      }
+      socket.once('connect', () => {
+        transportReady = true;
+      });
+    });
+    request.on('error', rejectScoped); // no-op if resolve/reject already happened
     request.end();
   });
 }

@@ -13,7 +13,7 @@ compatibility_date = "2025-01-01"
 
 # --- Optional plain-text vars ------------------------------------------------
 # [vars]
-# ENHANCELY_BASE = "https://app.enhancely.ai"   # default; TODO: confirm final base URL
+# ENHANCELY_BASE = "https://app.enhancely.ai"   # confirmed production default
 # ENHANCELY_TIMEOUT_MS = "800"
 # ENHANCELY_CACHE_TTL_MS = "300000"
 

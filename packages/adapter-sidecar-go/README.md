@@ -27,7 +27,7 @@ Enhancely sidecar proxy.
 - Same environment variables and same behavior table as the TS sidecar —
   the TS README is the spec.
 - Must uphold every non-negotiable repo rule: fail-open, own cache + ETag
-  revalidation, URL (never a local hash) sent to the API, `text/html` + 2xx
-  gate, hard request timeout.
+  revalidation, URL (never a local hash) sent to the API, exact-200
+  `text/html` plus transformation/disposition gates, hard request timeout.
 
 Until then: use the TS sidecar.

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { CacheEntry } from '@enhancely/injector-core';
 import {
   KVCacheBackend,
+  getKvCacheBackend,
+  kvEntryExpirationTtlSeconds,
   kvExpirationTtlSeconds,
   kvKeyFor,
   type KVNamespaceLike,
@@ -39,6 +41,30 @@ describe('kvExpirationTtlSeconds', () => {
   it('never drops below the 60s KV minimum', () => {
     expect(kvExpirationTtlSeconds(1_000)).toBe(60);
     expect(kvExpirationTtlSeconds(29_999)).toBe(60);
+  });
+});
+
+describe('kvEntryExpirationTtlSeconds', () => {
+  it('keeps retry backoffs alive until their deadline', () => {
+    const now = 1_000_000;
+    expect(
+      kvEntryExpirationTtlSeconds(
+        300_000,
+        { ...entry, jsonldRaw: null, retryNotBefore: now + 86_400_000 },
+        now
+      )
+    ).toBe(86_400);
+  });
+
+  it('uses the normal stale window when it is longer', () => {
+    const now = 1_000_000;
+    expect(
+      kvEntryExpirationTtlSeconds(
+        300_000,
+        { ...entry, jsonldRaw: null, retryNotBefore: now + 10_000 },
+        now
+      )
+    ).toBe(600);
   });
 });
 
@@ -86,6 +112,15 @@ describe('kvKeyFor', () => {
 });
 
 describe('KVCacheBackend', () => {
+  it('reuses one backend identity per KV binding and TTL for core singleflight', () => {
+    const firstKv = new FakeKV();
+    const secondKv = new FakeKV();
+
+    expect(getKvCacheBackend(firstKv, 300_000)).toBe(getKvCacheBackend(firstKv, 300_000));
+    expect(getKvCacheBackend(firstKv, 300_000)).not.toBe(getKvCacheBackend(firstKv, 60_000));
+    expect(getKvCacheBackend(firstKv, 300_000)).not.toBe(getKvCacheBackend(secondKv, 300_000));
+  });
+
   it('round-trips a cache entry as JSON', async () => {
     const kv = new FakeKV();
     const backend = new KVCacheBackend(kv, 300_000);

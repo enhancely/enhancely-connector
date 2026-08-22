@@ -4,7 +4,8 @@
  *
  * WHY BOTH. The core's backoff lives on the cache entry, so it is keyed by
  * URL. That is right for a 404 or a per-record problem, but an API outage is
- * not per-record — it affects every URL at once. Without a wider memo, every distinct URL would pay the full timeout once per execution environment.
+ * not per-record — it affects every URL at once. Without a wider memo, every
+ * distinct URL would pay the full timeout once per execution environment.
  *
  * So the FIRST upstream call that runs into the timeout parks every other call
  * in this execution environment for a short window. Pages then serve at full
@@ -16,10 +17,9 @@
  * A call that consumed essentially the whole budget did not get an answer.
  *
  * This module intentionally holds state (unlike `shared.ts`): the memo IS the
- * feature. Module state is per bundle and per execution environment — the
- * origin-request injector and the companion are separate Lambda functions, so
- * each fleet keeps its own memo, which is exactly the granularity an outage
- * detector needs.
+ * feature. The origin-request injector owns this memo per execution
+ * environment. The cache-cap-only companion has no Enhancely call and imports
+ * none of this state.
  */
 
 let upstreamDownUntil = 0;

@@ -31,11 +31,129 @@ export interface CapOptions {
   /**
    * "Set-Cookie on responses to credential-less requests is load-balancer
    * plumbing, not session material" — enables capping Set-Cookie responses
-   * (companion design §3.3). Requests carrying Cookie/Authorization are
+   * (the operator assertion documented by the Lambda adapter). Requests
+   * carrying Cookie/Authorization are
    * untouched regardless, so this only ever affects the shared
    * (crawler-facing) cache variant. Default false.
    */
   capSetCookieResponses: boolean;
+}
+
+type CacheDirectiveResult =
+  { state: 'absent' } | { state: 'invalid' } | { state: 'valid'; seconds: number };
+
+interface ParsedCacheDirective {
+  name: string;
+  value: string | null;
+}
+
+const CACHE_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/** HTTP optional whitespace is SP / HTAB only — never JavaScript trim(). */
+function trimOws(value: string): string {
+  return value.replace(/^[ \t]+|[ \t]+$/g, '');
+}
+
+/**
+ * Parse the Cache-Control list without treating commas inside quoted-string
+ * extension values as directive separators. Any malformed/ambiguous syntax
+ * invalidates the whole policy: a retry cap may become stricter, but must
+ * never infer a longer origin lifetime from a fragment another cache parses
+ * differently.
+ */
+function parseCacheControl(policy: string): ParsedCacheDirective[] | null {
+  const rawDirectives: string[] = [];
+  let start = 0;
+  let inQuotes = false;
+  let escaped = false;
+
+  for (let index = 0; index < policy.length; index += 1) {
+    const char = policy[index];
+    if (inQuotes) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inQuotes = false;
+      }
+    } else if (char === '"') {
+      inQuotes = true;
+    } else if (char === ',') {
+      rawDirectives.push(policy.slice(start, index));
+      start = index + 1;
+    }
+  }
+  if (inQuotes || escaped) return null;
+  rawDirectives.push(policy.slice(start));
+
+  const parsed: ParsedCacheDirective[] = [];
+  for (const rawDirective of rawDirectives) {
+    const directive = trimOws(rawDirective);
+    // RFC list extensions permit empty elements around/between commas.
+    if (directive === '') continue;
+
+    const equalsAt = directive.indexOf('=');
+    const namePart = equalsAt === -1 ? directive : directive.slice(0, equalsAt);
+    const rawName = namePart;
+    // cache-directive permits no OWS/BWS around "=". Accepting it here could
+    // infer freshness from syntax that CloudFront legitimately ignores.
+    if (!CACHE_TOKEN.test(rawName)) return null;
+
+    if (equalsAt === -1) {
+      parsed.push({ name: rawName.toLowerCase(), value: null });
+      continue;
+    }
+
+    const valuePart = directive.slice(equalsAt + 1);
+    const rawValue = valuePart;
+    if (rawValue === '') return null;
+    if (rawValue.startsWith('"')) {
+      if (!rawValue.endsWith('"') || rawValue.length < 2) return null;
+      const inner = rawValue.slice(1, -1);
+      for (let index = 0; index < inner.length; index += 1) {
+        const char = inner[index];
+        const code = char?.charCodeAt(0) ?? 0;
+        if (char === '"' || (code < 0x20 && char !== '\t') || code === 0x7f) return null;
+        // Quoted-pair is valid HTTP syntax, but caches differ on accepting it
+        // inside freshness values. Treat the whole policy as stale instead of
+        // risking a more permissive interpretation than CloudFront's.
+        if (char === '\\') return null;
+      }
+      parsed.push({ name: rawName.toLowerCase(), value: inner });
+      continue;
+    }
+
+    if (!CACHE_TOKEN.test(rawValue)) return null;
+    parsed.push({ name: rawName.toLowerCase(), value: rawValue });
+  }
+  return parsed;
+}
+
+/**
+ * Parse one freshness directive without conflating absence with invalidity.
+ * Duplicate or malformed values make freshness ambiguous; treating them as
+ * already stale is the only choice that cannot extend an origin policy.
+ */
+function parseCacheDirective(
+  directives: ParsedCacheDirective[] | null,
+  wanted: 'max-age' | 's-maxage'
+): CacheDirectiveResult {
+  if (directives === null) return { state: 'invalid' };
+  let matchedValue: string | null = null;
+
+  for (const directive of directives) {
+    if (directive.name !== wanted) continue;
+    if (matchedValue !== null || directive.value === null) return { state: 'invalid' };
+    matchedValue = directive.value;
+  }
+
+  if (matchedValue === null) return { state: 'absent' };
+
+  if (!/^\d+$/.test(matchedValue)) return { state: 'invalid' };
+
+  const seconds = Number(matchedValue);
+  return Number.isSafeInteger(seconds) ? { state: 'valid', seconds } : { state: 'invalid' };
 }
 
 /** Numeric Cache-Control directive value, or null when absent/invalid. */
@@ -43,15 +161,43 @@ export function cacheDirectiveSeconds(
   policy: string,
   wanted: 'max-age' | 's-maxage'
 ): number | null {
-  for (const directive of policy.split(',')) {
-    const [rawName, rawValue] = directive.trim().split('=', 2);
-    if (rawName?.toLowerCase() !== wanted || rawValue === undefined) continue;
-    const value = rawValue.trim().replace(/^"|"$/g, '');
-    if (!/^\d+$/.test(value)) return null;
-    const seconds = Number(value);
-    return Number.isSafeInteger(seconds) ? seconds : null;
+  const parsed = parseCacheDirective(parseCacheControl(policy), wanted);
+  return parsed.state === 'valid' ? parsed.seconds : null;
+}
+
+const IMF_FIXDATE =
+  /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** Strict modern HTTP-date parser; invalid/obsolete forms conservatively stale. */
+function strictHttpDate(value: string): number | null {
+  const match = IMF_FIXDATE.exec(value);
+  if (match === null) return null;
+
+  const [, weekday, dayText, monthText, yearText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText);
+  const month = MONTHS.indexOf(monthText ?? '');
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  if (year < 1601 || month < 0 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+    return null;
   }
-  return null;
+
+  const date = new Date(0);
+  date.setUTCFullYear(year, month, day);
+  date.setUTCHours(hour, minute, second, 0);
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month ||
+    date.getUTCDate() !== day ||
+    WEEKDAYS[date.getUTCDay()] !== weekday
+  ) {
+    return null;
+  }
+  return date.getTime();
 }
 
 /**
@@ -90,34 +236,49 @@ export function retrySharedTtlSeconds(
   const policy = cacheControlValue(headers);
 
   if (policy !== null) {
-    const directiveNames = policy
-      .split(',')
-      .map((directive) => directive.split('=', 1)[0]?.trim().toLowerCase());
+    const directives = parseCacheControl(policy);
+    if (directives === null) return 0;
     // no-cache is an explicit "revalidate every time" — honor it with s-maxage=0.
-    if (directiveNames.includes('no-cache')) {
+    if (directives.some((directive) => directive.name === 'no-cache')) {
       return 0;
     }
-    const originTtl =
-      cacheDirectiveSeconds(policy, 's-maxage') ?? cacheDirectiveSeconds(policy, 'max-age');
-    if (originTtl !== null) {
-      return Math.min(retryTtl, originTtl);
+    // Validate BOTH freshness directives before applying the s-maxage
+    // precedence. A valid s-maxage must not hide an ambiguous max-age list.
+    const sharedTtl = parseCacheDirective(directives, 's-maxage');
+    const browserTtl = parseCacheDirective(directives, 'max-age');
+    if (sharedTtl.state === 'invalid' || browserTtl.state === 'invalid') return 0;
+    if (sharedTtl.state === 'valid') {
+      return Math.min(retryTtl, sharedTtl.seconds);
+    }
+    if (browserTtl.state === 'valid') {
+      return Math.min(retryTtl, browserTtl.seconds);
     }
   }
 
   // No max-age/s-maxage: Expires is the only other explicit lifetime.
-  const expires = headerValue(headers, 'expires');
-  if (expires !== null) {
-    const expiresAt = Date.parse(expires);
-    if (Number.isNaN(expiresAt)) {
+  const expiresEntries = headers['expires'];
+  if (expiresEntries !== undefined) {
+    // Expires is a singleton field. Multiple values are ambiguous and must not
+    // create freshness regardless of which one a cache happens to select.
+    if (expiresEntries.length !== 1) return 0;
+    const expires = expiresEntries[0]?.value ?? '';
+    const expiresAt = strictHttpDate(expires);
+    if (expiresAt === null) {
       // RFC 9111 §5.3: an invalid Expires (the common `Expires: 0` included)
       // means ALREADY EXPIRED. Falling through to the assertion path would
       // write a fresh s-maxage onto a response the origin declared stale —
       // the one direction the cap must never move. Honor it as lifetime 0.
       return 0;
     }
-    const responseDate = Date.parse(headerValue(headers, 'date') ?? '');
-    const reference = Number.isNaN(responseDate) ? Date.now() : responseDate;
-    return Math.min(retryTtl, Math.max(0, Math.ceil((expiresAt - reference) / 1000)));
+    const dateEntries = headers['date'];
+    let reference = Date.now();
+    if (dateEntries !== undefined) {
+      if (dateEntries.length !== 1) return 0;
+      const responseDate = strictHttpDate(headerValue(headers, 'date') ?? '');
+      if (responseDate === null) return 0;
+      reference = responseDate;
+    }
+    return Math.min(retryTtl, Math.max(0, Math.floor((expiresAt - reference) / 1000)));
   }
 
   // Origin declared no explicit lifetime. Without the operator assertion, do

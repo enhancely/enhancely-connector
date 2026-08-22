@@ -16,7 +16,7 @@ compatibility_date = "2025-01-01"
 
 [vars]
 # Optional overrides — the defaults below are built into the connector.
-ENHANCELY_BASE = "https://app.enhancely.ai" # TODO: confirm final base URL
+ENHANCELY_BASE = "https://app.enhancely.ai" # confirmed production default
 ENHANCELY_TIMEOUT_MS = "800"                # per-call AbortSignal timeout
 ENHANCELY_CACHE_TTL_MS = "300000"           # 5 min freshness; ETag revalidation after
 

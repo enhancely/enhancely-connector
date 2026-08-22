@@ -9,7 +9,7 @@
 export type Fetcher = (input: string, init: RequestInit) => Promise<Response>;
 
 export interface InjectorConfig {
-  /** Enhancely API base, e.g. https://app.enhancely.ai — TODO: confirm final base URL. */
+  /** Enhancely API base; production defaults to https://app.enhancely.ai. */
   enhancelyBase: string;
   /** Project (`sk-…`) or organization (`sk-org-…`) API key. NEVER expose client-side. */
   apiKey: string;
@@ -25,11 +25,12 @@ export interface InjectorConfig {
   /** Only supported position today; kept in config for forward compatibility. */
   injectPosition: 'before-head-close';
   /**
-   * When true, a 404 from Enhancely triggers ONE fire-and-forget
-   * `POST /api/v1/jsonld {url}` that registers the page and starts
-   * generation — the connector becomes self-populating for every really
-   * visited page. The negative cache entry still suppresses re-lookups for a
-   * full TTL, so each URL registers at most once per TTL. Default false.
+   * When true, high-level snippet lookup uses ONE register-or-revalidate
+   * `POST /api/v1/jsonld {url}`: known pages return their snippet in that same
+   * call, while unknown pages are registered and start generation. The
+   * negative cache still suppresses repeats until the next retry deadline.
+   * The explicit `getJsonLdLookup` conditional-GET API retains its historical
+   * GET→404→POST behavior for backwards compatibility. Default false.
    */
   autoRegister: boolean;
   /** Platform fetch override (defaults to globalThis.fetch). */

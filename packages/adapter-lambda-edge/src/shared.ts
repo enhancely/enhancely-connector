@@ -1,17 +1,26 @@
 /**
- * Pure helpers shared by BOTH Lambda@Edge entrypoints.
+ * Pure helpers shared by all Lambda@Edge entrypoints.
  *
- * `index.ts` (origin-response) and `origin-request.ts` need the same gates,
- * URL builders, charset probes and size accounting. Keeping them here means
- * the two triggers cannot drift apart — a divergence would show up as one
- * trigger injecting a page the other refuses, which is exactly the class of
- * bug that is hardest to notice in production.
+ * `index.ts` (origin-response), `origin-request.ts`, and the cache-cap-only
+ * `companion.ts` share the relevant gates and URL helpers. Charset probes and
+ * size accounting are shared by the two body-aware injectors. Keeping these
+ * invariants here prevents the entrypoints from silently drifting apart.
  *
- * Nothing in this module holds state or performs I/O; both entrypoints import
- * from it, and `index.ts` re-exports the public names so existing consumers
- * and tests keep their import paths.
+ * Nothing in this module holds state or performs I/O; all entrypoints import
+ * the helpers they need, and `index.ts` re-exports the public names so existing
+ * consumers and tests keep their import paths.
  */
 import type { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda';
+import { charsetOf, isAttachmentDisposition } from '@enhancely/injector-core';
+export {
+  blocksIndexing,
+  charsetOf,
+  containsOnlyAscii,
+  declaresUtf8MetaInPrescan,
+  hasUtf8Bom,
+  isUtf8SafeHtmlBytes,
+  isValidUtf8,
+} from '@enhancely/injector-core';
 
 /**
  * Lambda@Edge quota for a response GENERATED in an origin-response trigger:
@@ -65,6 +74,14 @@ const UTF8_COMPATIBLE_CHARSETS = new Set(['utf-8', 'utf8', 'us-ascii', 'ascii'])
 export const GENERATED_HTML_CONTENT_TYPE = 'text/html; charset=utf-8';
 
 /**
+ * Extensions that can never be an injectable HTML document. Both members of
+ * the recommended Lambda@Edge pair apply this before config or network work,
+ * so an asset-shaped handback cannot be reconsidered by the companion.
+ */
+export const NON_HTML_EXTENSION =
+  /\.(?:js|mjs|cjs|css|map|json|jsonld|geojson|xml|rss|atom|txt|csv|tsv|yaml|yml|wasm|webmanifest|ics|vcf|png|jpe?g|jfif|gif|webp|avif|heic|heif|svg|ico|bmp|tiff?|psd|eps|woff2?|ttf|otf|eot|mp4|m4v|webm|ogv|mkv|flv|mov|avi|mp3|m4a|aac|opus|wav|flac|oga|ogg|vtt|srt|pdf|docx?|xlsx?|pptx?|odt|ods|odp|epub|mobi|zip|gz|tgz|bz2|xz|7z|rar|tar|iso|apk|dmg|exe|msi|deb|rpm|bin)$/i;
+
+/**
  * Bytes reserved for the response status line and framing overhead on top of
  * the per-header bytes in serializedHeaderBytes.
  */
@@ -95,70 +112,6 @@ export function serializedHeaderBytes(
   return total;
 }
 
-/** Lower-cased `charset` parameter of a Content-Type header value, or null. */
-export function charsetOf(contentType: string): string | null {
-  const match = /;\s*charset\s*=\s*"?([\w-]+)"?/i.exec(contentType);
-  return match?.[1]?.toLowerCase() ?? null;
-}
-
-export function containsOnlyAscii(body: Buffer): boolean {
-  return body.every((byte) => byte <= 0x7f);
-}
-
-/** A byte-order mark is unambiguous UTF-8 evidence without parsing HTML. */
-export function hasUtf8Bom(body: Buffer): boolean {
-  return body.length >= 3 && body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf;
-}
-
-/**
- * Positive-only slice of the WHATWG encoding prescan, for the one case that
- * is unambiguous: a meta tag inside the first 1024 bytes (the same window
- * browsers prescan) that declares UTF-8, either as `<meta charset="utf-8">`
- * or as `<meta http-equiv="Content-Type" content="text/html; charset=utf-8">`.
- *
- * Deliberately narrow. HTML comments are skipped (a commented-out meta is not
- * a declaration), the attribute must literally be `charset` (`data-charset`
- * and lookalikes do not count), the http-equiv form only counts for
- * Content-Type, and only UTF-8 answers true. A declaration of any OTHER
- * encoding, a meta beyond the window, or anything malformed stays ambiguous
- * and the caller fails open, exactly as before. False negatives are safe
- * (pass-through); the shape of the check makes false positives require a page
- * that literally declares UTF-8 while meaning something else, at which point
- * browsers decode it as UTF-8 too.
- */
-export function declaresUtf8MetaInPrescan(body: Buffer): boolean {
-  // The prescan window is byte-based; latin1 maps every byte 1:1 to a code
-  // point, so string offsets stay byte offsets.
-  let window = body.subarray(0, 1024).toString('latin1');
-  // Drop complete comments, then everything after an unterminated opener.
-  window = window.replace(/<!--[\s\S]*?-->/g, ' ');
-  const openComment = window.indexOf('<!--');
-  if (openComment !== -1) window = window.slice(0, openComment);
-
-  const metaRe = /<meta\b([^>]*)>/gi;
-  const attrRe = /([^\s"'>/=]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]*))/g;
-  let tag: RegExpExecArray | null;
-  while ((tag = metaRe.exec(window)) !== null) {
-    const attrs = new Map<string, string>();
-    attrRe.lastIndex = 0;
-    let attr: RegExpExecArray | null;
-    while ((attr = attrRe.exec(tag[1] ?? '')) !== null) {
-      const name = attr[1]?.toLowerCase() ?? '';
-      // First occurrence wins, matching how browsers treat duplicates.
-      if (!attrs.has(name)) attrs.set(name, attr[2] ?? attr[3] ?? attr[4] ?? '');
-    }
-    const direct = attrs.get('charset');
-    const declared =
-      direct !== undefined
-        ? direct.trim().toLowerCase()
-        : attrs.get('http-equiv')?.trim().toLowerCase() === 'content-type'
-          ? charsetOf(attrs.get('content') ?? '')
-          : null;
-    if (declared === 'utf-8' || declared === 'utf8') return true;
-  }
-  return false;
-}
-
 export interface AttemptInput {
   /** Method of the request CloudFront sent to the origin. */
   method: string;
@@ -170,12 +123,15 @@ export interface AttemptInput {
   contentEncoding: string | null;
   /** Response Cache-Control header value. */
   cacheControl: string | null;
+  /** Response Content-Disposition header value. */
+  contentDisposition: string | null;
   /** True when the response carries any Set-Cookie header. */
   hasSetCookie: boolean;
 }
 
 /** `private` / `no-store` as Cache-Control directives (not substrings). */
 const PER_REQUEST_CACHE_CONTROL = /(?:^|[\s,])(?:private|no-store)(?:$|[\s,=])/i;
+const NO_TRANSFORM_CACHE_CONTROL = /(?:^|[\s,])no-transform(?:$|[\s,=])/i;
 
 /** True when the Cache-Control marks a per-request representation. */
 export function hasPerRequestCacheControl(cacheControl: string | null): boolean {
@@ -183,12 +139,12 @@ export function hasPerRequestCacheControl(cacheControl: string | null): boolean 
 }
 
 /**
- * Marker header the origin-request entrypoint stamps on every GENERATED
- * response. Purpose: field debugging ("which path produced this response?")
- * and a mis-pairing tripwire — per AWS docs the origin-response trigger never
- * fires for generated responses, so a companion observing this header proves
- * the full origin-response injector was wired next to the origin-request one
- * (forbidden pairing) and must abstain. Nothing ever DEPENDS on the header.
+ * Marker header the origin-request entrypoint stamps on injected GENERATED
+ * responses. It is a field-debugging aid and a never-touch-injected-content
+ * tripwire: per AWS docs an origin-response trigger does not run for generated
+ * responses, so the companion should never observe it. If it does (for
+ * example because an origin echoed it), the companion abstains. This is not a
+ * reliable deployment-pairing detector, and injection never depends on it.
  */
 export const INJECTED_MARKER_HEADER = 'x-enhancely-injected';
 export const INJECTED_MARKER_VALUE = '1';
@@ -217,7 +173,10 @@ function isInjectableRepresentation(input: AttemptInput): boolean {
   if (mediaType !== 'text/html') return false;
 
   const charset = charsetOf(contentType);
-  return charset === null || UTF8_COMPATIBLE_CHARSETS.has(charset);
+  if (charset !== null && !UTF8_COMPATIBLE_CHARSETS.has(charset)) return false;
+  if (NO_TRANSFORM_CACHE_CONTROL.test(input.cacheControl ?? '')) return false;
+  if (isAttachmentDisposition(input.contentDisposition)) return false;
+  return true;
 }
 
 /**
@@ -265,22 +224,6 @@ export function shouldAttemptGeneratedResponse(input: AttemptInput): boolean {
   // A compressed body cannot be injected into: the fetch asked for `identity`,
   // so a Content-Encoding here means the origin ignored us.
   return input.contentEncoding === null;
-}
-
-/**
- * Register gate for the companion entrypoint: is this a real, servable HTML
- * page worth enrolling at Enhancely?
- *
- * Representation-level only (GET + "200" + text/html + UTF-8-compatible
- * charset). Deliberately IGNORES both per-request state (Set-Cookie /
- * private / no-store — the paired origin-request injector injects those
- * pages, so refusing to register them would starve it; see the companion
- * design §3.2) and Content-Encoding (the CloudFront copy is usually gzip/br;
- * the companion reads no body, so encoding is irrelevant to registering).
- * The `contentEncoding` field of the input is not consulted.
- */
-export function shouldRegisterRepresentation(input: AttemptInput): boolean {
-  return isInjectableRepresentation(input);
 }
 
 /**
@@ -419,11 +362,6 @@ export function combinedHeaderValue(headers: CloudFrontHeaders, name: string): s
   return entries === undefined ? null : entries.map((entry) => entry.value).join(', ');
 }
 
-/** `noindex` / `none` as complete X-Robots-Tag directives, not substrings. */
-export function blocksIndexing(xRobotsTag: string | null): boolean {
-  return xRobotsTag !== null && /(?:^|[\s,:])(?:noindex|none)(?:$|[\s,])/i.test(xRobotsTag);
-}
-
 /**
  * Request headers NEVER forwarded on the origin re-fetch:
  * - `host` — set explicitly by the caller (vhost resolution),
@@ -438,6 +376,7 @@ const NON_FORWARDED_REQUEST_HEADERS = new Set([
   'keep-alive',
   'proxy-authenticate',
   'proxy-authorization',
+  'proxy-connection',
   'te',
   'trailer',
   'transfer-encoding',
@@ -457,11 +396,18 @@ const NON_FORWARDED_REQUEST_HEADERS = new Set([
  */
 export function forwardedHeaders(headers: CloudFrontHeaders): Record<string, string> {
   const out: Record<string, string> = {};
+  const blocked = new Set(NON_FORWARDED_REQUEST_HEADERS);
+  for (const entry of headers['connection'] ?? []) {
+    for (const token of entry.value.split(',')) {
+      const name = token.trim().toLowerCase();
+      if (name !== '') blocked.add(name);
+    }
+  }
   for (const [name, entries] of Object.entries(headers)) {
     // CloudFront keys the map with lowercase names already; normalize anyway
     // so the exclusion set can never be dodged by casing.
     const key = name.toLowerCase();
-    if (NON_FORWARDED_REQUEST_HEADERS.has(key)) continue;
+    if (blocked.has(key)) continue;
     if (entries.length === 0) continue;
     // CloudFront may split repeated headers into multiple entries; cookies
     // recombine with "; " (RFC 6265), everything else with ", " (RFC 9110).

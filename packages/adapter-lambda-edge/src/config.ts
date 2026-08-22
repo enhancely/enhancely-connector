@@ -46,7 +46,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { defineConfig } from '@enhancely/injector-core';
+import { DEFAULT_TIMEOUT_MS, defineConfig } from '@enhancely/injector-core';
 import type { InjectorConfig } from '@enhancely/injector-core';
 
 export const DEFAULT_SSM_PARAMETER_NAME = '/enhancely/connector/api-key';
@@ -68,6 +68,18 @@ export const DEFAULT_ORIGIN_TIMEOUT_MS = 2000;
  * viewer-facing 502 — NOT fail-open.
  */
 export const DEFAULT_SSM_TIMEOUT_MS = 2000;
+
+/**
+ * Terraform deploys every entrypoint with a fixed 10-second Lambda timeout.
+ * AbortSignal deadlines must expire early enough that Node/AWS can settle the
+ * aborted socket and the handler can still return the original response. Keep
+ * two seconds entirely outside network deadlines for cold start, the dynamic
+ * SSM SDK import, abort settlement and response serialization.
+ */
+export const LAMBDA_HARD_TIMEOUT_MS = 10_000;
+export const FAIL_OPEN_SETTLEMENT_RESERVE_MS = 2_000;
+export const MAX_SEQUENTIAL_NETWORK_TIMEOUT_MS =
+  LAMBDA_HARD_TIMEOUT_MS - FAIL_OPEN_SETTLEMENT_RESERVE_MS;
 
 /**
  * Default lifetime of the origin-request "this URL is not a page" memo.
@@ -94,7 +106,7 @@ export interface BakedConnectorConfig {
   timeoutMs?: number;
   /** JSON-LD cache TTL (core default: 300 000 ms). */
   cacheTtlMs?: number;
-  /** Enable self-registration: POST unknown pages to Enhancely on 404. */
+  /** Enable self-registration through the one-step register-or-revalidate POST. */
   autoRegister?: boolean;
   /** Timeout for the origin re-fetch (default: 2000 ms). */
   originTimeoutMs?: number;
@@ -122,33 +134,35 @@ export interface BakedConnectorConfig {
    */
   assertedDefaultTtlSeconds?: number;
   /**
-   * Operator assertion (companion entrypoint only, default false): on this
-   * origin, `Set-Cookie` on responses to credential-less requests is
-   * load-balancer plumbing (e.g. ALB stickiness stamped on every response),
-   * not session material. When true, the retry cache-lifetime cap ALSO
-   * applies to such responses — without it, an origin that stamps a cookie
-   * on everything can never have an uninjected copy unpinned. Requests
-   * carrying Cookie/Authorization stay untouched regardless, and
-   * `private`/`no-store` responses are never capped. Do NOT set this on an
-   * origin that mints session cookies (JSESSIONID & co.) for anonymous
-   * requests: the written s-maxage would license downstream shared caches to
-   * replay that Set-Cookie across users (session-fixation pattern).
+   * Operator assertion (all Lambda entrypoints, default false): on this origin,
+   * `Set-Cookie` on responses to credential-less requests is load-balancer
+   * plumbing (e.g. ALB stickiness stamped on every response), not session
+   * material. When true, the retry cache-lifetime cap ALSO applies to such
+   * responses — without it, an origin that stamps a cookie on everything can
+   * never have an uninjected copy unpinned. Requests carrying
+   * Cookie/Authorization stay untouched regardless, and `private`/`no-store`
+   * responses are never capped. Do NOT set this on an origin that mints session
+   * cookies (JSESSIONID & co.) for anonymous requests: the written s-maxage
+   * would license downstream shared caches to replay that Set-Cookie across
+   * users (session-fixation pattern).
    */
   capSetCookieResponses?: boolean;
   /**
-   * How long the origin-request entrypoint remembers that a URL is NOT an
-   * injectable page (a redirect, a 404, JSON, a binary or over-quota body).
+   * How long the origin-request entrypoint remembers that an answer cannot be
+   * injected or safely generated from its first fetch (for example an
+   * unsupported 2xx representation or over-quota body). Small redirects,
+   * errors and veto bodies are returned from that fetch and need no memo.
    * Default 1 800 000 ms = 30 minutes.
    *
    * Deliberately independent of `cacheTtlMs`, and much longer: that TTL
    * governs a JSON-LD record, which changes when someone edits content, while
-   * this one governs "this URL is not a page at all", which is stable for
-   * months. On a no-store origin, repeated requests can otherwise repay the classification fetch before the trigger can identify the URL.
+   * this one governs a representation-level hard veto, which is normally much
+   * more stable.
    *
-   * Raising it costs nothing in correctness: a URL that later becomes a real
-   * page is still registered (the hand-back makes CloudFront fetch, which
-   * fires the companion) and is still injected by every execution environment
-   * that has not memoized it — the memo is per environment, never global.
+   * A stale veto is bounded by this TTL and scoped to one execution
+   * environment. The companion may shorten CloudFront's cache lifetime so the
+   * origin-request trigger gets another opportunity, but it never bypasses
+   * this memo and never calls Enhancely itself.
    */
   nonPageMemoTtlMs?: number;
   /**
@@ -200,6 +214,11 @@ function positiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+/** AbortSignal.timeout accepts whole milliseconds; reject unsafe coercions. */
+function positiveWholeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 /** Pick only well-typed fields; junk in the file must never crash the edge. */
 function parseBaked(raw: unknown): BakedConnectorConfig {
   const baked: BakedConnectorConfig = {};
@@ -210,19 +229,41 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
   if (apiKey !== undefined) baked.apiKey = apiKey;
   const enhancelyBase = nonEmptyString(source['enhancelyBase']);
   if (enhancelyBase !== undefined) baked.enhancelyBase = enhancelyBase;
-  const timeoutMs = positiveNumber(source['timeoutMs']);
-  if (timeoutMs !== undefined) baked.timeoutMs = timeoutMs;
+  const timeoutMs = positiveWholeNumber(source['timeoutMs']);
   const cacheTtlMs = positiveNumber(source['cacheTtlMs']);
   if (cacheTtlMs !== undefined) baked.cacheTtlMs = cacheTtlMs;
   if (typeof source['autoRegister'] === 'boolean') baked.autoRegister = source['autoRegister'];
-  const originTimeoutMs = positiveNumber(source['originTimeoutMs']);
-  if (originTimeoutMs !== undefined) baked.originTimeoutMs = originTimeoutMs;
+  const originTimeoutMs = positiveWholeNumber(source['originTimeoutMs']);
   const ssmParameterName = nonEmptyString(source['ssmParameterName']);
   if (ssmParameterName !== undefined) baked.ssmParameterName = ssmParameterName;
   const ssmRegion = nonEmptyString(source['ssmRegion']);
   if (ssmRegion !== undefined) baked.ssmRegion = ssmRegion;
-  const ssmTimeoutMs = positiveNumber(source['ssmTimeoutMs']);
-  if (ssmTimeoutMs !== undefined) baked.ssmTimeoutMs = ssmTimeoutMs;
+  const ssmTimeoutMs = positiveWholeNumber(source['ssmTimeoutMs']);
+
+  // These calls are sequential on the first cold invocation: resolve the key
+  // from SSM, fetch the origin, then ask Enhancely. A hand-written baked file
+  // must not be able to spend Lambda's entire 10-second lifetime inside its
+  // AbortSignal deadlines, because hard Lambda termination becomes a viewer
+  // 502 instead of fail-open. Invalid/over-budget overrides are ignored as one
+  // set, restoring the known-safe 800 + 2000 + 2000 ms defaults.
+  const effectiveTimeoutMs = timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const effectiveOriginTimeoutMs = originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
+  const effectiveSsmTimeoutMs = ssmTimeoutMs ?? DEFAULT_SSM_TIMEOUT_MS;
+  if (
+    effectiveTimeoutMs + effectiveOriginTimeoutMs + effectiveSsmTimeoutMs <=
+    MAX_SEQUENTIAL_NETWORK_TIMEOUT_MS
+  ) {
+    if (timeoutMs !== undefined) baked.timeoutMs = timeoutMs;
+    if (originTimeoutMs !== undefined) baked.originTimeoutMs = originTimeoutMs;
+    if (ssmTimeoutMs !== undefined) baked.ssmTimeoutMs = ssmTimeoutMs;
+  } else {
+    console.error(
+      `[enhancely-lambda-edge] connector-config timeouts total ` +
+        `${effectiveTimeoutMs + effectiveOriginTimeoutMs + effectiveSsmTimeoutMs} ms, exceeding ` +
+        `the ${MAX_SEQUENTIAL_NETWORK_TIMEOUT_MS} ms safe network budget under Lambda's ` +
+        `10-second limit — ignoring timeout overrides and using safe defaults`
+    );
+  }
   const assertedDefaultTtlSeconds = positiveNumber(source['assertedDefaultTtlSeconds']);
   // Whole seconds only, minimum 1: a fractional assertion below 1 would
   // floor to s-maxage=0 downstream (safe but surprising) — treat it as off.
@@ -339,8 +380,8 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
 
     // Guard against an unconfigured/placeholder key. Every Enhancely key is
     // `sk-…` (project) or `sk-org-…`; anything else (e.g. the SSM SecureString
-    // placeholder `REPLACE_ME` before the real value is set) means the deployment is
-    // not configured yet. Return null → the handler passes through WITHOUT the
+    // placeholder `REPLACE_ME` before the real value is set) means the deployment
+    // is not configured yet. Return null → the handler passes through WITHOUT the
     // expensive origin re-fetch, so we do not pay doubled origin load from the
     // moment the stack applies until the key is actually installed.
     if (!apiKey.startsWith('sk-')) {
@@ -427,9 +468,9 @@ export function getAssertedDefaultTtlSeconds(): number {
 }
 
 /**
- * Operator assertion `capSetCookieResponses` (baked config; companion design
- * §3.3), default false. Only meaningful after `resolveAdapterConfig()`
- * settled — exactly the order the handler uses.
+ * Operator assertion `capSetCookieResponses` (baked config; used pair-wide and
+ * by standalone origin-response), default false. Only meaningful after
+ * `resolveAdapterConfig()` settled — exactly the order every handler uses.
  */
 export function getCapSetCookieResponses(): boolean {
   return resolvedCapSetCookieResponses;
@@ -467,7 +508,9 @@ function __resetMemoForTests(): void {
 
 /** TEST-ONLY: bypass the connector-config.json file read (`null` = no file). */
 export function __setBakedConfigForTests(baked: BakedConnectorConfig | null): void {
-  bakedOverride = baked;
+  // Exercise the same validation as the real JSON-file path so tests cannot
+  // accidentally bypass the production timeout budget with a typed object.
+  bakedOverride = baked === null ? null : parseBaked(baked);
   __resetMemoForTests();
 }
 

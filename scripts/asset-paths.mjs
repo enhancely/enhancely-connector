@@ -66,12 +66,13 @@ const CLOUDFRONT_BEHAVIOR_QUOTA = 25;
  * like `window.location` is not a file type the connector knows.
  */
 async function knownNonHtmlExtensions() {
-  const source = new URL('../packages/adapter-lambda-edge/src/origin-request.ts', import.meta.url);
+  const source = new URL('../packages/adapter-lambda-edge/src/shared.ts', import.meta.url);
   const text = await readFile(source, 'utf8');
-  const match = /const NON_HTML_EXTENSION =\s*\/\\\.\(\?:([^)]+)\)\$\/i;/.exec(text);
+  const match = /export const NON_HTML_EXTENSION =\s*\/\\\.\(\?:([^)]+)\)\$\/i;/.exec(text);
   if (!match) {
-    console.error('  ! could not read NON_HTML_EXTENSION from the adapter source');
-    return null;
+    throw new Error(
+      'could not read NON_HTML_EXTENSION from the adapter source; refusing unsafe suggestions'
+    );
   }
   const set = new Set();
   for (const alternative of match[1].split('|')) {
@@ -184,7 +185,7 @@ async function main() {
       // non-page extensions may be routed away from the injector.
       if (ext === null || PAGE_EXTENSIONS.has(ext)) continue;
       // Only suggest what the injector already rejects by extension.
-      if (known !== null && !known.has(ext)) continue;
+      if (!known.has(ext)) continue;
       if (resolved.hostname !== base.hostname && !sharesRegistrableSuffix(resolved, base)) {
         externalHosts.add(resolved.hostname);
         continue;

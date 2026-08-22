@@ -5,6 +5,7 @@ import {
   defineConfig,
   fetchJsonLd,
   registerJsonLd,
+  registerOrRevalidate,
 } from '../src/index.js';
 import type { Fetcher } from '../src/index.js';
 
@@ -83,6 +84,57 @@ describe('fetchJsonLd — request shape', () => {
     expect(input).toBe(`${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(PAGE_URL)}`);
     // The raw URL is sent encoded — never a locally computed hash.
     expect(input).toContain('https%3A%2F%2Fexample.com%2Fpricing');
+  });
+
+  it('normalizes and strips a query before a directly called client request', async () => {
+    const { config, fetchImpl } = withMockFetch(new Response(RAW_JSONLD, { status: 200 }));
+    await fetchJsonLd(config, 'http://example.com/pricing/?token=secret#fragment');
+
+    const { input } = lastRequest(fetchImpl);
+    expect(input).toBe(
+      `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent('https://example.com/pricing')}`
+    );
+    expect(input).not.toContain('secret');
+    expect(input).not.toContain('fragment');
+  });
+
+  it.each([
+    '/relative?token=secret',
+    'not a url?token=secret',
+    'ftp://example.com/page?token=secret',
+    'https://user:password@example.com/page?token=secret',
+    'https://example.com/page//?token=secret',
+  ])('rejects unsafe page URL %s without calling fetch', async (pageUrl) => {
+    const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('must not fetch')));
+    const config = defineConfig({ apiKey: 'sk-test-key', fetchImpl });
+
+    await expect(fetchJsonLd(config, pageUrl)).resolves.toEqual({
+      status: 'error',
+      reason: 'invalid-page-url',
+    });
+    await expect(registerOrRevalidate(config, pageUrl)).resolves.toEqual({
+      status: 'error',
+      reason: 'invalid-page-url',
+    });
+    await expect(registerJsonLd(config, pageUrl)).resolves.toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('strips query PII from both registration client bodies', async () => {
+    const fetchImpl = vi
+      .fn<Fetcher>()
+      .mockResolvedValueOnce(new Response(null, { status: 201 }))
+      .mockResolvedValueOnce(new Response(null, { status: 201 }));
+    const config = defineConfig({ apiKey: 'sk-test-key', fetchImpl });
+    const raw = 'http://example.com/pricing/?token=secret#fragment';
+
+    await registerOrRevalidate(config, raw);
+    await registerJsonLd(config, raw);
+
+    for (const [, init] of fetchImpl.mock.calls) {
+      expect(JSON.parse(String(init.body))).toEqual({ url: 'https://example.com/pricing' });
+      expect(String(init.body)).not.toContain('secret');
+    }
   });
 
   it('sends Authorization: Bearer <apiKey>', async () => {

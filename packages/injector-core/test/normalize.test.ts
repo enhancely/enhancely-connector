@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { normalizeLite } from '../src/index.js';
+import { normalizeForEnhancely, normalizeLite } from '../src/index.js';
 
 describe('normalizeLite', () => {
   it('forces https (rule 1)', () => {
@@ -50,5 +50,29 @@ describe('normalizeLite', () => {
 
     const clean = 'https://example.com/docs/getting-started';
     expect(normalizeLite(clean)).toBe(clean);
+  });
+
+  it('rejects a valid URL whose normalized key is not a fixed point', () => {
+    expect(normalizeForEnhancely('https://example.com/page//?token=secret#fragment')).toBeNull();
+  });
+
+  it.each([
+    'http://example.com/page/?token=secret#fragment',
+    'https://example.com/',
+    'https://example.com:8443/a/../b/',
+    'https://münchen.example/straße/',
+    'https://example.com/path%2F',
+    'https://example.com/a//b/',
+  ])('returns only safe normalization fixed points for %s', (raw) => {
+    const key = normalizeForEnhancely(raw);
+    expect(key).not.toBeNull();
+    expect(normalizeLite(key ?? '')).toBe(key);
+
+    const parsed = new URL(key ?? '');
+    expect(parsed.protocol).toBe('https:');
+    expect(parsed.username).toBe('');
+    expect(parsed.password).toBe('');
+    expect(parsed.search).toBe('');
+    expect(parsed.hash).toBe('');
   });
 });

@@ -8,12 +8,10 @@
  * Functional skeleton — NOT production-hardened. Known TODOs:
  * - TODO(tls): no TLS termination — run behind nginx/Apache/a load balancer.
  * - TODO(http2): plain HTTP/1.1 only (node:http), no h2 upstream or downstream.
- * - TODO(gzip): if the upstream sends Content-Encoding (gzip/br/…) we do NOT
- *   attempt injection — the response passes through unchanged. Disable
- *   compression between origin and sidecar, compress at the edge instead.
- * - TODO(charset-transcode): only HTML that declares no charset or a
- *   UTF-8-compatible one is buffered/injected (see gate.ts); other charsets
- *   (iso-8859-1, windows-1252, …) stream through byte-identical and
+ * - TODO(gzip): we ask for identity, but if the upstream still sends
+ *   Content-Encoding (gzip/br/…) the response passes through unchanged.
+ * - TODO(charset-transcode): declared legacy charsets and charset-less bodies
+ *   without positive UTF-8 evidence stream through byte-identical and
  *   uninjected — transcoding them is not supported.
  */
 import * as http from 'node:http';
@@ -21,16 +19,19 @@ import * as https from 'node:https';
 // handleHtml(ctx: HtmlContext, cache: CacheBackend, config: InjectorConfig) → Promise<string>
 // is the core orchestrator: cache lookup + ETag revalidation + fetch + inject,
 // fail-open by contract (any failure returns ctx.html unchanged).
-import { defineConfig, handleHtml, MemoryCache } from '@enhancely/injector-core';
-import { isInjectableUpstream } from './gate.js';
+import {
+  defineConfig,
+  handleHtml,
+  isUtf8SafeHtmlBytes,
+  MemoryCache,
+} from '@enhancely/injector-core';
+import { isInjectableUpstream, MAX_HTML_BYTES } from './gate.js';
+import { forwardableHeaders } from './headers.js';
 
 const UPSTREAM_ORIGIN = process.env['UPSTREAM_ORIGIN'];
 const ENHANCELY_API_KEY = process.env['ENHANCELY_API_KEY'] ?? '';
 const ENHANCELY_BASE = process.env['ENHANCELY_BASE'] ?? '';
 const PORT = Number.parseInt(process.env['PORT'] ?? '8080', 10);
-
-/** HTML bodies above this size pass through uninjected (memory guard). */
-const MAX_HTML_BYTES = 2 * 1024 * 1024;
 
 if (!UPSTREAM_ORIGIN) {
   console.error('[enhancely-sidecar] FATAL: UPSTREAM_ORIGIN is not set (e.g. http://origin:3000)');
@@ -52,32 +53,18 @@ const config = defineConfig({
 });
 const cache = new MemoryCache();
 
-/** Hop-by-hop headers that must not be forwarded (RFC 9110 §7.6.1). */
-const HOP_BY_HOP = new Set([
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
-]);
-
-function forwardableHeaders(headers: http.IncomingHttpHeaders): http.OutgoingHttpHeaders {
-  const out: http.OutgoingHttpHeaders = {};
-  for (const [name, value] of Object.entries(headers)) {
-    if (!HOP_BY_HOP.has(name.toLowerCase()) && value !== undefined) out[name] = value;
-  }
-  return out;
-}
-
 function isInjectable(req: http.IncomingMessage, res: http.IncomingMessage): boolean {
+  const robots = res.headers['x-robots-tag'];
   return isInjectableUpstream({
     method: req.method,
     status: res.statusCode,
     contentType: res.headers['content-type'],
     contentEncoding: res.headers['content-encoding'],
+    xRobotsTag: Array.isArray(robots) ? robots.join(', ') : robots,
+    cacheControl: res.headers['cache-control'],
+    contentDisposition:
+      res.headersDistinct['content-disposition']?.join(', ') ?? res.headers['content-disposition'],
+    contentLength: res.headers['content-length'],
     apiKeyPresent: ENHANCELY_API_KEY !== '',
   });
 }
@@ -93,6 +80,9 @@ function pageUrl(req: http.IncomingMessage): string {
 export const server = http.createServer((req, res) => {
   const headers = forwardableHeaders(req.headers);
   headers['host'] = upstream.host;
+  // Injection operates on identity bytes. Asking the origin explicitly also
+  // avoids making correct behavior depend on a particular nginx/ALB setup.
+  headers['accept-encoding'] = 'identity';
   headers['x-forwarded-host'] = req.headers['x-forwarded-host'] ?? req.headers.host ?? '';
   headers['x-forwarded-proto'] = req.headers['x-forwarded-proto'] ?? 'http';
   const clientIp = req.socket.remoteAddress ?? '';
@@ -143,29 +133,48 @@ export const server = http.createServer((req, res) => {
         if (overflowed) return;
         void (async () => {
           const originalBody = Buffer.concat(chunks);
-          // The gate only lets UTF-8-compatible declared charsets in here; if
-          // the bytes are still not valid UTF-8 (mislabeled page) the decode
-          // is lossy — which is why the ORIGINAL bytes are served verbatim
-          // below whenever injection did not change anything.
           const originalHtml = originalBody.toString('utf8');
           let html = originalHtml;
-          try {
-            html = await handleHtml(
-              {
-                html: originalHtml,
-                url: pageUrl(req),
-                contentType: proxyRes.headers['content-type'] ?? null,
-                status,
-              },
-              cache,
-              config
-            );
-          } catch {
-            html = originalHtml; // core is fail-open by contract; belt and braces
+          // Prove byte fidelity before handleHtml can touch Enhancely. A
+          // mislabeled legacy body may contain a perfectly visible </head>
+          // after lossy decode, but injecting would then re-encode and corrupt
+          // customer bytes.
+          if (isUtf8SafeHtmlBytes(originalBody, proxyRes.headers['content-type'] ?? '')) {
+            try {
+              html = await handleHtml(
+                {
+                  html: originalHtml,
+                  url: pageUrl(req),
+                  contentType: proxyRes.headers['content-type'] ?? null,
+                  status,
+                },
+                cache,
+                config
+              );
+            } catch {
+              html = originalHtml; // core is fail-open by contract; belt and braces
+            }
           }
           // Fail-open must be byte-exact: only re-encode when injection
           // actually modified the HTML.
-          const body = html === originalHtml ? originalBody : Buffer.from(html, 'utf8');
+          const didInject = html !== originalHtml;
+          const body = didInject ? Buffer.from(html, 'utf8') : originalBody;
+          if (didInject) {
+            responseHeaders['content-type'] = 'text/html; charset=utf-8';
+            // Origin validators and digests describe the uninjected bytes and
+            // must not be replayed for the transformed representation.
+            for (const name of [
+              'etag',
+              'last-modified',
+              'accept-ranges',
+              'content-md5',
+              'digest',
+              'content-digest',
+              'repr-digest',
+            ]) {
+              delete responseHeaders[name];
+            }
+          }
           responseHeaders['content-length'] = body.byteLength; // injection changed the size
           res.writeHead(status, responseHeaders);
           res.end(body);

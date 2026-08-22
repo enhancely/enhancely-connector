@@ -4,8 +4,10 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CONFIG_FILE_NAME,
+  DEFAULT_ORIGIN_TIMEOUT_MS,
   DEFAULT_SSM_PARAMETER_NAME,
   DEFAULT_SSM_REGION,
+  MAX_SEQUENTIAL_NETWORK_TIMEOUT_MS,
   __resetAdapterConfigForTests,
   __setBakedConfigForTests,
   getConfigRetryInMs,
@@ -82,6 +84,51 @@ describe('resolveAdapterConfig — baked config', () => {
 
     expect(config?.apiKey).toBe('sk-baked');
     expect(ssm.send).not.toHaveBeenCalled();
+  });
+
+  it('accepts timeout overrides exactly at the safe sequential-network boundary', async () => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-baked',
+      timeoutMs: 3_000,
+      originTimeoutMs: 3_000,
+      ssmTimeoutMs: 2_000,
+    });
+
+    const config = await resolveAdapterConfig();
+
+    expect(MAX_SEQUENTIAL_NETWORK_TIMEOUT_MS).toBe(8_000);
+    expect(config?.timeoutMs).toBe(3_000);
+    expect(getOriginTimeoutMs()).toBe(3_000);
+  });
+
+  it('drops an over-budget baked timeout set back to safe defaults', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    __setBakedConfigForTests({
+      apiKey: 'sk-baked',
+      timeoutMs: 4_000,
+      originTimeoutMs: 3_000,
+      ssmTimeoutMs: 2_000,
+    });
+
+    const config = await resolveAdapterConfig();
+
+    expect(config?.timeoutMs).toBe(800);
+    expect(getOriginTimeoutMs()).toBe(DEFAULT_ORIGIN_TIMEOUT_MS);
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('safe network budget'));
+  });
+
+  it('drops fractional AbortSignal timeout values instead of coercing them', async () => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-baked',
+      timeoutMs: 500.5,
+      originTimeoutMs: 1_000.5,
+      ssmTimeoutMs: 250.5,
+    });
+
+    const config = await resolveAdapterConfig();
+
+    expect(config?.timeoutMs).toBe(800);
+    expect(getOriginTimeoutMs()).toBe(DEFAULT_ORIGIN_TIMEOUT_MS);
   });
 });
 

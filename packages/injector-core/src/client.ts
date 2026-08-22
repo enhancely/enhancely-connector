@@ -1,4 +1,5 @@
 import type { InjectorConfig, JsonLdFetchResult } from './types.js';
+import { normalizeForEnhancely } from './normalize.js';
 
 type BodyReadResult = { status: 'ok'; text: string } | { status: 'error'; reason: string };
 
@@ -131,10 +132,14 @@ async function readJsonLdBody(
  *
  * Contract notes (verified against the Enhancely main repo):
  * - We send a URL, never a locally computed hash — the server normalizes and
- *   hashes authoritatively. The caller passes the query-stripped URL
- *   (`normalizeLite`, = the cache key): the server strips the query anyway, so
- *   the resolved record is identical, but query strings (tokens/PII) never
- *   leave the edge and the looked-up URL matches the cached one.
+ *   hashes authoritatively. This client validates and query-strips the page URL
+ *   (`normalizeLite` semantics, = the cache key) before any fetch. The value
+ *   must also be a normalization fixed point because the server/pipeline can
+ *   normalize it again; legacy multi-trailing-slash inputs therefore fail
+ *   locally instead of associating one cache key with another record URL. The server
+ *   strips the query anyway, so the resolved record is identical, but query
+ *   strings (tokens/PII) never leave the edge and the looked-up URL matches the
+ *   cached one. Unsafe URL shapes fail locally with no network I/O.
  * - `Accept: application/ld+json` must be the EXACT header value (the server
  *   does an exact string match, no q-values) — it selects the raw, already
  *   script-safe-escaped JSON-LD string (`<` is pre-escaped as the unicode
@@ -210,8 +215,11 @@ export async function fetchJsonLd(
   pageUrl: string,
   etag?: string | null
 ): Promise<JsonLdFetchResult> {
+  const safePageUrl = normalizeForEnhancely(pageUrl);
+  if (safePageUrl === null) return { status: 'error', reason: 'invalid-page-url' };
+
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
-  const endpoint = `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(pageUrl)}`;
+  const endpoint = `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(safePageUrl)}`;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${config.apiKey}`,
@@ -292,6 +300,9 @@ export async function registerOrRevalidate(
   pageUrl: string,
   etag?: string | null
 ): Promise<JsonLdFetchResult> {
+  const safePageUrl = normalizeForEnhancely(pageUrl);
+  if (safePageUrl === null) return { status: 'error', reason: 'invalid-page-url' };
+
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
 
   const headers: Record<string, string> = {
@@ -308,7 +319,7 @@ export async function registerOrRevalidate(
     response = await fetchImpl(`${config.enhancelyBase}/api/v1/jsonld`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ url: pageUrl }),
+      body: JSON.stringify({ url: safePageUrl }),
       signal,
     });
   } catch (error) {
@@ -357,6 +368,9 @@ export async function registerOrRevalidate(
  * semantics: the boolean result is informational, failures never propagate.
  */
 export async function registerJsonLd(config: InjectorConfig, pageUrl: string): Promise<boolean> {
+  const safePageUrl = normalizeForEnhancely(pageUrl);
+  if (safePageUrl === null) return false;
+
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
   try {
     const response = await fetchImpl(`${config.enhancelyBase}/api/v1/jsonld`, {
@@ -365,7 +379,7 @@ export async function registerJsonLd(config: InjectorConfig, pageUrl: string): P
         Authorization: `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ url: pageUrl }),
+      body: JSON.stringify({ url: safePageUrl }),
       signal: AbortSignal.timeout(config.timeoutMs),
     });
     const accepted = response.status === 201 || response.status === 200 || response.status === 202;

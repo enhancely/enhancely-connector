@@ -796,6 +796,10 @@ describe('handler — gating pass-through (original response, no origin contact)
       'Cache-Control: no-store on the CloudFront response',
       { responseHeaders: { 'content-type': 'text/html', 'cache-control': 'no-store' } },
     ],
+    [
+      'already-injected marker on the CloudFront response',
+      { responseHeaders: { 'content-type': 'text/html', 'x-enhancely-injected': '1' } },
+    ],
   ])('%s → untouched response', async (_name, overrides) => {
     const event = eventFor('/page', overrides);
     const result = await invoke(event);
@@ -1129,9 +1133,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const responseHeaders = {
       'content-type': 'text/html; charset=utf-8',
@@ -1144,7 +1146,8 @@ describe('handler — retryable pass-through cache policy', () => {
 
     expect(first?.body).toBeUndefined();
     expect(originHits).toBe(0);
-    expect(enhancelyFetch).toHaveBeenCalledTimes(2); // one GET + one registration POST
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1); // one register-or-revalidate POST
+    expect(enhancelyFetch.mock.calls[0]?.[1].method).toBe('POST');
     expect(first?.headers?.['etag']).toBeUndefined();
     expect(first?.headers?.['last-modified']).toBeUndefined();
     expect(first?.headers?.['expires']).toBeUndefined();
@@ -1156,13 +1159,13 @@ describe('handler — retryable pass-through cache policy', () => {
 
     // A different CloudFront variant of the same normalized page is answered
     // from the core's pending negative cache and receives the same short policy
-    // without another Enhancely GET/POST or origin re-fetch.
+    // without another Enhancely POST or origin re-fetch.
     const second = await invoke(
       eventFor('/new-page', { querystring: 'variant=2', responseHeaders })
     );
     expect(second?.body).toBeUndefined();
     expect(second?.headers?.['cache-control']?.[0]?.value).toContain('s-maxage=');
-    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(0);
   });
 
@@ -1176,9 +1179,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const result = await invoke(
       eventFor('/short-origin-ttl', {
@@ -1190,7 +1191,7 @@ describe('handler — retryable pass-through cache policy', () => {
     );
 
     expect(result?.headers?.['cache-control']?.[0]?.value).toContain(`s-maxage=${expectedTtl}`);
-    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(0);
   });
 
@@ -1200,9 +1201,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
     const event = eventFor('/multi-cache-control');
     const response = event.Records[0]?.cf.response;
     if (response === undefined) throw new Error('expected response fixture');
@@ -1223,9 +1222,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const result = await invoke(
       eventFor('/expires-fallback', {
@@ -1250,9 +1247,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/credentialed-miss', {
       requestHeaders: { [name]: value },
@@ -1267,7 +1262,7 @@ describe('handler — retryable pass-through cache policy', () => {
     expect(result).toBe(event.Records[0]?.cf.response);
     expect(result?.headers?.['cache-control']?.[0]?.value).toBe('max-age=86400');
     expect(result?.headers?.['etag']?.[0]?.value).toBe('"credentialed"');
-    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(0);
   });
 
@@ -1283,9 +1278,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/no-lifetime-miss', {
       responseHeaders: { 'content-type': 'text/html; charset=utf-8' },
@@ -1295,8 +1288,8 @@ describe('handler — retryable pass-through cache policy', () => {
     // Same object back, no injected shared-cache directive introduced.
     expect(result).toBe(event.Records[0]?.cf.response);
     expect(result?.headers?.['cache-control']).toBeUndefined();
-    // The lookup still ran (GET + registration POST); the origin was not re-fetched.
-    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    // The one register-or-revalidate lookup ran; the origin was not re-fetched.
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(0);
   });
 
@@ -1457,9 +1450,7 @@ describe('handler — retryable pass-through cache policy', () => {
       cacheTtlMs: 20_000,
       assertedDefaultTtlSeconds: 86_400,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/cap-no-lifetime-miss', {
       responseHeaders: {
@@ -1491,9 +1482,7 @@ describe('handler — retryable pass-through cache policy', () => {
       cacheTtlMs: 20_000,
       assertedDefaultTtlSeconds: 86_400,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/cap-credentialed-miss', {
       requestHeaders: { cookie: 'session=abc' },
@@ -1513,9 +1502,7 @@ describe('handler — retryable pass-through cache policy', () => {
       cacheTtlMs: 20_000,
       assertedDefaultTtlSeconds: 86_400,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/cap-explicit-miss', {
       responseHeaders: {
@@ -1541,9 +1528,7 @@ describe('handler — retryable pass-through cache policy', () => {
       cacheTtlMs: 20_000,
       assertedDefaultTtlSeconds: 5,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/cap-small-assertion-miss', {
       responseHeaders: { 'content-type': 'text/html; charset=utf-8' },
@@ -1565,9 +1550,7 @@ describe('handler — retryable pass-through cache policy', () => {
       cacheTtlMs: 20_000,
       assertedDefaultTtlSeconds: 86_400,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/cap-public-miss', {
       responseHeaders: {
@@ -1636,9 +1619,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/public-without-lifetime', {
       responseHeaders: {
@@ -1650,7 +1631,7 @@ describe('handler — retryable pass-through cache policy', () => {
 
     expect(result).toBe(event.Records[0]?.cf.response);
     expect(result?.headers?.['cache-control']?.[0]?.value).toBe('public');
-    expect(enhancelyFetch).toHaveBeenCalledTimes(2);
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
     expect(originHits).toBe(0);
   });
 
@@ -1663,9 +1644,7 @@ describe('handler — retryable pass-through cache policy', () => {
       autoRegister: true,
       cacheTtlMs: 20_000,
     });
-    enhancelyFetch
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    enhancelyFetch.mockResolvedValueOnce(new Response(null, { status: 202 }));
 
     const event = eventFor('/long-lifetime-miss', {
       responseHeaders: {

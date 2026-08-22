@@ -256,7 +256,7 @@ describe('getJsonLdLookup — pending & terminal-negative economics', () => {
   });
 });
 
-describe('getJsonLdRegisterLookup — the companion economy', () => {
+describe('getJsonLdRegisterLookup — single-POST register economy', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(1_700_000_000_000);

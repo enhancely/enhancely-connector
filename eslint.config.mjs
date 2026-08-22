@@ -3,11 +3,7 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: [
-      '**/dist/**',
-      '**/node_modules/**',
-      '**/.wrangler/**',
-    ],
+    ignores: ['**/dist/**', '**/node_modules/**', '**/.wrangler/**'],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -22,6 +18,7 @@ export default tseslint.config(
         Buffer: 'readonly',
         fetch: 'readonly',
         URL: 'readonly',
+        setTimeout: 'readonly',
       },
     },
   },

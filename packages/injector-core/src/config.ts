@@ -1,6 +1,6 @@
 import type { InjectorConfig, InjectorConfigInput } from './types.js';
 
-/** TODO: confirm the final production API base URL with the Enhancely team. */
+/** Production API base confirmed by the public Enhancely API specification. */
 export const DEFAULT_ENHANCELY_BASE = 'https://app.enhancely.ai';
 
 export const DEFAULT_TIMEOUT_MS = 800;

@@ -52,6 +52,7 @@ let originHits = 0;
 let lastHostHeader: string | undefined;
 let lastPath: string | undefined;
 let lastRequestHeaders: http.IncomingHttpHeaders = {};
+let failNextOriginRequest = true;
 
 beforeAll(async () => {
   server = http.createServer((req, res) => {
@@ -93,10 +94,21 @@ beforeAll(async () => {
           'content-security-policy': "default-src 'self'",
           etag: '"abc"',
           'last-modified': 'Wed, 21 Oct 2026 07:28:00 GMT',
-          connection: 'keep-alive',
+          connection: 'keep-alive, X-Origin-Secret',
+          'x-origin-secret': 'must-not-leak',
+          te: 'trailers',
           'x-cache': 'Miss from cloudfront',
         });
         res.end(PAGE_HTML);
+      },
+      '/already-injected': () => {
+        res.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'x-enhancely-injected': '1',
+        });
+        res.end(
+          '<html><head><script type="application/ld+json" data-source="Enhancely.ai">{"existing":true}</script></head><body></body></html>'
+        );
       },
       // Two Set-Cookie values plus header families CloudFront forbids.
       '/multi': () => {
@@ -120,6 +132,30 @@ beforeAll(async () => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('{}');
       },
+      '/created': () => {
+        res.writeHead(201, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(PAGE_HTML);
+      },
+      '/partial': () => {
+        res.writeHead(206, {
+          'content-type': 'text/html; charset=utf-8',
+          'content-range': 'bytes 0-9/100',
+        });
+        res.end('<html>par');
+      },
+      '/empty-204': () => {
+        res.writeHead(204, { 'cache-control': 'public, max-age=60' });
+        res.end();
+      },
+      '/flaky-origin': () => {
+        if (failNextOriginRequest) {
+          failNextOriginRequest = false;
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(PAGE_HTML);
+      },
       '/latin1': () => {
         res.writeHead(200, { 'content-type': 'text/html; charset=iso-8859-1' });
         res.end(PAGE_HTML);
@@ -133,6 +169,10 @@ beforeAll(async () => {
         res.end(
           `<html><head></head><body>${'x'.repeat(MAX_ORIGIN_BODY_BYTES + 1024)}</body></html>`
         );
+      },
+      '/quota-after-lookup': () => {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(`<html><head></head><body>${'x'.repeat(950_000)}</body></html>`);
       },
       // Multi-byte UTF-8 in title, body and (via the mock) the JSON-LD.
       '/umlaut': () => {
@@ -179,6 +219,7 @@ beforeEach(() => {
   lastHostHeader = undefined;
   lastPath = undefined;
   lastRequestHeaders = {};
+  failNextOriginRequest = true;
   __resetAdapterConfigForTests();
   __resetOriginRequestStateForTests();
   __resetUpstreamMemoForTests();
@@ -363,6 +404,44 @@ describe('origin-request — no snippet still costs exactly ONE origin hit (v0.9
   });
 });
 
+describe('origin-request — injection feasibility is proven before Enhancely', () => {
+  it('generates no-head HTML unchanged with one origin hit and zero API calls', async () => {
+    __resetAdapterConfigForTests();
+    __resetOriginRequestStateForTests();
+    __resetUpstreamMemoForTests();
+    __setBakedConfigForTests({ apiKey: 'sk-test', autoRegister: true });
+    __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
+
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/no-head' })));
+    expect(response.body).toBe('<html><body>no head element</body></html>');
+    expect(response.bodyEncoding).toBe('text');
+    expect(originHits).toBe(1);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('returns the original page after a post-lookup quota veto without a second origin fetch', async () => {
+    const largeJsonLd = JSON.stringify({
+      '@context': 'https://schema.org',
+      '@type': 'Article',
+      description: 'y'.repeat(120_000),
+    });
+    const largeLookup = vi.fn(
+      async () =>
+        new Response(largeJsonLd, {
+          status: 200,
+          headers: { 'content-type': 'application/ld+json', etag: 'W/"large"' },
+        })
+    );
+    __setConfigOverridesForTests({ fetchImpl: largeLookup });
+
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/quota-after-lookup' })));
+    expect(response.body).toContain('<html><head></head><body>');
+    expect(response.body).not.toContain('application/ld+json');
+    expect(originHits).toBe(1);
+    expect(largeLookup).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('origin-request — per-request state IS injected (differs from origin-response)', () => {
   it('injects into a response carrying Set-Cookie and no-store', async () => {
     const response = asResponse(await invoke(makeRequestEvent({ uri: '/with-cookie' })));
@@ -383,6 +462,16 @@ describe('origin-request — per-request state IS injected (differs from origin-
 });
 
 describe('origin-request — generated response headers', () => {
+  it('preserves already-injected upstream content without another Enhancely call', async () => {
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/already-injected' })));
+    const body = Buffer.from(response.body ?? '', 'base64').toString('utf8');
+
+    expect(response.bodyEncoding).toBe('base64');
+    expect(body.match(/application\/ld\+json/g)).toHaveLength(1);
+    expect(body).toContain('{"existing":true}');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
   it('preserves the origin security and caching headers', async () => {
     const response = asResponse(await invoke(makeRequestEvent({ uri: '/headers' })));
     expect(headerValue(response, 'vary')).toBe('Accept-Encoding');
@@ -394,6 +483,8 @@ describe('origin-request — generated response headers', () => {
   it('strips headers CloudFront forbids in a generated response', async () => {
     const response = asResponse(await invoke(makeRequestEvent({ uri: '/headers' })));
     expect(response.headers?.['connection']).toBeUndefined();
+    expect(response.headers?.['x-origin-secret']).toBeUndefined();
+    expect(response.headers?.['te']).toBeUndefined();
     expect(response.headers?.['x-cache']).toBeUndefined();
     expect(response.headers?.['content-length']).toBeUndefined();
     expect(response.headers?.['transfer-encoding']).toBeUndefined();
@@ -427,6 +518,21 @@ describe('origin-request — pass-through gates', () => {
     });
   }
 
+  it('does not alter unrelated viewer/configured headers on an early return', async () => {
+    const header = 'x-enhancely-handback';
+    const result = await invoke(
+      makeRequestEvent({
+        uri: '/app.js',
+        requestHeaders: { [header]: 'customer-value' },
+        originCustomHeaders: { [header]: 'configured-value' },
+      })
+    );
+    expect(isPassThrough(result)).toBe(true);
+    const request = result as import('aws-lambda').CloudFrontRequest;
+    expect(request.headers?.[header]?.[0]?.value).toBe('customer-value');
+    expect(request.origin?.custom?.customHeaders[header]?.[0]?.value).toBe('configured-value');
+  });
+
   it('falls back to the origin domain when the viewer Host header is absent', async () => {
     // Mirrors the origin-response adapter: an origin request policy that does
     // not forward Host still has to work, so the origin's own domain name is
@@ -439,12 +545,7 @@ describe('origin-request — pass-through gates', () => {
     );
   });
 
-  const afterFetch: Array<[string, string]> = [
-    ['non-HTML content type', '/json'],
-    ['non-UTF-8 charset', '/latin1'],
-    ['noindex', '/noindex'],
-    ['body over the fetch cap', '/big'],
-  ];
+  const afterFetch: Array<[string, string]> = [['body over the fetch cap', '/big']];
   for (const [name, uri] of afterFetch) {
     it(`${name} → request (one discarded fetch)`, async () => {
       const result = await invoke(makeRequestEvent({ uri }));
@@ -512,13 +613,11 @@ describe('origin-request — the fetch must be the one CloudFront would have mad
         requestHeaders: {
           'if-none-match': 'W/"abc"',
           'if-modified-since': 'Wed, 21 Oct 2026 07:28:00 GMT',
-          range: 'bytes=0-99',
         },
       })
     );
     expect(lastRequestHeaders['if-none-match']).toBeUndefined();
     expect(lastRequestHeaders['if-modified-since']).toBeUndefined();
-    expect(lastRequestHeaders['range']).toBeUndefined();
   });
 });
 
@@ -542,7 +641,7 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
   // Origin-first pays one extra origin hit for things it must not touch: it
   // fetches to find out, then hands back so CloudFront fetches again. The
   // first time that is unavoidable; the second time it is pure waste.
-  for (const [name, uri] of [['a non-HTML body', '/json']] as const) {
+  for (const [name, uri] of [['a non-reproducible 2xx status', '/created']] as const) {
     it(`${name}: the repeat costs no adapter fetch at all`, async () => {
       const first = await invoke(makeRequestEvent({ uri }));
       expect(isPassThrough(first)).toBe(true);
@@ -557,7 +656,7 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
   }
 
   it('remembers per URL, not globally', async () => {
-    await invoke(makeRequestEvent({ uri: '/json' }));
+    await invoke(makeRequestEvent({ uri: '/created' }));
     expect(originHits).toBe(1);
     // A DIFFERENT url must still be examined.
     const other = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
@@ -577,10 +676,10 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
     });
     __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
 
-    await invoke(makeRequestEvent({ uri: '/json' }));
+    await invoke(makeRequestEvent({ uri: '/created' }));
     expect(originHits).toBe(1);
     await new Promise((resolve) => setTimeout(resolve, 20));
-    await invoke(makeRequestEvent({ uri: '/json' }));
+    await invoke(makeRequestEvent({ uri: '/created' }));
     expect(originHits).toBe(1);
   });
 
@@ -593,7 +692,7 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
   });
 });
 
-describe('origin-request — a non-2xx answer is returned verbatim, not re-fetched', () => {
+describe('origin-request — safe origin answers are returned verbatim, not re-fetched', () => {
   it('returns the origin answer with ONE origin hit and no Enhancely call', async () => {
     const response = asResponse(await invoke(makeRequestEvent({ uri: '/redirect' })));
     expect(response.status).toBe('302');
@@ -608,16 +707,52 @@ describe('origin-request — a non-2xx answer is returned verbatim, not re-fetch
     expect(response.headers?.['x-enhancely-injected']).toBeUndefined();
   });
 
-  it('leaves 2xx non-HTML alone (could be large or binary)', async () => {
-    const result = await invoke(makeRequestEvent({ uri: '/json' }));
-    expect(isPassThrough(result)).toBe(true);
+  it('returns a small status-200 non-HTML answer with one origin hit and no API call', async () => {
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/json' })));
+    expect(response.status).toBe('200');
+    expect(response.bodyEncoding).toBe('base64');
+    expect(Buffer.from(response.body ?? '', 'base64').toString('utf8')).toBe('{}');
+    expect(originHits).toBe(1);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 
-  it('hands back a Range request rather than substituting a full body', async () => {
+  it.each([
+    ['a noindex HTML page', '/noindex'],
+    ['a legacy-charset HTML page', '/latin1'],
+  ])('returns %s verbatim without contacting Enhancely', async (_name, uri) => {
+    const response = asResponse(await invoke(makeRequestEvent({ uri })));
+    expect(response.status).toBe('200');
+    expect(response.bodyEncoding).toBe('base64');
+    expect(Buffer.from(response.body ?? '', 'base64').toString('utf8')).toBe(PAGE_HTML);
+    expect(originHits).toBe(1);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('hands back Range before our fetch without adding an origin-visible coordination header', async () => {
     const result = await invoke(
-      makeRequestEvent({ uri: '/redirect', requestHeaders: { range: 'bytes=0-99' } })
+      makeRequestEvent({ uri: '/page', requestHeaders: { range: 'bytes=0-99' } })
     );
     expect(isPassThrough(result)).toBe(true);
+    expect(originHits).toBe(0);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    const request = result as import('aws-lambda').CloudFrontRequest;
+    expect(request.headers['range']?.[0]?.value).toBe('bytes=0-99');
+    expect(request.headers['x-enhancely-handback']).toBeUndefined();
+  });
+
+  it('keeps 206 on the conservative handback path without an API call', async () => {
+    const result = await invoke(makeRequestEvent({ uri: '/partial' }));
+    expect(isPassThrough(result)).toBe(true);
+    expect(originHits).toBe(1);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('returns an empty 204 from the existing fetch without a second origin request', async () => {
+    const response = asResponse(await invoke(makeRequestEvent({ uri: '/empty-204' })));
+    expect(response.status).toBe('204');
+    expect(response.body).toBeUndefined();
+    expect(originHits).toBe(1);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 });
 
@@ -646,7 +781,7 @@ describe('origin-request — registration is precise on this trigger (v0.9.0)', 
   it('never registers a non-HTML body — gated before any API call', async () => {
     enableRegistration();
     const result = await invoke(makeRequestEvent({ uri: '/json' }));
-    expect(isPassThrough(result)).toBe(true);
+    expect(asResponse(result).bodyEncoding).toBe('base64');
     // The decisive property of origin-first: NOTHING reached Enhancely.
     expect(enhancelyFetch).not.toHaveBeenCalled();
   });
@@ -670,11 +805,16 @@ describe('origin-request — registration is precise on this trigger (v0.9.0)', 
 describe('origin-request — a slow Enhancely parks ALL lookups, not just one URL', () => {
   it('skips the lookup entirely for other URLs after one timeout', async () => {
     // The core's retryNotBefore is keyed by URL, so on its own every distinct
-    // page pays the full timeout once. During an outage this would add avoidable latency across distinct URLs.
+    // page pays the full timeout once. The execution-environment-wide memo
+    // prevents that repeated outage latency.
     __resetAdapterConfigForTests();
     __resetOriginRequestStateForTests();
     __resetUpstreamMemoForTests();
-    __setBakedConfigForTests({ apiKey: 'sk-test', timeoutMs: 60 });
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      timeoutMs: 60,
+      assertedDefaultTtlSeconds: 86_400,
+    });
     const slow = vi.fn(
       async () =>
         new Promise<Response>((resolve) => {
@@ -692,15 +832,84 @@ describe('origin-request — a slow Enhancely parks ALL lookups, not just one UR
     const second = asResponse(await invoke(makeRequestEvent({ uri: '/other' })));
     expect(second.body).toBe(PAGE_HTML);
     expect(slow).toHaveBeenCalledTimes(1);
+    expect(headerValue(second, 'cache-control')).toMatch(
+      /^max-age=0, s-maxage=\d+, must-revalidate$/
+    );
 
     // Origin-first: both pages WERE fetched (that is how we can still serve
     // them), but neither paid the Enhancely timeout a second time. One origin
     // hit per request — never two.
     expect(originHits).toBe(2);
   });
+
+  it('still injects a stale positive cache hit while the global breaker is open', async () => {
+    __resetAdapterConfigForTests();
+    __resetOriginRequestStateForTests();
+    __resetUpstreamMemoForTests();
+    __setBakedConfigForTests({ apiKey: 'sk-test', timeoutMs: 60, cacheTtlMs: 1 });
+    const selective = vi.fn(async (input: string) => {
+      if (input.includes('%2Fpage')) {
+        return new Response(JSONLD_RAW, {
+          status: 200,
+          headers: { 'content-type': 'application/ld+json', etag: 'W/"1"' },
+        });
+      }
+      return new Promise<Response>((resolve) => {
+        setTimeout(() => resolve(new Response('', { status: 504 })), 100);
+      });
+    });
+    __setConfigOverridesForTests({ fetchImpl: selective });
+
+    const first = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
+    expect(first.body).toContain(SNIPPET);
+    await new Promise((resolve) => setTimeout(resolve, 10)); // positive entry is stale
+
+    await invoke(makeRequestEvent({ uri: '/slow' })); // opens the global breaker
+    const cached = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
+
+    expect(cached.body).toContain(SNIPPET);
+    expect(selective).toHaveBeenCalledTimes(2);
+    expect(originHits).toBe(3);
+  });
 });
 
 describe('origin-request — fail-open', () => {
+  it('scopes a post-connect reset to its exact request instead of the whole origin', async () => {
+    const first = await invoke(makeRequestEvent({ uri: '/flaky-origin' }));
+    expect(isPassThrough(first)).toBe(true);
+    expect(originHits).toBe(1);
+
+    // The same known-bad request skips our pre-fetch during the short memo.
+    const repeated = await invoke(makeRequestEvent({ uri: '/flaky-origin' }));
+    expect(isPassThrough(repeated)).toBe(true);
+    expect(originHits).toBe(1);
+
+    // A healthy path on the same endpoint/vhost must still be fetched and
+    // injected: the reset happened after TCP connected and may be path-specific.
+    const second = asResponse(await invoke(makeRequestEvent({ uri: '/page' })));
+    expect(second.body).toContain(SNIPPET);
+    expect(originHits).toBe(2);
+    expect(enhancelyFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens an endpoint-wide circuit for a pre-connect failure', async () => {
+    const firstEvent = makeRequestEvent({ uri: '/page' });
+    const firstOrigin = firstEvent.Records[0]!.cf.request.origin;
+    if (firstOrigin?.custom) firstOrigin.custom.port = 1; // nothing listens here
+    const first = await invoke(firstEvent);
+    expect(isPassThrough(first)).toBe(true);
+
+    // A different URL on the same endpoint/vhost is handed straight back. This
+    // assertion is intentionally behavioral: no origin server or API is hit.
+    const secondEvent = makeRequestEvent({ uri: '/other' });
+    const secondOrigin = secondEvent.Records[0]!.cf.request.origin;
+    if (secondOrigin?.custom) secondOrigin.custom.port = 1;
+    const second = await invoke(secondEvent);
+    expect(isPassThrough(second)).toBe(true);
+    expect(originHits).toBe(0);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
   it('returns the request when the origin is unreachable', async () => {
     const event = makeRequestEvent();
     const origin = event.Records[0]!.cf.request.origin;

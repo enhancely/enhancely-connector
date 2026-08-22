@@ -27,7 +27,11 @@
  * load balancer, where every response carries a session cookie, the old rule
  * silently meant "never inject at all".
  *
- * Generated-response caching follows Cache-Control semantics; Set-Cookie alone does not determine cacheability.
+ * CloudFront's cache policy and response cache directives determine whether a
+ * generated response is cached; `Set-Cookie` alone is not a cache veto.
+ * Injecting into a page that sets a cookie therefore does not make CloudFront
+ * cache anything it would not have cached anyway — the shared-cookie risk is a
+ * property of the distribution's cache policy, not of this injection.
  *
  * Precise wording matters here: the generated response is NOT byte-identical
  * to the passed-through one (ETag, Last-Modified and Content-Length are
@@ -39,8 +43,8 @@
  * cheapest order in origin hits, but it forces the adapter to decide from the
  * REQUEST alone whether a URL is worth asking about — and from the request
  * alone that is unknowable. The extension pre-filter catches assets; an
- * extension-less URI may still be a redirect, a JSON endpoint or a 404. Every
- * one of those spent an unnecessary API call and added avoidable latency.
+ * extension-less URI may still be a redirect, a JSON endpoint or a 404. Asking
+ * Enhancely first would spend an API call and its latency on every such request.
  *
  * No request-side signal fixes this. `Accept` cannot: Googlebot sends the
  * wildcard media range WITHOUT `text/html` (Google Search Central), so
@@ -61,17 +65,23 @@
  *   HTML + snippet    → 1 own fetch, no CloudFront fetch  = 1
  *   HTML, no snippet  → 1 own fetch, response generated   = 1
  *   non-2xx (404, 3xx) → 1 own fetch, returned verbatim   = 1
- *   other non-HTML    → 1 own fetch + 1 CloudFront fetch  = 2  (first time)
- *                     → 0 own fetches + 1 CloudFront      = 1  (remembered)
+ *   small status-200 veto → 1 own fetch, returned verbatim = 1
+ *   over-quota/other 2xx → 1 own + 1 CloudFront fetch     = 2  (first time)
+ *                         → 0 own + 1 CloudFront fetch     = 1  (remembered)
  *
- * A non-2xx answer never costs two hits: it is reproduced byte-for-byte from
- * the fetch already made (verbatimNonOkResponse) — measured safe, CloudFront
- * still substitutes an operator's custom error page for it. Only the last
- * line pays a second hit, it is reserved for representations this adapter can
- * neither inject nor reproduce (2xx non-HTML, oversized, unreproducible
- * encodings), and only the FIRST request for such a URL pays it: the verdict
- * is memoized per execution environment (see nonPageMemo). Two consequences follow, both of which the previous
- * order could not deliver:
+ * A reproducible answer never costs two hits: its exact bytes are base64-
+ * framed from the fetch already made (verbatimOriginResponse). For non-2xx,
+ * CloudFront still applies an operator's configured custom error response.
+ * Small status-200 vetoes (JSON, noindex, legacy charset,
+ * ignored identity encoding) use the same safe primitive. Only responses that
+ * cannot fit or whose successful status has not been live-validated hand back;
+ * their verdict is memoized per execution environment (see nonPageMemo). No
+ * private coordination header is added to the real origin request: a generic
+ * origin or WAF may vary on any header, so doing so would not be customer-
+ * independent. The companion repeats cheap request/response gates solely to
+ * decide whether an eligible handback may receive a shorter cache lifetime;
+ * it never performs a recovery lookup. Two consequences follow, both of which
+ * the previous order could not deliver:
  *   - REGISTRATION is precise. The adapter knows the response is real HTML, so
  *     autoRegister no longer has to be forced off (v0.7.0/v0.8.0 could only
  *     have registered redirects, JSON endpoints and 404s).
@@ -102,13 +112,17 @@ import type {
   CloudFrontResultResponse,
 } from 'aws-lambda';
 import {
+  __resetRateLimitCircuitForTests,
+  buildScriptTag,
+  findHeadInjectionPoint,
   getJsonLdLookup,
   getJsonLdRegisterLookup,
   injectIntoHead,
   matchesExcludedPath,
   MemoryCache,
+  normalizeForEnhancely,
 } from '@enhancely/injector-core';
-import type { JsonLdLookupResult } from '@enhancely/injector-core';
+import type { InjectorConfig, JsonLdLookupResult } from '@enhancely/injector-core';
 import {
   getAssertedDefaultTtlSeconds,
   getCapSetCookieResponses,
@@ -121,30 +135,29 @@ import { retryablePassThroughResponse } from './cache-cap.js';
 import {
   isUpstreamDown,
   noteUpstreamCallDuration,
+  upstreamDownRemainingMs,
   __resetUpstreamMemoForTests,
 } from './upstream-memo.js';
 
 // Re-exported so tests (and consumers) keep their import path.
 export { __resetUpstreamMemoForTests };
-import { fetchOriginHtml } from './origin-fetch.js';
+import { fetchOriginHtml, originFetchFailureScope } from './origin-fetch.js';
 import {
   blocksIndexing,
   buildOriginUrl,
   buildPageUrl,
-  charsetOf,
-  containsOnlyAscii,
   customHeaderValue,
-  declaresUtf8MetaInPrescan,
   forwardedHeaders,
   GENERATED_HTML_CONTENT_TYPE,
   GENERATED_RESPONSE_SAFETY_MARGIN_BYTES,
-  hasUtf8Bom,
   headerValue,
   INJECTED_MARKER_HEADER,
   INJECTED_MARKER_VALUE,
+  isUtf8SafeHtmlBytes,
   MAX_GENERATED_RESPONSE_BYTES,
   MAX_ORIGIN_BODY_BYTES,
   MAX_RESPONSE_HEADER_BYTES,
+  NON_HTML_EXTENSION,
   originCustomHeaders,
   PAGE_HOST_HEADER,
   serializedHeaderBytes,
@@ -152,19 +165,8 @@ import {
   withoutConditionalHeaders,
 } from './shared.js';
 
-/**
- * Extensions that can never be an injectable HTML document. Checked BEFORE any
- * config, lookup or fetch so asset traffic on the same cache behavior costs
- * nothing but a regex.
- *
- * This is the one structural downside of the origin-request trigger: the
- * decision to fetch has to be made from the REQUEST, before any Content-Type
- * exists. The list is therefore a cheap pre-filter, not the gate — anything it
- * lets through is still checked against the real response Content-Type below,
- * and a wrong guess costs one discarded fetch, never a wrong body.
- */
-const NON_HTML_EXTENSION =
-  /\.(?:js|mjs|cjs|css|map|json|jsonld|geojson|xml|rss|atom|txt|csv|tsv|yaml|yml|wasm|webmanifest|ics|vcf|png|jpe?g|jfif|gif|webp|avif|heic|heif|svg|ico|bmp|tiff?|psd|eps|woff2?|ttf|otf|eot|mp4|m4v|webm|ogv|mkv|flv|mov|avi|mp3|m4a|aac|opus|wav|flac|oga|ogg|vtt|srt|pdf|docx?|xlsx?|pptx?|odt|ods|odp|epub|mobi|zip|gz|tgz|bz2|xz|7z|rar|tar|iso|apk|dmg|exe|msi|deb|rpm|bin)$/i;
+/** Smallest script wrapper an injectable Enhancely answer can add. */
+const MINIMUM_INJECTED_SNIPPET_BYTES = Buffer.byteLength(buildScriptTag('', null), 'utf8');
 
 /**
  * Headers an edge function may not emit. Adding one of these to a generated
@@ -186,6 +188,7 @@ const DISALLOWED_RESPONSE_HEADERS = new Set([
   'proxy-authenticate',
   'proxy-authorization',
   'proxy-connection',
+  'te',
   'trailer',
   'upgrade',
   'x-accel-buffering',
@@ -280,8 +283,18 @@ export function buildResponseHeaders(
   fidelity: BodyFidelity = 'injected'
 ): CloudFrontHeaders {
   const headers: CloudFrontHeaders = {};
+  // RFC 9110 allows Connection to name additional hop-by-hop fields. Those
+  // names are dynamic, so dropping only the fixed `connection` header can
+  // leak origin-connection metadata into the generated viewer response.
+  const connectionSpecific = new Set<string>();
+  for (const value of allHeaders['connection'] ?? []) {
+    for (const token of value.split(',')) {
+      const name = token.trim().toLowerCase();
+      if (name !== '') connectionSpecific.add(name);
+    }
+  }
   for (const [name, values] of Object.entries(allHeaders)) {
-    if (isDisallowedResponseHeader(name)) continue;
+    if (isDisallowedResponseHeader(name) || connectionSpecific.has(name)) continue;
     // Validators and digests describe the ORIGINAL bytes: wrong once the body
     // carries an injected snippet, still accurate when it does not. On the
     // pass-through path only Content-Encoding must go — the fetch asked for
@@ -314,16 +327,16 @@ function canonicalHeaderName(lowercase: string): string {
 let cache = new MemoryCache();
 
 /**
- * Per-execution-environment memo of URLs the origin answered with something
- * this adapter must not touch — a redirect, a 404, JSON, a compressed or
- * non-UTF-8 body, an over-quota page.
+ * Per-execution-environment memo of URLs whose origin answer cannot be
+ * injected AND cannot safely be generated from the fetch already made — for
+ * example an over-quota response or an unsupported 2xx representation.
  *
  * WHY. Origin-first buys precision at the cost of ONE extra origin hit for
  * exactly that class: we fetch to find out what it is, then hand the request
  * back so CloudFront fetches it again. The first time that is unavoidable —
- * nothing in the request tells us. The SECOND time it is pure waste, and on a
- * site being scanned for dead URLs, or one with many trailing-slash redirects,
- * the second time is most of the traffic.
+ * nothing in the request tells us. The SECOND time is pure waste. Small
+ * redirects, errors and status-200 veto bodies are instead reproduced from
+ * the first fetch and never enter this memo.
  *
  * So the verdict is remembered and the fetch is skipped: repeats hand back
  * immediately and cost exactly what they cost before origin-first — one
@@ -334,6 +347,19 @@ let cache = new MemoryCache();
  * already accepts.
  */
 let nonPageMemo = new Map<string, number>();
+let nonPageMemoEstimatedBytes = 0;
+
+/**
+ * Short origin-failure circuits. A proven DNS/connect/TLS setup failure is
+ * scoped to endpoint + virtual host because every path shares that transport.
+ * Errors after the transport is ready (including a slow/reset response) are
+ * scoped to the exact origin request so one bad URL cannot suppress healthy
+ * pages while repeats of that URL still avoid a known-doomed extra fetch.
+ */
+let originFailureMemo = new Map<string, number>();
+let originRequestFailureMemo = new Map<string, number>();
+const ORIGIN_FAILURE_MEMO_TTL_MS = 10_000;
+const ORIGIN_FAILURE_MEMO_MAX_ENTRIES = 256;
 
 /**
  * Bounded so a scan of unique dead URLs cannot grow the map without limit.
@@ -341,50 +367,154 @@ let nonPageMemo = new Map<string, number>();
  * enough that the cap only ever exists as a runaway guard.
  */
 const NON_PAGE_MEMO_MAX_ENTRIES = 10_000;
+const NON_PAGE_MEMO_MAX_ESTIMATED_BYTES = 4 * 1024 * 1024;
 
-function rememberNonPage(url: string, ttlMs: number): void {
-  // Map preserves insertion order — drop the oldest entry when over cap.
-  if (!nonPageMemo.has(url) && nonPageMemo.size >= NON_PAGE_MEMO_MAX_ENTRIES) {
-    const oldest = nonPageMemo.keys().next().value;
-    if (oldest !== undefined) nonPageMemo.delete(oldest);
-  }
-  nonPageMemo.set(url, Date.now() + ttlMs);
+function estimatedNonPageMemoBytes(url: string): number {
+  return 64 + url.length * 2;
 }
 
-function isRememberedNonPage(url: string): boolean {
+function deleteNonPageMemo(url: string): void {
+  if (!nonPageMemo.delete(url)) return;
+  nonPageMemoEstimatedBytes -= estimatedNonPageMemoBytes(url);
+}
+
+function originFailureKey(originUrl: string, originHost: string): string | null {
+  try {
+    return `${new URL(originUrl).origin}\0${originHost.toLowerCase()}`;
+  } catch {
+    return null;
+  }
+}
+
+function originRequestFailureKey(endpointKey: string, originUrl: string): string {
+  // Keep the original string: fetchOriginHtml deliberately preserves its raw
+  // path/query bytes instead of accepting WHATWG dot-segment rewriting.
+  return `${endpointKey}\0${originUrl}`;
+}
+
+function originFailureRemainingMs(memo: Map<string, number>, key: string): number | null {
+  const until = memo.get(key);
+  if (until === undefined) return null;
+  const remaining = until - Date.now();
+  if (remaining > 0) return remaining;
+  memo.delete(key);
+  return null;
+}
+
+function rememberOriginFailure(memo: Map<string, number>, key: string): void {
+  if (!memo.has(key) && memo.size >= ORIGIN_FAILURE_MEMO_MAX_ENTRIES) {
+    const oldest = memo.keys().next().value;
+    if (oldest !== undefined) memo.delete(oldest);
+  }
+  memo.set(key, Date.now() + ORIGIN_FAILURE_MEMO_TTL_MS);
+}
+
+function rememberNonPage(url: string, ttlMs: number): number {
+  // Bound both count and retained key bytes: CloudFront paths can be long, so
+  // a count-only 10k cap would still be large enough to threaten the 256 MiB
+  // Lambda memory limit. Refreshing an existing verdict moves it to the end.
+  deleteNonPageMemo(url);
+  const entryBytes = estimatedNonPageMemoBytes(url);
+  while (
+    nonPageMemo.size >= NON_PAGE_MEMO_MAX_ENTRIES ||
+    nonPageMemoEstimatedBytes + entryBytes > NON_PAGE_MEMO_MAX_ESTIMATED_BYTES
+  ) {
+    const oldest = nonPageMemo.keys().next().value;
+    if (oldest === undefined) break;
+    deleteNonPageMemo(oldest);
+  }
+  const until = Date.now() + ttlMs;
+  if (entryBytes <= NON_PAGE_MEMO_MAX_ESTIMATED_BYTES) {
+    nonPageMemo.set(url, until);
+    nonPageMemoEstimatedBytes += entryBytes;
+  }
+  return Math.max(1, until - Date.now());
+}
+
+function rememberedNonPageRemainingMs(url: string): number | null {
   const until = nonPageMemo.get(url);
-  if (until === undefined) return false;
-  if (Date.now() < until) return true;
-  nonPageMemo.delete(url);
-  return false;
+  if (until === undefined) return null;
+  const remaining = until - Date.now();
+  if (remaining > 0) return remaining;
+  deleteNonPageMemo(url);
+  return null;
+}
+
+/** Remember an expensive hard veto, then let CloudFront perform its fetch. */
+function memoizedPassThrough(request: CloudFrontRequest, pageUrl: string): CloudFrontRequest {
+  rememberNonPage(pageUrl, getNonPageMemoTtlMs());
+  return request;
 }
 
 /**
- * Return a non-2xx origin answer straight from the fetch we already made,
- * instead of handing the request back for CloudFront to fetch it again.
+ * The global outage memo blocks network, not useful local data. Positive
+ * entries — fresh or stale — remain injectable. A negative/missing entry gets
+ * a retry bound no earlier than both its own memo and the outage window.
+ */
+async function lookupWhileUpstreamIsDown(
+  pageUrl: string,
+  config: InjectorConfig
+): Promise<JsonLdLookupResult> {
+  const now = Date.now();
+  const outageRemaining = Math.max(1, upstreamDownRemainingMs());
+  try {
+    const key = normalizeForEnhancely(pageUrl);
+    if (key === null) {
+      return { snippet: null, revalidateInMs: outageRemaining };
+    }
+    const entry = await cache.get(key);
+    if (entry?.jsonldRaw !== null && entry?.jsonldRaw !== undefined) {
+      return {
+        snippet: buildScriptTag(entry.jsonldRaw, entry.etag),
+        revalidateInMs: null,
+      };
+    }
+
+    const cacheExpiry =
+      entry !== undefined && entry.storedAt > 0 ? entry.storedAt + config.cacheTtlMs : 0;
+    const nextOwnLookup = Math.max(cacheExpiry, entry?.retryNotBefore ?? 0);
+    return {
+      snippet: null,
+      revalidateInMs: Math.max(1, outageRemaining, nextOwnLookup - now),
+    };
+  } catch {
+    // MemoryCache cannot currently throw, but a cache peek must stay fail-open
+    // if its implementation changes. The outage window remains a safe bound.
+    return { snippet: null, revalidateInMs: outageRemaining };
+  }
+}
+
+/**
+ * Return a reproducible origin answer straight from the fetch we already
+ * made, instead of handing the request back for CloudFront to fetch it again.
  * Returns null when that is not safe or not enabled, and the caller then
  * hands back as before.
  *
- * An error is not a page: no Enhancely call is made, the body is never
- * inspected, and every origin header is preserved — the bytes are framed as
- * base64 so the response is reproduced exactly, whatever its encoding or
- * charset.
+ * Alongside non-2xx answers this includes status 200 representations rejected
+ * before the Enhancely gate (small JSON, noindex, legacy charset, ignored
+ * Content-Encoding). The bytes are framed as base64, so their encoding and
+ * charset are reproduced exactly without decoding.
  *
- * CloudFront applies configured custom error responses to generated error statuses as well; generating saves the second origin fetch.
+ * CloudFront applies configured custom error responses to generated error
+ * statuses as well. The viewer outcome therefore remains governed by the
+ * distribution configuration while generation saves the second origin fetch.
  *
  * Excluded regardless:
- * - 204/304 — a generated 204 carrying a body is a viewer-facing 502, and a
- *   304 must not be manufactured from a full fetch.
+ * - body-bearing 204 / every 304 — a generated 204 carrying a body is a
+ *   viewer-facing 502, and a 304 must not be manufactured from a full fetch.
  * - Range requests — our fetch drops Range, so the origin answered in full;
  *   returning that as a 200/206 substitute would be wrong.
  * - Anything over the generated-response quota.
  */
-function verbatimNonOkResponse(
+function verbatimOriginResponse(
   origin: OriginFetchResult,
   request: CloudFrontRequest
 ): CloudFrontResultResponse | null {
-  if (origin.status >= 200 && origin.status <= 299) return null;
-  if (origin.status === 204 || origin.status === 304) return null;
+  // A true empty 204 is safely reproducible only without a body. Other 2xx
+  // statuses retain the conservative handback until explicitly validated.
+  if (origin.status === 204 && origin.body.length > 0) return null;
+  if (origin.status === 304) return null;
+  if (origin.status > 200 && origin.status <= 299 && origin.status !== 204) return null;
   if (origin.status < 200 || origin.status > 599) return null;
   if (request.headers['range'] !== undefined) return null;
 
@@ -405,10 +535,40 @@ function verbatimNonOkResponse(
   };
 }
 
+/**
+ * Generate the already-fetched HTML unchanged when it fits CloudFront's
+ * response quotas. The caller has already proved the UTF-8 round trip is
+ * lossless, so validators remain valid; only Content-Encoding is removed
+ * because the identity body is emitted as text.
+ */
+function decodedHtmlResponse(
+  origin: OriginFetchResult,
+  html: string
+): CloudFrontResultResponse | null {
+  const headers = buildResponseHeaders(origin.allHeaders, 'decoded');
+  const headerBytes = serializedHeaderBytes(headers, String(origin.status));
+  if (headerBytes > MAX_RESPONSE_HEADER_BYTES) return null;
+
+  const bodyBudgetBytes =
+    MAX_GENERATED_RESPONSE_BYTES - headerBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
+  if (Buffer.byteLength(html, 'utf8') > bodyBudgetBytes) return null;
+
+  return {
+    status: String(origin.status),
+    headers,
+    body: html,
+    bodyEncoding: 'text',
+  };
+}
+
 /** TEST-ONLY: fresh cache between tests. */
 export function __resetOriginRequestStateForTests(): void {
   cache = new MemoryCache();
   nonPageMemo = new Map();
+  nonPageMemoEstimatedBytes = 0;
+  originFailureMemo = new Map();
+  originRequestFailureMemo = new Map();
+  __resetRateLimitCircuitForTests();
 }
 
 export const handler: CloudFrontRequestHandler = async (event) => {
@@ -436,6 +596,13 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // Cheap pre-filter for asset traffic sharing this cache behavior.
     if (NON_HTML_EXTENSION.test(request.uri)) return request;
 
+    // Our fetch deliberately removes Range to obtain a full injectable body.
+    // Generating that full body for a range request would change semantics, so
+    // let CloudFront perform the one correct origin request. The companion has
+    // the same Range gate, so an origin that ignores Range still causes no API
+    // lookup without adding any private coordination header to the origin.
+    if (request.headers['range'] !== undefined) return request;
+
     // Only custom origins can be re-issued by this adapter (S3 REST origins
     // speak a different protocol and would need SigV4 signing).
     const originUrl = buildOriginUrl(request);
@@ -446,6 +613,19 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     const originHost =
       headerValue(request.headers, 'host') ?? request.origin?.custom?.domainName ?? '';
     if (originHost === '') return request;
+
+    // Proven transport failures suppress this endpoint+vhost; ambiguous or
+    // post-connect failures suppress only the exact request target. Either
+    // circuit avoids a known-doomed fetch before CloudFront's fail-open retry.
+    const failureKey = originFailureKey(originUrl, originHost);
+    if (failureKey === null) return request;
+    const requestFailureKey = originRequestFailureKey(failureKey, originUrl);
+    if (
+      originFailureRemainingMs(originFailureMemo, failureKey) !== null ||
+      originFailureRemainingMs(originRequestFailureMemo, requestFailureKey) !== null
+    ) {
+      return request;
+    }
 
     // No resolvable API key → hand the request back untouched. Unlike the
     // origin-response path there is no response to re-cache here, so a missing
@@ -461,13 +641,16 @@ export const handler: CloudFrontRequestHandler = async (event) => {
 
     // Already known not to be an injectable page: skip our fetch entirely, so
     // this costs exactly one CloudFront fetch and nothing else.
-    if (isRememberedNonPage(pageUrl)) return request;
+    const rememberedRemaining = rememberedNonPageRemainingMs(pageUrl);
+    if (rememberedRemaining !== null) {
+      return request;
+    }
 
     // ORIGIN FIRST (v0.9.0 — see the module header). The trigger cannot know
     // from the request alone whether this URL is an HTML page: the extension
     // pre-filter catches assets, but an extension-less URI may just as well be
     // a redirect, a JSON endpoint or a 404. Asking Enhancely first therefore
-    // spent an unnecessary API call on every such request.
+    // spends one unnecessary API call and its latency on every such request.
     //
     // Fetching the origin first inverts that: the lookup happens only once the
     // response PROVES this is a servable, injectable HTML page, exactly like
@@ -479,30 +662,50 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     //
     // From here on we own the origin fetch: CloudFront will not contact the
     // origin for this request unless we hand the request back.
-    const origin = await fetchOriginHtml(
-      originUrl,
-      originHost,
-      getOriginTimeoutMs(),
-      MAX_ORIGIN_BODY_BYTES,
-      {
-        // Conditional/range headers must go: a viewer holding a cached copy
-        // sends If-None-Match, the origin answers 304 with no body, the gate
-        // rejects it and the fetch was spent for nothing.
-        ...withoutConditionalHeaders(forwardedHeaders(request.headers)),
-        // Origin custom headers never appear in request.headers — CloudFront
-        // adds them on its way to the origin. Without them the origin sees a
-        // request CloudFront would never have made. Spread last because
-        // CloudFront gives them precedence over same-named viewer headers.
-        ...originCustomHeaders(request),
+    let origin: OriginFetchResult;
+    try {
+      origin = await fetchOriginHtml(
+        originUrl,
+        originHost,
+        getOriginTimeoutMs(),
+        MAX_ORIGIN_BODY_BYTES,
+        MAX_RESPONSE_HEADER_BYTES,
+        {
+          // Conditional/range headers must go: a viewer holding a cached copy
+          // sends If-None-Match, the origin answers 304 with no body, the gate
+          // rejects it and the fetch was spent for nothing.
+          ...withoutConditionalHeaders(forwardedHeaders(request.headers)),
+          // Origin custom headers never appear in request.headers — CloudFront
+          // adds them on its way to the origin. Without them the origin sees a
+          // request CloudFront would never have made. Spread last because
+          // CloudFront gives them precedence over same-named viewer headers.
+          ...originCustomHeaders(request),
+        }
+      );
+      originFailureMemo.delete(failureKey);
+      originRequestFailureMemo.delete(requestFailureKey);
+    } catch (error) {
+      if (originFetchFailureScope(error) === 'endpoint') {
+        rememberOriginFailure(originFailureMemo, failureKey);
+      } else {
+        rememberOriginFailure(originRequestFailureMemo, requestFailureKey);
       }
-    );
+      return request;
+    }
 
     // Over the conservative fetch cap. Handing the request back is strictly
     // better than the origin-response path's equivalent: CloudFront fetches it
     // itself and streams it with no generated-response quota at all.
     if (origin.truncated) {
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+      return memoizedPassThrough(request, pageUrl);
+    }
+
+    // Pair-wide invariant: an upstream connector may already have injected
+    // this representation. Preserve it from the fetch we made and never ask
+    // Enhancely or append a duplicate script. If it cannot be generated under
+    // CloudFront quotas, hand back; the companion applies the same marker gate.
+    if (origin.allHeaders[INJECTED_MARKER_HEADER] !== undefined) {
+      return verbatimOriginResponse(origin, request) ?? memoizedPassThrough(request, pageUrl);
     }
 
     // The ONE response gate. On the origin-response trigger this same check
@@ -521,55 +724,64 @@ export const handler: CloudFrontRequestHandler = async (event) => {
         contentType: origin.contentType,
         contentEncoding: origin.contentEncoding,
         cacheControl: origin.cacheControl,
+        contentDisposition: origin.contentDisposition,
         hasSetCookie: origin.hasSetCookie,
       })
     ) {
       // A non-2xx answer we can reproduce exactly goes straight back: one
       // origin hit, and nothing to remember, because handing it back would
       // have cost the same one hit via CloudFront.
-      const verbatim = verbatimNonOkResponse(origin, request);
+      const verbatim = verbatimOriginResponse(origin, request);
       if (verbatim !== null) return verbatim;
       // Everything else (2xx non-HTML, oversized, unreproducible) hands back
       // and IS worth remembering: that path costs a second origin fetch.
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+      return memoizedPassThrough(request, pageUrl);
     }
 
     // A page the origin marks noindex is not schema-markup territory.
     if (blocksIndexing(origin.xRobotsTag)) {
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+      const verbatim = verbatimOriginResponse(origin, request);
+      return verbatim ?? memoizedPassThrough(request, pageUrl);
     }
 
+    if (!isUtf8SafeHtmlBytes(origin.body, origin.contentType ?? '')) {
+      const verbatim = verbatimOriginResponse(origin, request);
+      return verbatim ?? memoizedPassThrough(request, pageUrl);
+    }
     const originalHtml = origin.body.toString('utf8');
-    // Charset gate, part 2: prove the utf8 decode was lossless before touching
-    // the bytes — a lossy decode would put U+FFFD into a body CloudFront then
-    // caches.
-    if (!Buffer.from(originalHtml, 'utf8').equals(origin.body)) {
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+
+    // Prove there is a real structural </head> insertion point BEFORE asking
+    // Enhancely. The core scanner skips raw-text elements, comments and quoted
+    // attributes; using its returned offset again below prevents preflight and
+    // injection from ever disagreeing.
+    const injectionPoint = findHeadInjectionPoint(originalHtml);
+    if (injectionPoint === null) {
+      return decodedHtmlResponse(origin, originalHtml) ?? memoizedPassThrough(request, pageUrl);
     }
-    const originCharset = charsetOf(origin.contentType ?? '');
-    const asciiBody = containsOnlyAscii(origin.body);
-    // Relabeling non-ASCII bytes as UTF-8 can change visible text even when
-    // those bytes form valid UTF-8, so only genuinely ASCII source bytes are
-    // safe under an `ascii`/`us-ascii` label.
-    if ((originCharset === 'ascii' || originCharset === 'us-ascii') && !asciiBody) {
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+
+    // All injected-response headers are known before the JSON-LD body is. If
+    // they already exceed CloudFront's independent 32 KiB cap, no snippet can
+    // make this response valid — skip Enhancely and hand back with a hard veto.
+    const injectedHeaders = buildResponseHeaders(origin.allHeaders, 'injected');
+    injectedHeaders['content-type'] = [{ key: 'Content-Type', value: GENERATED_HTML_CONTENT_TYPE }];
+    injectedHeaders[INJECTED_MARKER_HEADER] = [
+      { key: 'X-Enhancely-Injected', value: INJECTED_MARKER_VALUE },
+    ];
+    const injectedHeaderBytes = serializedHeaderBytes(injectedHeaders, String(origin.status));
+    if (injectedHeaderBytes > MAX_RESPONSE_HEADER_BYTES) {
+      return decodedHtmlResponse(origin, originalHtml) ?? memoizedPassThrough(request, pageUrl);
     }
-    // With no header charset, valid UTF-8 bytes are not proof of UTF-8 intent:
-    // browsers run a context-sensitive encoding prescan and might read the same
-    // bytes as windows-1252. Safe to relabel are ASCII bytes, a UTF-8 BOM, or a
-    // meta tag in the prescan window that declares UTF-8 itself.
+
+    // Likewise, if the original HTML plus even an empty script wrapper cannot
+    // fit, every successful lookup is unusable. This is only a lower-bound
+    // veto; the exact snippet-sized check remains after the lookup.
+    const injectedBodyBudgetBytes =
+      MAX_GENERATED_RESPONSE_BYTES - injectedHeaderBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
     if (
-      originCharset === null &&
-      !asciiBody &&
-      !hasUtf8Bom(origin.body) &&
-      !declaresUtf8MetaInPrescan(origin.body)
+      Buffer.byteLength(originalHtml, 'utf8') + MINIMUM_INJECTED_SNIPPET_BYTES >
+      injectedBodyBudgetBytes
     ) {
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+      return decodedHtmlResponse(origin, originalHtml) ?? memoizedPassThrough(request, pageUrl);
     }
 
     // ── The response has now PROVEN this is a servable, injectable HTML page.
@@ -581,8 +793,10 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // and will not answer for THIS url either. Skip the lookup, but still
     // serve the body we already hold — handing back would make CloudFront
     // fetch the very same page a second time.
-    let lookup: JsonLdLookupResult = { snippet: null, revalidateInMs: null };
-    if (!isUpstreamDown()) {
+    let lookup: JsonLdLookupResult;
+    if (isUpstreamDown()) {
+      lookup = await lookupWhileUpstreamIsDown(pageUrl, config);
+    } else {
       const startedAt = Date.now();
       lookup = config.autoRegister
         ? await getJsonLdRegisterLookup(pageUrl, cache, config)
@@ -598,38 +812,42 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // lets the retry cache cap below work at all: the response CloudFront
     // caches is now ours to bound.
     const injected =
-      lookup.snippet === null ? originalHtml : injectIntoHead(originalHtml, lookup.snippet);
+      lookup.snippet === null
+        ? originalHtml
+        : injectIntoHead(originalHtml, lookup.snippet, injectionPoint);
     const didInject = injected !== originalHtml;
 
     // Validators describe the ORIGINAL bytes. They stay accurate on the
     // pass-through path and must go on the injected one.
-    const headers = buildResponseHeaders(origin.allHeaders, didInject ? 'injected' : 'decoded');
-    if (didInject) {
-      // The generated text is UTF-8 regardless of what the origin declared, so
-      // Unicode in the injected JSON-LD can never be decoded under a stale label.
-      headers['content-type'] = [{ key: 'Content-Type', value: GENERATED_HTML_CONTENT_TYPE }];
-      // Marker: "this response carries injected JSON-LD". Field debugging
-      // (which path produced this response?) and a never-touch-injected-content
-      // invariant for the companion. Nothing depends on it.
-      headers[INJECTED_MARKER_HEADER] = [
-        { key: 'X-Enhancely-Injected', value: INJECTED_MARKER_VALUE },
-      ];
-    }
+    // The injected header candidate was built and quota-checked before the
+    // lookup. Reuse it verbatim; the pass-through path retains validators.
+    const headers = didInject
+      ? injectedHeaders
+      : buildResponseHeaders(origin.allHeaders, 'decoded');
+    const originalResult = decodedHtmlResponse(origin, originalHtml);
+    const fallbackToOriginal = (): CloudFrontRequest | CloudFrontResultResponse => {
+      if (originalResult === null) return memoizedPassThrough(request, pageUrl);
+      const retryInMs = lookup.snippet === null ? lookup.revalidateInMs : config.cacheTtlMs;
+      return retryInMs === null
+        ? originalResult
+        : retryablePassThroughResponse(originalResult, request.headers, retryInMs, {
+            assertedDefaultTtlSeconds: getAssertedDefaultTtlSeconds(),
+            capSetCookieResponses: getCapSetCookieResponses(),
+          });
+    };
 
     // CloudFront caps response headers at 32 KB independently of the 1 MB
     // quota; exceeding it is a viewer-facing 502 after Lambda has completed.
     const responseHeaderBytes = serializedHeaderBytes(headers, String(origin.status));
     if (responseHeaderBytes > MAX_RESPONSE_HEADER_BYTES) {
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+      return fallbackToOriginal();
     }
 
     // The 1 MB generated-response quota counts headers AND body together.
     const bodyBudgetBytes =
       MAX_GENERATED_RESPONSE_BYTES - responseHeaderBytes - GENERATED_RESPONSE_SAFETY_MARGIN_BYTES;
     if (Buffer.byteLength(injected, 'utf8') > bodyBudgetBytes) {
-      rememberNonPage(pageUrl, getNonPageMemoTtlMs());
-      return request;
+      return fallbackToOriginal();
     }
 
     const result: CloudFrontResultResponse = {

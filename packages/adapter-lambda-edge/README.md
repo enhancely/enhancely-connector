@@ -2,6 +2,10 @@
 
 CloudFront **Lambda@Edge** adapters for the Enhancely JSON-LD injector.
 
+Die aktuelle, kundenunabhängige Laufzeitarchitektur mit Mermaid-Diagrammen,
+Request-Zahlen und sämtlichen Cache-/Retry-Zeiten steht in
+[`../../docs/architecture/current-runtime-architecture.md`](../../docs/architecture/current-runtime-architecture.md).
+
 > **Status: implemented + tested.** Three entrypoints, one core. All connector
 > logic comes from `@enhancely/injector-core` — these adapters only translate
 > CloudFront event shapes and wire up the edge-specific concerns: key
@@ -11,14 +15,14 @@ CloudFront **Lambda@Edge** adapters for the Enhancely JSON-LD injector.
 
 ## Which trigger?
 
-|                                                     | **origin-request** (`src/origin-request.ts`)                                  | **origin-response** (`src/index.ts`)                     |
-| --------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Origin hits per injected cache miss                 | **1**                                                                         | **2** (CloudFront's + our re-fetch)                      |
-| Cross-response consistency gates                    | none — there is only one response                                             | X-Robots-Tag, Cache-Control, Expires, CSP must all match |
-| Pages that set a cookie or are `private`/`no-store` | **injected**                                                                  | skipped                                                  |
-| Fail-open primitive                                 | `return request` — CloudFront proceeds as if the function were not associated | return the response it already holds                     |
-| Body over the 1 MB quota                            | hands the request back, CloudFront streams it unlimited                       | viewer-facing **502**                                    |
-| Artifact                                            | `dist/lambda-origin-request.zip`                                              | `dist/lambda.zip`                                        |
+|                                                     | **origin-request** (`src/origin-request.ts`)                               | **origin-response** (`src/index.ts`)                     |
+| --------------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Origin hits per injected cache miss                 | **1**                                                                      | **2** (CloudFront's + our re-fetch)                      |
+| Cross-response consistency gates                    | none — there is only one response                                          | X-Robots-Tag, Cache-Control, Expires, CSP must all match |
+| Pages that set a cookie or are `private`/`no-store` | **injected**                                                               | skipped                                                  |
+| Fail-open primitive                                 | generate the safe original or return the request for CloudFront to fetch   | return the response it already holds                     |
+| Body over the 1 MB quota                            | hands the request back; CloudFront streams it without that generated limit | returns the already-held response unchanged before quota |
+| Artifact                                            | `dist/lambda-origin-request.zip`                                           | `dist/lambda.zip`                                        |
 
 **`origin-request` is the recommended trigger.** It exists because the
 origin-response trigger cannot read the origin body: that adapter has to fetch
@@ -35,10 +39,12 @@ body.
 
 ### Order of operations: origin first (v0.9.0)
 
-The Enhancely lookup runs only **after** the origin response proves the URL is a
-servable, injectable HTML page. Up to v0.8.0 it ran first, which forced the
-adapter to guess from the request alone — and from the request alone this is
-unknowable:
+The Enhancely lookup runs only **after** the origin response proves the URL is
+an exact-200, servable, injectable HTML page: correct media type and charset,
+indexable, transformable, inline rather than an attachment, structurally
+injectable, and within the generated-response quota preflights. Up to v0.8.0 it
+ran first, which forced the adapter to guess from the request alone — and from
+the request alone this is unknowable:
 
 - **`Accept` cannot decide it.** Googlebot sends the wildcard media range
   _without_ `text/html` (Google Search Central), so requiring `text/html` would
@@ -49,20 +55,73 @@ unknowable:
   of the cache key — gating on a header outside the cache key lets the
   un-injected variant win the cache entry and be served to everyone.
 
-Origin-first avoids spending Enhancely calls on extension-less non-pages while retaining the local extension fast path.
+Asking Enhancely first would add an unnecessary API call and its latency to
+every extension-less non-page. With the origin fetched first, that class costs
+**zero** Enhancely calls.
 
-| path                        | origin hits                                            |
-| --------------------------- | ------------------------------------------------------ |
-| HTML + snippet              | 1 (we fetch, we generate)                              |
-| HTML, no snippet            | 1 (we fetch, we generate the origin's bytes)           |
-| non-2xx (404, redirect …)   | 1 — returned byte-for-byte from the fetch already made |
-| other non-HTML / over quota | 2 on the FIRST request, 1 afterwards (memoized)        |
+| path                                                             | origin hits                                            |
+| ---------------------------------------------------------------- | ------------------------------------------------------ |
+| HTML + snippet                                                   | 1 (we fetch, we generate)                              |
+| HTML, no snippet or no usable `</head>`                          | 1 (we fetch, we generate the origin's bytes)           |
+| non-2xx (404, redirect …)                                        | 1 — returned byte-for-byte from the fetch already made |
+| small status-200 veto (JSON/noindex/`no-transform`/attachment/…) | 1 — returned from the fetch already made               |
+| over quota / non-reproducible other 2xx                          | 2 on the FIRST request, 1 afterwards (memoized)        |
 
-A reproducible non-2xx answer is returned from the fetch already made, so it never pays twice. Only the last line pays
-twice, it is reserved for representations this adapter can neither inject nor
-reproduce, and only the FIRST request for such a URL pays it: the verdict
-is memoized per execution environment, so repeats skip our fetch and cost
-exactly what they cost before origin-first — one CloudFront fetch, nothing else.
+A reproducible answer never pays twice — non-2xx and small status-200 vetoes
+are returned exactly from the fetch already made, without an Enhancely call.
+CloudFront applies the operator's configured custom error response to a
+Lambda@Edge-generated error status. Range, 206/304, unsupported
+successful statuses, and quota failures stay on the conservative handback
+path; an empty 204 is safely generated from the existing fetch. Only the last
+line pays twice, and only the FIRST request for such a URL: the verdict is
+memoized per execution environment. The two triggers deliberately do not
+coordinate through a private request header: CloudFront would forward it to
+the customer's origin/WAF, where it could change the representation. The
+cache-cap-only companion repeats the cheap extension/Range/status/content-type/
+indexing/transform/disposition gates but never contacts Enhancely. A post-lookup snippet
+that does not fit the Lambda quota falls back to the already-fetched original
+HTML whenever that original still fits, so that case remains one origin request
+and one Enhancely request. In the rare case where neither the injected body nor
+that original can be generated, the request is handed back; the companion may
+safely shorten its cache lifetime but cannot add another Enhancely request.
+
+Origin-fetch failures use two short, execution-environment-local circuits.
+DNS, TCP-connect and TLS failures observed before the transport is ready park
+the endpoint + virtual host for 10 seconds. A timeout, reset or malformed
+response after connect is memoized only for that exact origin request, so one
+bad path cannot suppress injection on healthy pages while repeats still avoid
+a known-doomed extra fetch. Every circuit remains fail-open: CloudFront performs
+its normal origin request.
+
+#### Conformance: what the unit tests cannot prove
+
+`pnpm conformance` drives a live CloudFront distribution and asserts what the
+**platform** does with what the adapter produces — properties no unit test can
+reach: whether a generated response keeps two separate `Set-Cookie` headers,
+whether an over-quota body fails open instead of returning 502, whether a
+300 KB page is still compressed, whether latin-1 bytes survive byte-exact.
+
+Pass the URL of a compatible, operator-owned fixture distribution explicitly:
+`pnpm conformance https://connector-fixtures.example`. The suite tests what is
+deployed, not what is committed, and this repository intentionally contains no
+live deployment configuration or credentials.
+
+Two findings it produced on its first run, both worth knowing:
+
+- **CloudFront strips `Set-Cookie` when a cache behavior does not forward
+  cookies** (_"removes `Set-Cookie` headers from responses before returning
+  responses to your viewers"_). On such a distribution the header is gone
+  whether the response was injected or passed through — the injector cannot
+  lose a cookie the platform already removes. Where cookies ARE forwarded,
+  CloudFront also **caches** `Set-Cookie` with the object and replays it on
+  every hit; AWS's own mitigation is an origin sending
+  `Cache-Control: no-cache="Set-Cookie"`. That is the risk `capSetCookieResponses`
+  asks the operator to reason about.
+- **An unvalidated domain caps at 5 records.** Registration then answers
+  `403 domain-validation-required`, the connector correctly treats it as a
+  durable negative and backs off — and nothing new is ever injected. The
+  functions log nothing in normal operation, so the only symptom is silence.
+  Validate the domain before concluding the connector is broken.
 
 #### Keeping the function off asset paths
 
@@ -89,7 +148,7 @@ ASSET_PATHS_AUTH='user:pass' pnpm asset-paths https://staging.example.com/
 
 It reads every asset the pages reference (including `srcset` and CSS `url()`),
 keeps only extensions this adapter already rejects — the list is read from
-`origin-request.ts`, so the tool cannot drift from the code — and reports the
+`shared.ts`, so the tool cannot drift from the code — and reports the
 smallest set of behaviors that covers them, comparing a path-prefix strategy
 against an extension strategy. Two traps it guards against: CloudFront allows
 only 25 behaviors per distribution, and shortening `*.js` to `*.js*` also
@@ -113,45 +172,40 @@ before the origin answers. Two things follow that the old order could not delive
 `auto_register` is precise (the adapter knows it is HTML), and the retry cache
 cap applies to the un-injected response because that response is now ours.
 
-### The companion (origin-response, pairs WITH origin-request)
+### The cache-cap-only companion (origin-response, pairs WITH origin-request)
 
-`src/companion.ts` is a third, slim entrypoint that restores the two things the
-origin-request trigger structurally cannot do:
+`src/companion.ts` is a slim cache-lifetime safety net for responses the
+origin-request injector has to hand back. It never calls Enhancely: an
+origin-response event exposes no body and therefore cannot prove a real
+`<head>`, valid UTF-8 bytes, or available generated-response quota. The
+origin-request injector remains the only API caller in the recommended pair.
 
-- **auto-registration** — it sees status + content-type, so it can enroll real,
-  servable HTML (the origin-request lookup runs before any response exists and
-  would register redirects and 404s). With `autoRegister` it makes ONE
-  register-or-revalidate `POST /api/v1/jsonld { url }` per unknown/stale URL:
-  unknown → registered (201), known → revalidated (`If-None-Match` → 412) or
-  fetched (200 + raw body + ETag, cached so the NEXT miss injects). With
-  `autoRegister` off it degrades to a cap-only companion (conditional GET).
-- **retry cache-lifetime capping** — on a miss without a snippet the
-  origin-request adapter hands the request back and never sees the response
-  CloudFront caches; the companion does, and applies the same
+- **retry cache-lifetime capping** — for a response origin-request could not
+  safely generate, the companion applies the same
   `retryablePassThroughResponse` cap as the standalone origin-response adapter
   (shared code in `src/cache-cap.ts`), which makes `assertedDefaultTtlSeconds`
-  effective again.
+  effective again. Method, excluded-path, known-extension, Range, exact-200
+  HTML, charset, indexing, `no-transform`, and attachment gates run first, so
+  permanent non-pages keep their native cache policy.
 
 The pairing is safe by AWS contract: a response GENERATED by an origin-request
 function never fires the origin-response trigger, and cached responses invoke
 neither function — the companion only ever sees uninjected pass-through
-traffic. Generated responses additionally carry `X-Enhancely-Injected`; a
-companion that ever observes it abstains loudly (it means the full
-origin-response INJECTOR was mis-paired onto the behavior, which stays
-forbidden).
+traffic. Every injected generated response additionally carries
+`X-Enhancely-Injected`. A companion that ever observes it abstains loudly. In a
+correct deployment a generated response cannot reach this trigger, so the
+marker indicates an origin echo or changed AWS event semantics; it is a
+never-touch-injected-body invariant, not a pairing detector. Pairing safety
+comes from the Terraform association map and review.
 
-Cap gates are stricter than register gates, deliberately: requests carrying
+Cap gates are deliberately strict: requests carrying
 `Cookie`/`Authorization` and responses with `private`/`no-store` are never
 rewritten; responses with `Set-Cookie` only under the operator assertion
 `capSetCookieResponses` (for credential-less requests — the shared crawler
-variant). Registration, by contrast, mirrors what the injector will inject —
-including Set-Cookie/`private`/`no-store` pages.
-
-One economics note on cap-only mode (`autoRegister: false`): the companion then
-GETs unknown URLs, each answering 404 — on a large un-registered site that can
-trip the server's per-org 404-flood limiter (429 for the whole org, which also
-backs off the injector fleet). Cap-only mode is meant for catalogs that are
-already populated; during catalog fill, run with `autoRegister: true`.
+variant). The same assertion is used when the origin-request injector generates
+an uninjected retryable fallback, so this is a pairing-wide assertion rather
+than a companion-only switch. `autoRegister` affects body-aware injectors only;
+it has no effect in the companion.
 
 ### Why origin-request injects pages that set cookies
 
@@ -165,28 +219,16 @@ produced, `Set-Cookie` included verbatim.
 On sites behind a stickiness-enabled load balancer — where _every_ response
 carries a session cookie — the old rule silently meant "never inject at all".
 
-Generated-response caching follows the response cache directives; Set-Cookie alone is not a cacheability signal. The connector therefore preserves the origin's cache semantics.
+`Set-Cookie` alone is not a cache veto for a generated response. CloudFront's
+cache policy and the response cache directives determine cacheability.
+Injecting into a page that sets a cookie therefore does not make CloudFront
+cache anything it would not have cached anyway; the shared-cookie risk is a
+property of the distribution's cache policy, not of this injection.
 
 One correction while being precise: the generated response is _not_
 byte-identical to the passed-through one — `ETag`, `Last-Modified` and
 `Content-Length` are deliberately dropped because they describe the uninjected
 body. It is identical in the only respect that governs caching.
-
-### Order of operations: lookup first
-
-The Enhancely lookup runs **before** the origin fetch, and a missing snippet
-hands the request back so CloudFront does its own normal fetch:
-
-```
-no snippet → 0 own fetches + 1 CloudFront fetch = 1   (same as without the function)
-snippet    → 1 own fetch,   0 CloudFront fetches = 1   (origin-response: 2)
-```
-
-Running both concurrently would shave the lookup latency off the snippet path,
-but would spend a wasted origin fetch on every page _without_ a snippet — and
-while a catalog is still filling up, that is the large majority of requests.
-The lookup is a memory-cache hit in steady state anyway, and after an upstream
-failure the core's `retryNotBefore` memo skips the call entirely.
 
 ---
 
@@ -200,7 +242,8 @@ viewer ──> CloudFront ──(cache miss)──> origin
                 ├─ origin-response trigger: this handler
                 │    1. policy/response gate: excludePaths, noindex/none,
                 │       GET + status "200" + text/html +
-                │       UTF-8-compatible charset + no Set-Cookie +
+                │       UTF-8-compatible charset + transformable + inline +
+                │       no Set-Cookie +
                 │       no private/no-store Cache-Control (the first
                 │       response may be gzip/br; it is not the body used)
                 │    2. resolve config (baked file or SSM, memoized)
@@ -249,6 +292,9 @@ only when the origin declares an explicit cache lifetime (`max-age`,
 `max-age=0`, caps CloudFront `s-maxage` at the next meaningful retry (404 cache
 TTL, `Retry-After`/error backoff, or config cooldown), and removes `ETag`,
 `Last-Modified`, and `Expires`. It never exceeds the origin lifetime. When the
+freshness syntax is duplicate, malformed, quote-ambiguous, or not a strict
+modern HTTP date, it is treated as already stale instead of being guessed.
+When the
 origin declares no lifetime, the response remains byte-for-byte untouched by
 default: the adapter cannot see the distribution's DefaultTTL and must not
 accidentally turn a DefaultTTL=0 response into a shared-cacheable one. The
@@ -273,17 +319,14 @@ page is never at risk; worst case is one uninjected view.
 
 The re-fetch deliberately uses `node:http`/`node:https`, not `fetch`:
 undici's `fetch` treats `Host` as a forbidden header and silently drops it,
-which would break virtual hosts on the origin.
+which would break virtual hosts on the origin. Its response-header parser is
+explicitly raised from Node's 16 KiB default to CloudFront's 32 KiB limit.
 
-> **`assertedDefaultTtlSeconds` and the retry cache-control rewriting need an
-> origin-response seat.** The `origin-request` entrypoint hands the request
-> back when there is no snippet, so CloudFront fetches and caches the origin's
-> own response — that entrypoint never sees it and cannot shorten its
-> lifetime. On an origin-request deployment, associate the **companion** on
-> origin-response of the same behavior (see "The companion" above): it applies
-> exactly this capping, making the assertion effective again. Without the
-> companion, an uninjected page on that trigger is cached for the behavior's
-> normal TTL.
+> **Hard handbacks still need the companion's origin-response seat.** Normal
+> no-snippet and no-`</head>` pages are generated by `origin-request`, which can
+> cap them itself. Over-quota and other non-reproducible responses must be
+> fetched by CloudFront; the companion sees the actual response headers,
+> applies its cheap gates, and performs only safe TTL capping.
 
 ## Configuration (no environment variables at the edge!)
 
@@ -309,21 +352,30 @@ responses through uninjected for a **30-second cooldown**. The next invocation
 after the cooldown retries resolution, so a key created later or a transient
 SSM failure does not strand a warm execution environment.
 
-| `connector-config.json` key | Default                        | Notes                                                                                                                                                                                                                                                                           |
-| --------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiKey`                    | — (falls back to SSM)          | `sk-…` / `sk-org-…`. Present → SSM is never contacted.                                                                                                                                                                                                                          |
-| `enhancelyBase`             | `https://app.enhancely.ai`     | Enhancely API base URL.                                                                                                                                                                                                                                                         |
-| `timeoutMs`                 | `800`                          | Enhancely API call timeout (enforced by the core).                                                                                                                                                                                                                              |
-| `cacheTtlMs`                | `300000` (5 min)               | JSON-LD cache TTL.                                                                                                                                                                                                                                                              |
-| `autoRegister`              | `false`                        | Register unknown pages (GET-path adapters: POST after a 404; the companion: one register-or-revalidate POST, no prior 404 needed).                                                                                                                                              |
-| `originTimeoutMs`           | `2000`                         | Origin re-fetch timeout (higher than the API timeout on purpose).                                                                                                                                                                                                               |
-| `ssmParameterName`          | `/enhancely/connector/api-key` | Only used when `apiKey` is absent.                                                                                                                                                                                                                                              |
-| `ssmRegion`                 | `us-east-1`                    | Region of the SSM parameter.                                                                                                                                                                                                                                                    |
-| `ssmTimeoutMs`              | `2000`                         | Bound on the SSM `GetParameter` call (fail-open on expiry).                                                                                                                                                                                                                     |
-| `excludePaths`              | `[]`                           | Paths skipped before config/API work; CloudFront-style `*`/`?`.                                                                                                                                                                                                                 |
-| `assertedDefaultTtlSeconds` | `0` (off)                      | Asserted minimum DefaultTTL used to cap lifetime-less retries.                                                                                                                                                                                                                  |
-| `nonPageMemoTtlMs`          | `1800000` (30 min)             | How long origin-request remembers that a URL is not a page, so repeats skip its fetch. Independent of `cacheTtlMs` on purpose: a JSON-LD record changes when content is edited, "this URL is not a page" does not.                                                              |
-| `capSetCookieResponses`     | `false`                        | Companion only: also cap `Set-Cookie` responses (credential-less requests only). **Never** enable on an origin that mints session cookies for anonymous requests — replayed `Set-Cookie` via downstream caches is the session-fixation pattern. TF: `cap_set_cookie_responses`. |
+| `connector-config.json` key | Default                        | Notes                                                                                                                                                                                                                                                                                                                                                                                      |
+| --------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `apiKey`                    | — (falls back to SSM)          | `sk-…` / `sk-org-…`. Present → SSM is never contacted.                                                                                                                                                                                                                                                                                                                                     |
+| `enhancelyBase`             | `https://app.enhancely.ai`     | Enhancely API base URL.                                                                                                                                                                                                                                                                                                                                                                    |
+| `timeoutMs`                 | `800`                          | Enhancely API call timeout (enforced by the core).                                                                                                                                                                                                                                                                                                                                         |
+| `cacheTtlMs`                | `300000` (5 min)               | JSON-LD cache TTL.                                                                                                                                                                                                                                                                                                                                                                         |
+| `autoRegister`              | `false`                        | `false`: one conditional GET without registration. `true`: exactly one register-or-revalidate POST for lookup or registration. Only the explicit low-level compatibility API can still use GET→404→POST.                                                                                                                                                                                   |
+| `originTimeoutMs`           | `2000`                         | Origin fetch/re-fetch timeout (higher than the API timeout on purpose).                                                                                                                                                                                                                                                                                                                    |
+| `ssmParameterName`          | `/enhancely/connector/api-key` | Only used when `apiKey` is absent.                                                                                                                                                                                                                                                                                                                                                         |
+| `ssmRegion`                 | `us-east-1`                    | Region of the SSM parameter.                                                                                                                                                                                                                                                                                                                                                               |
+| `ssmTimeoutMs`              | `2000`                         | Bound on the SSM `GetParameter` call (fail-open on expiry).                                                                                                                                                                                                                                                                                                                                |
+| `excludePaths`              | `[]`                           | Paths skipped before config/API work; CloudFront-style `*`/`?`.                                                                                                                                                                                                                                                                                                                            |
+| `assertedDefaultTtlSeconds` | `0` (off)                      | Asserted minimum DefaultTTL used to cap lifetime-less retries.                                                                                                                                                                                                                                                                                                                             |
+| `nonPageMemoTtlMs`          | `1800000` (30 min)             | How long origin-request remembers a hard veto, so repeats skip its classification fetch. Independent of the JSON-LD cache TTL.                                                                                                                                                                                                                                                             |
+| `capSetCookieResponses`     | `false`                        | Pair-wide assertion for the origin-request injector's generated fallback and companion, also honored by standalone origin-response: cap `Set-Cookie` responses on credential-less requests. **Never** enable on an origin that mints session cookies for anonymous requests — replayed `Set-Cookie` via downstream caches is the session-fixation pattern. TF: `cap_set_cookie_responses`. |
+
+All three baked timeout fields form one atomic safety set. The manual Lambda
+commands below deliberately use a 10-second function timeout; baked overrides
+are accepted only when `timeoutMs + originTimeoutMs + ssmTimeoutMs <= 8000`.
+If that total is larger, all three overrides are ignored together and the safe
+`800 + 2000 + 2000` ms defaults are used, preserving at least two seconds for
+cold start, abort/socket settlement, and returning the fail-open response. The
+Terraform module is stricter at plan time:
+`timeout_ms + origin_timeout_ms <= 6000`, with its fixed 2000 ms SSM reserve.
 
 ### Key source trade-offs
 
@@ -337,9 +389,11 @@ to the browser (non-negotiable rule #1 of this repo).
 
 ## Limits (Lambda@Edge realities)
 
-- **1 MB generated response — headers AND body together** — for
-  origin-response triggers; exceeding it makes CloudFront answer the viewer
-  with a **502**, not the original page. The adapter accounts for the quota
+- **1 MB generated response — headers AND body together** — for Lambda@Edge
+  replacements generated by either injector trigger; exceeding it would make
+  CloudFront answer the viewer with a **502**, not the original page. Both
+  adapters account for the quota and fail open before returning an oversized
+  replacement. The standalone origin-response adapter does so
   in two stages:
   1. The origin **download** is capped at a conservative `1 MB − 33 KB`
      (1,014,784 bytes = 1 MB minus CloudFront's 32,768-byte header maximum
@@ -370,9 +424,16 @@ to the browser (non-negotiable rule #1 of this repo).
   `http-equiv` form inside the browser's 1024-byte prescan window. Other
   ambiguous charset-less pages pass through. Generated HTML is always advertised explicitly as
   `text/html; charset=utf-8`, so Unicode JSON-LD cannot be mislabeled.
-- **Per-request responses pass through**: `Set-Cookie` on the response, or
-  `Cache-Control: private`/`no-store`, marks a representation that a
-  re-fetch cannot faithfully reproduce — no injection there.
+- **Standalone origin-response only — per-request responses pass through**:
+  `Set-Cookie` on the response, or `Cache-Control: private`/`no-store`, marks a
+  representation that a re-fetch cannot faithfully reproduce. The recommended
+  origin-request injector uses its single fetched representation and therefore
+  does inject these pages.
+- **Every Lambda entrypoint honors transformation/disposition policy**:
+  `Cache-Control: no-transform` and `Content-Disposition: attachment` veto
+  lookup, registration, injection, and retry-cache rewriting. A small response
+  already fetched by origin-request is returned safely without an Enhancely
+  call; otherwise the original CloudFront path remains untouched.
 - **Custom origins only**: S3 REST origins are not re-fetchable this way —
   attach this function to behaviors backed by a custom (HTTP) origin.
 - `Content-Length` is **deleted** from the modified response — it described
@@ -465,45 +526,66 @@ aws iam put-role-policy --role-name enhancely-lambda-edge --policy-name ssm-read
 (SecureString with a customer-managed KMS key additionally needs
 `kms:Decrypt` on that key.)
 
-### 3. Create + publish (Lambda@Edge triggers need a PUBLISHED VERSION, never `$LATEST`)
+### 3. Create + publish the recommended pair
+
+Lambda@Edge associations require published versions, never `$LATEST`. The
+manual equivalent of the Terraform module's default is **two functions** with
+the same config: the origin-request injector and the non-injecting companion.
+Each standalone release zip contains its entrypoint as `index.js`, so both use
+`index.handler`:
 
 ```bash
 aws lambda create-function --region us-east-1 \
   --function-name enhancely-injector \
-  --runtime nodejs20.x \
+  --runtime nodejs22.x \
   --handler index.handler \
   --role arn:aws:iam::<ACCOUNT>:role/enhancely-lambda-edge \
   --timeout 10 --memory-size 256 \
-  --zip-file fileb://dist/lambda-origin-request.zip   # origin-response: dist/lambda.zip
+  --zip-file fileb://dist/lambda-origin-request.zip
+
+aws lambda create-function --region us-east-1 \
+  --function-name enhancely-injector-companion \
+  --runtime nodejs22.x \
+  --handler index.handler \
+  --role arn:aws:iam::<ACCOUNT>:role/enhancely-lambda-edge \
+  --timeout 10 --memory-size 256 \
+  --zip-file fileb://dist/lambda-companion.zip
 
 aws lambda publish-version --region us-east-1 \
   --function-name enhancely-injector
-# note the returned Version → ARN like …:function:enhancely-injector:1
+aws lambda publish-version --region us-east-1 \
+  --function-name enhancely-injector-companion
+# Note both returned version ARNs for step 4.
 ```
 
-Redeploys: `aws lambda update-function-code … --zip-file fileb://dist/lambda-origin-request.zip   # origin-response: dist/lambda.zip`
-followed by a fresh `publish-version` and step 4 with the new version ARN.
+For explicit standalone compatibility mode, create only one function from
+`dist/lambda.zip` and associate it with `origin-response`. That artifact is the
+full re-fetching injector and must never be paired with the origin-request
+injector. The companion zip is the only supported origin-response partner.
 
-### 4. Attach to the CloudFront behavior (origin-response)
+On redeploy, update and publish **both** default-pair functions, then replace
+both version ARNs in step 4.
+
+### 4. Attach both functions to the same CloudFront behavior
 
 ```bash
 aws cloudfront get-distribution-config --id <DIST_ID> > dist-config.json
-# In DistributionConfig.DefaultCacheBehavior (or the relevant CacheBehavior).
-# EventType must match the artifact you deployed:
-#   lambda-origin-request.zip → "origin-request"   (recommended)
-#   lambda.zip                → "origin-response"
+# In DistributionConfig.DefaultCacheBehavior (or the relevant CacheBehavior):
 #   "LambdaFunctionAssociations": {
-#     "Quantity": 1,
-#     "Items": [{
-#       "LambdaFunctionARN": "arn:aws:lambda:us-east-1:<ACCOUNT>:function:enhancely-injector:<VERSION>",
-#       "EventType": "origin-request",
-#       "IncludeBody": false
-#     }]
+#     "Quantity": 2,
+#     "Items": [
+#       {
+#         "LambdaFunctionARN": "arn:aws:lambda:us-east-1:<ACCOUNT>:function:enhancely-injector:<VERSION>",
+#         "EventType": "origin-request",
+#         "IncludeBody": false
+#       },
+#       {
+#         "LambdaFunctionARN": "arn:aws:lambda:us-east-1:<ACCOUNT>:function:enhancely-injector-companion:<VERSION>",
+#         "EventType": "origin-response",
+#         "IncludeBody": false
+#       }
+#     ]
 #   }
-#
-# Do NOT associate both triggers with the same behavior using these artifacts:
-# origin-request already generates the final response, and the origin-response
-# adapter would then re-fetch it a second time.
 aws cloudfront update-distribution --id <DIST_ID> \
   --if-match <ETag-from-get> \
   --distribution-config file://dist-config.updated.json
@@ -511,7 +593,7 @@ aws cloudfront update-distribution --id <DIST_ID> \
 
 Recommended alongside: an origin request policy that forwards the viewer
 `Host` header, and a cache policy with a non-trivial TTL for HTML (so the
-injected page is actually cached and the re-fetch stays a cache-miss cost).
+injected page is actually cached and origin work stays a cache-miss cost).
 
 Verify:
 
@@ -542,6 +624,7 @@ coverage includes the exact generated-size boundaries (origin-fetch cap,
 independent 32 KB header cap, header-aware body budget, injection pushing one
 byte over), CSP/cache-metadata stability, Unicode JSON-LD on genuinely ASCII
 source HTML, ambiguous charset gates, origin connection errors and re-fetch
-timeouts, redirects, Set-Cookie / private / no-store gates, credential-safe
+timeouts, redirects, `no-transform` / attachment / Set-Cookie / private /
+no-store gates, credential-safe
 retry policies, Enhancely 404/rate-limit/network errors, and the missing-key
 pass-through/cooldown.

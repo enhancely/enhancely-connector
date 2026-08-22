@@ -27,6 +27,23 @@ export function kvExpirationTtlSeconds(cacheTtlMs: number): number {
 }
 
 /**
+ * Keep a negative entry at least until its retry deadline. Register responses
+ * may carry day-scale 403/429 backoffs; expiring KV after the normal 2× stale
+ * window would forget that deadline and resume POSTing too early.
+ */
+export function kvEntryExpirationTtlSeconds(
+  cacheTtlMs: number,
+  entry: CacheEntry,
+  now: number = Date.now()
+): number {
+  const retrySeconds =
+    entry.retryNotBefore === undefined
+      ? 0
+      : Math.max(0, Math.ceil((entry.retryNotBefore - now) / 1000));
+  return Math.max(kvExpirationTtlSeconds(cacheTtlMs), retrySeconds);
+}
+
+/**
  * Keys at or below this UTF-8 byte length are used verbatim. Workers KV caps
  * keys at 512 bytes; 400 leaves comfortable headroom while keeping the vast
  * majority of real-world URLs human-readable in the KV dashboard.
@@ -91,10 +108,33 @@ export class KVCacheBackend implements CacheBackend {
   async set(key: string, entry: CacheEntry): Promise<void> {
     try {
       await this.kv.put(await kvKeyFor(key), JSON.stringify(entry), {
-        expirationTtl: kvExpirationTtlSeconds(this.cacheTtlMs),
+        expirationTtl: kvEntryExpirationTtlSeconds(this.cacheTtlMs, entry),
       });
     } catch {
       // Fail-open: a lost cache write only costs a future API call.
     }
   }
+}
+
+/**
+ * Stable backend identity per Worker isolate, KV binding and TTL. Core
+ * singleflight/write serialization is keyed by the CacheBackend object; a new
+ * wrapper on every request would therefore defeat coalescing even though all
+ * wrappers address the same KV namespace.
+ */
+const backendMemo = new WeakMap<KVNamespaceLike, Map<number, KVCacheBackend>>();
+
+export function getKvCacheBackend(kv: KVNamespaceLike, cacheTtlMs: number): KVCacheBackend {
+  let byTtl = backendMemo.get(kv);
+  if (byTtl === undefined) {
+    byTtl = new Map();
+    backendMemo.set(kv, byTtl);
+  }
+
+  let backend = byTtl.get(cacheTtlMs);
+  if (backend === undefined) {
+    backend = new KVCacheBackend(kv, cacheTtlMs);
+    byTtl.set(cacheTtlMs, backend);
+  }
+  return backend;
 }

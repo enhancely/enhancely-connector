@@ -138,4 +138,5 @@ void test('utf-8 page gets the JSON-LD snippet injected before </head>', async (
   const html = res.body.toString('utf8');
   assert.equal(html, UTF8_HTML.replace('</head>', `${SNIPPET}</head>`));
   assert.equal(Number(res.headers['content-length']), res.body.byteLength);
+  assert.equal(res.headers['content-type'], 'text/html; charset=utf-8');
 });

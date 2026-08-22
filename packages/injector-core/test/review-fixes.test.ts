@@ -21,7 +21,6 @@ describe('injectIntoHead — raw-text elements (finding 1)', () => {
   it.each([
     ['style', '<head><style>.x{content:"</head>"}</style></head><body/>'],
     ['title', '<head><title>broken </head> title</title></head><body/>'],
-    ['textarea', '<head><textarea></head></textarea></head><body/>'],
     ['noscript', '<head><noscript></head></noscript></head><body/>'],
   ])('skips a literal </head> inside <%s>', (_tag, html) => {
     const out = injectIntoHead(html, SNIP);
@@ -29,6 +28,11 @@ describe('injectIntoHead — raw-text elements (finding 1)', () => {
     expect(out.slice(closer - SNIP.length, closer)).toBe(SNIP);
     // Exactly one insertion, placed before the REAL (last) closer.
     expect(out.split(SNIP)).toHaveLength(2);
+  });
+
+  it('fails open for <textarea>, which makes the parser leave the head', () => {
+    const html = '<head><textarea></head></textarea></head><body/>';
+    expect(injectIntoHead(html, SNIP)).toBe(html);
   });
 
   it('still injects before a plain </head>', () => {
@@ -136,7 +140,9 @@ describe('backoff memo race (finding 3)', () => {
 
     const snippet = await getJsonLdSnippet('https://ex.com/p', cache, config);
 
-    expect(snippet).toBeNull(); // our request saw a miss and failed
+    // The failing request observes and serves the concurrently stored positive
+    // entry instead of merely declining to overwrite it.
+    expect(snippet).toBe(buildScriptTag(fresh.jsonldRaw!, fresh.etag));
     expect(sets).toHaveLength(0); // but the fresh parallel entry survived
   });
 
@@ -248,6 +254,25 @@ describe('autoRegister (self-populating connector)', () => {
     expect(fetchImpl.mock.calls).toHaveLength(2); // 1 GET + 1 POST only
   });
 
+  it('keeps a ready record returned by the legacy follow-up POST', async () => {
+    const cache = new MemoryCache();
+    const raw = '{"@context":"https://schema.org","@type":"Article"}';
+    const fetchImpl = vi
+      .fn<Fetcher>()
+      .mockResolvedValueOnce(new Response('', { status: 404 }))
+      .mockResolvedValueOnce(new Response(raw, { status: 200, headers: { ETag: '"ready"' } }));
+    const config = defineConfig({ apiKey: 'k', autoRegister: true, fetchImpl });
+
+    const result = await getJsonLdLookup('https://ex.com/ready-race', cache, config);
+
+    expect(result.snippet).toContain(raw);
+    expect(await cache.get('https://ex.com/ready-race')).toMatchObject({
+      jsonldRaw: raw,
+      etag: '"ready"',
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it('does not POST when autoRegister is off (default)', async () => {
     const cache = new MemoryCache();
     const fetchImpl = vi.fn<Fetcher>(() => notFound());
@@ -262,7 +287,7 @@ describe('autoRegister (self-populating connector)', () => {
     expect(fetchImpl.mock.calls.filter(([, i]) => i.method === 'POST')).toHaveLength(0);
   });
 
-  it('stays fail-open when the registration POST rejects', async () => {
+  it('stays fail-open and records a retry memo when the one registration POST rejects', async () => {
     const cache = new MemoryCache();
     const fetchImpl = vi.fn<Fetcher>((_u, init) =>
       init.method === 'POST' ? Promise.reject(new Error('boom')) : notFound()
@@ -270,8 +295,11 @@ describe('autoRegister (self-populating connector)', () => {
     const config = defineConfig({ apiKey: 'k', autoRegister: true, fetchImpl });
     expect(await getJsonLdSnippet('https://ex.com/p', cache, config)).toBeNull();
     const entry = await cache.get('https://ex.com/p');
-    expect(entry?.jsonldRaw).toBeNull(); // negative entry still stored
-    expect(entry?.registrationPending).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls[0]?.[1].method).toBe('POST');
+    expect(entry?.jsonldRaw).toBeNull();
+    expect(entry?.retryNotBefore).toBeGreaterThan(Date.now());
+    expect(entry?.registrationPending).toBeUndefined();
   });
 
   it('extends a stale pending revalidation delay through a temporary upstream backoff', async () => {

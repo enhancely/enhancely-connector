@@ -43,7 +43,9 @@ import type {
   CloudFrontResultResponse,
 } from 'aws-lambda';
 import {
+  __resetRateLimitCircuitForTests,
   getJsonLdLookup,
+  getJsonLdRegisterLookup,
   injectIntoHead,
   matchesExcludedPath,
   MemoryCache,
@@ -63,16 +65,14 @@ import {
   buildOriginUrl,
   buildPageUrl,
   cacheControlValue,
-  charsetOf,
   combinedHeaderValue,
-  containsOnlyAscii,
   customHeaderValue,
-  declaresUtf8MetaInPrescan,
   forwardedHeaders,
   GENERATED_HTML_CONTENT_TYPE,
   GENERATED_RESPONSE_SAFETY_MARGIN_BYTES,
-  hasUtf8Bom,
   headerValue,
+  INJECTED_MARKER_HEADER,
+  isUtf8SafeHtmlBytes,
   MAX_GENERATED_RESPONSE_BYTES,
   MAX_ORIGIN_BODY_BYTES,
   MAX_RESPONSE_HEADER_BYTES,
@@ -172,6 +172,7 @@ let cache = new MemoryCache();
 /** TEST-ONLY: fresh cache between tests. */
 export function __resetHandlerStateForTests(): void {
   cache = new MemoryCache();
+  __resetRateLimitCircuitForTests();
 }
 
 export const handler: CloudFrontResponseHandler = async (event) => {
@@ -193,6 +194,10 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       return response;
     }
 
+    // Pair-wide invariant: never add a second snippet to content another
+    // Enhancely integration (or an upstream connector) already marked.
+    if (response.headers[INJECTED_MARKER_HEADER] !== undefined) return response;
+
     // Cheap gate on what CloudFront already knows — no network work unless
     // this looks like an injectable HTML page.
     if (
@@ -203,6 +208,7 @@ export const handler: CloudFrontResponseHandler = async (event) => {
           contentType: headerValue(response.headers, 'content-type'),
           contentEncoding: headerValue(response.headers, 'content-encoding'),
           cacheControl: cacheControlValue(response.headers),
+          contentDisposition: combinedHeaderValue(response.headers, 'content-disposition'),
           hasSetCookie: response.headers['set-cookie'] !== undefined,
         },
         // Ignore the first response's content-encoding — we re-fetch identity.
@@ -259,10 +265,15 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
 
     // Ask Enhancely FIRST — this needs no page body (cache + ETag + API call
-    // only). Only when there is actually something to inject do we pay the
+    // only). With autoRegister, the register-or-revalidate POST discovers and
+    // reads in one round-trip; lookup-only mode remains a conditional GET.
+    // Only when there is actually something to inject do we pay the
     // origin re-fetch below. Pages with no JSON-LD yet (unregistered, 404,
-    // rate-limited, upstream error) therefore never double the origin load. A not-yet-configured key (no snippet) likewise costs zero extra origin hits.
-    const lookup = await getJsonLdLookup(pageUrl, cache, config);
+    // rate-limited, upstream error) therefore never double the origin load. A
+    // not-yet-configured key (no snippet) likewise costs zero extra origin hits.
+    const lookup = config.autoRegister
+      ? await getJsonLdRegisterLookup(pageUrl, cache, config)
+      : await getJsonLdLookup(pageUrl, cache, { ...config, autoRegister: false });
     if (lookup.snippet === null) {
       return lookup.revalidateInMs === null
         ? response
@@ -278,6 +289,7 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       originHost,
       getOriginTimeoutMs(),
       MAX_ORIGIN_BODY_BYTES,
+      MAX_RESPONSE_HEADER_BYTES,
       forwardedHeaders(request.headers)
     );
     // Over the conservative fetch cap — a body that large can never be
@@ -292,6 +304,7 @@ export const handler: CloudFrontResponseHandler = async (event) => {
         // bytes are not injectable HTML.
         contentEncoding: origin.contentEncoding,
         cacheControl: origin.cacheControl,
+        contentDisposition: origin.contentDisposition,
         hasSetCookie: origin.hasSetCookie,
       })
     ) {
@@ -348,39 +361,8 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       return response;
     }
 
+    if (!isUtf8SafeHtmlBytes(origin.body, origin.contentType ?? '')) return response;
     const originalHtml = origin.body.toString('utf8');
-    // Charset gate, part 2: a page may omit the charset parameter yet carry
-    // non-UTF-8 bytes (e.g. `<meta charset="iso-8859-1">` in the markup). A
-    // lossy utf8 decode replaces those bytes with U+FFFD, and CloudFront would
-    // CACHE the mojibake. Prove the decode was lossless before doing anything
-    // with it; otherwise pass through byte-identical.
-    if (!Buffer.from(originalHtml, 'utf8').equals(origin.body)) return response;
-    const originCharset = charsetOf(origin.contentType ?? '');
-    const asciiBody = containsOnlyAscii(origin.body);
-    // `ascii`/`us-ascii` are legacy web-encoding labels. Relabeling non-ASCII
-    // bytes as UTF-8 can change visible origin text even when those bytes form
-    // valid UTF-8, so only genuinely ASCII source bytes are safe.
-    if ((originCharset === 'ascii' || originCharset === 'us-ascii') && !asciiBody) {
-      return response;
-    }
-    // With no header charset, valid UTF-8 bytes are not proof of UTF-8 intent:
-    // browsers perform a context-sensitive HTML encoding prescan and might
-    // interpret the same bytes as windows-1252. Safe to relabel are ASCII
-    // bytes, an unambiguous UTF-8 BOM, or a meta tag in the prescan window
-    // that itself declares UTF-8 (then the browser decodes it as UTF-8 too,
-    // and the lossless-decode proof above already showed the bytes ARE valid
-    // UTF-8). Everything else stays ambiguous and passes through. In the
-    // field this matters for origins that send a bare `text/html` for German
-    // pages carrying umlauts plus `<meta charset="utf-8">`: before this
-    // prescan every such page silently failed open.
-    if (
-      originCharset === null &&
-      !asciiBody &&
-      !hasUtf8Bom(origin.body) &&
-      !declaresUtf8MetaInPrescan(origin.body)
-    ) {
-      return response;
-    }
     // We already hold the snippet — inject it directly. injectIntoHead returns
     // the HTML unchanged when there is no </head>, preserving fail-open.
     const injected = injectIntoHead(originalHtml, lookup.snippet);

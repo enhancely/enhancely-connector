@@ -4,6 +4,8 @@ import {
   MemoryCache,
   buildScriptTag,
   defineConfig,
+  getJsonLdLookup,
+  getJsonLdRegisterLookup,
   getJsonLdSnippet,
   handleHtml,
   normalizeLite,
@@ -127,12 +129,52 @@ describe('getJsonLdSnippet', () => {
     expect(await cache.get(key)).toMatchObject({ jsonldRaw: RAW_JSONLD });
   });
 
-  it('auto-registration (404) POSTs the QUERY-STRIPPED URL, not the raw request URL', async () => {
+  it.each([
+    ['relative', '/pricing?token=relative-secret'],
+    ['malformed', 'not a url?token=malformed-secret'],
+    ['non-http', 'mailto:person@example.com?token=mail-secret'],
+    ['credentials', 'https://person:password@example.com/pricing?token=query-secret'],
+    ['non-fixed normalization', 'https://example.com/pricing//?token=query-secret'],
+  ])('rejects a %s page URL locally without cache or network I/O', async (_label, rawUrl) => {
+    const cache = {
+      get: vi.fn(() => Promise.reject(new Error('must not read cache'))),
+      set: vi.fn(() => Promise.reject(new Error('must not write cache'))),
+    };
+    const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('must not fetch')));
+
+    expect(await getJsonLdSnippet(rawUrl, cache, makeConfig(fetchImpl))).toBeNull();
+    expect(cache.get).not.toHaveBeenCalled();
+    expect(cache.set).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['conditional GET', getJsonLdLookup],
+    ['register-or-revalidate', getJsonLdRegisterLookup],
+  ])('rejects an unstable URL before cache access in %s mode', async (_label, lookup) => {
+    const cache = {
+      get: vi.fn(() => Promise.reject(new Error('must not read cache'))),
+      set: vi.fn(() => Promise.reject(new Error('must not write cache'))),
+    };
+    const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('must not fetch')));
+    const result = await lookup(
+      'https://example.com/pricing//?token=secret',
+      cache,
+      makeConfig(fetchImpl)
+    );
+
+    expect(result).toEqual({ snippet: null, revalidateInMs: null });
+    expect(cache.get).not.toHaveBeenCalled();
+    expect(cache.set).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('auto-registration uses ONE POST with the QUERY-STRIPPED URL', async () => {
     const cache = new MemoryCache();
     const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
     const fetchImpl = vi.fn<Fetcher>((url, init) => {
       calls.push({ url, method: init.method, body: init.body });
-      return Promise.resolve(new Response('', { status: 404 }));
+      return Promise.resolve(new Response('', { status: 201 }));
     });
     const config = defineConfig({
       apiKey: 'sk-test-key',
@@ -147,12 +189,10 @@ describe('getJsonLdSnippet', () => {
     const key = normalizeLite(rawUrl);
     expect(key).toBe('https://example.com/pricing');
 
-    // GET carried the stripped URL…
-    const get = calls.find((c) => c.method !== 'POST');
-    expect(get?.url).toBe(`${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(key)}`);
-
-    // …and the registration POST body carried the stripped URL too (no token).
-    const post = calls.find((c) => c.method === 'POST');
+    // Register-or-revalidate replaces the old GET→404→POST pair.
+    expect(calls).toHaveLength(1);
+    const post = calls[0];
+    expect(post?.method).toBe('POST');
     expect(post?.url).toBe(`${config.enhancelyBase}/api/v1/jsonld`);
     expect(JSON.parse(String(post?.body))).toEqual({ url: key });
     expect(String(post?.body)).not.toContain('token');
@@ -307,6 +347,142 @@ describe('getJsonLdSnippet — retry backoff (429/error memo)', () => {
   });
 });
 
+describe('lookup single-flight and cross-mode races', () => {
+  function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  it('coalesces concurrent conditional GET misses for one cache and URL', async () => {
+    const response = deferred<Response>();
+    const fetchImpl = vi.fn<Fetcher>(() => response.promise);
+    const cache = new MemoryCache();
+    const config = makeConfig(fetchImpl);
+
+    const lookups = Array.from({ length: 16 }, () => getJsonLdSnippet(PAGE_URL, cache, config));
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    response.resolve(new Response(RAW_JSONLD, { status: 200, headers: { ETag: '"v1"' } }));
+
+    await expect(Promise.all(lookups)).resolves.toEqual(Array(16).fill(SNIPPET));
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('coalesces concurrent auto-registration into one register-or-revalidate POST', async () => {
+    const response = deferred<Response>();
+    const fetchImpl = vi.fn<Fetcher>(() => response.promise);
+    const cache = new MemoryCache();
+    const config = defineConfig({
+      apiKey: 'sk-test-key',
+      autoRegister: true,
+      cacheTtlMs: TTL_MS,
+      fetchImpl,
+    });
+
+    const lookups = Array.from({ length: 16 }, () => getJsonLdSnippet(PAGE_URL, cache, config));
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    expect(fetchImpl.mock.calls[0]?.[1].method).toBe('POST');
+    response.resolve(new Response('', { status: 201, headers: { 'Retry-After': '30' } }));
+
+    await expect(Promise.all(lookups)).resolves.toEqual(Array(16).fill(null));
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes a completed flight so a later uncached lookup can retry', async () => {
+    const cache = {
+      get: () => Promise.resolve(undefined),
+      set: () => Promise.resolve(),
+    };
+    const fetchImpl = vi.fn<Fetcher>(() =>
+      Promise.resolve(new Response('temporary', { status: 500 }))
+    );
+    const config = makeConfig(fetchImpl);
+
+    await getJsonLdSnippet(PAGE_URL, cache, config);
+    await getJsonLdSnippet(PAGE_URL, cache, config);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['negative-first', 'positive-first'] as const)(
+    'keeps the positive result across a concurrent GET/POST race (%s)',
+    async (order) => {
+      const getResponse = deferred<Response>();
+      const postResponse = deferred<Response>();
+      const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+        init.method === 'POST' ? postResponse.promise : getResponse.promise
+      );
+      const cache = new MemoryCache();
+      const config = makeConfig(fetchImpl);
+
+      const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+      const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+      if (order === 'negative-first') {
+        getResponse.resolve(new Response('', { status: 404 }));
+        await getLookup;
+        postResponse.resolve(new Response(RAW_JSONLD, { status: 200, headers: { ETag: '"v2"' } }));
+      } else {
+        postResponse.resolve(new Response(RAW_JSONLD, { status: 200, headers: { ETag: '"v2"' } }));
+        await postLookup;
+        getResponse.resolve(new Response('', { status: 404 }));
+      }
+
+      await Promise.all([getLookup, postLookup]);
+      expect(await cache.get(KEY)).toMatchObject({ jsonldRaw: RAW_JSONLD, etag: '"v2"' });
+    }
+  );
+
+  it('keeps a concurrent POST 200 when GET 404 commits read the same cache snapshot', async () => {
+    const getResponse = deferred<Response>();
+    const postResponse = deferred<Response>();
+    const releaseCommitReads = deferred<void>();
+    const fetchImpl = vi.fn<Fetcher>((_url, init) =>
+      init.method === 'POST' ? postResponse.promise : getResponse.promise
+    );
+
+    let stored: Awaited<ReturnType<MemoryCache['get']>>;
+    let delayReads = false;
+    let delayedReadCount = 0;
+    const cache = {
+      async get() {
+        const snapshot = stored;
+        if (delayReads) {
+          delayedReadCount += 1;
+          await releaseCommitReads.promise;
+        }
+        return snapshot;
+      },
+      async set(_key: string, entry: NonNullable<typeof stored>) {
+        stored = entry;
+      },
+    };
+    const config = makeConfig(fetchImpl);
+
+    const getLookup = getJsonLdLookup(PAGE_URL, cache, config);
+    const postLookup = getJsonLdRegisterLookup(PAGE_URL, cache, config);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+    // Both initial misses have completed. Hold later cache reads after taking
+    // their snapshot so the old non-atomic get-then-set implementation lets
+    // both commits observe `undefined` before either write is visible.
+    delayReads = true;
+    postResponse.resolve(new Response(RAW_JSONLD, { status: 200, headers: { ETag: '"v2"' } }));
+    await vi.waitFor(() => expect(delayedReadCount).toBe(1));
+    getResponse.resolve(new Response('', { status: 404 }));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    releaseCommitReads.resolve();
+
+    const [getResult, postResult] = await Promise.all([getLookup, postLookup]);
+    expect(getResult.snippet).toBe(SNIPPET_V2);
+    expect(postResult.snippet).toBe(SNIPPET_V2);
+    expect(stored).toMatchObject({ jsonldRaw: RAW_JSONLD, etag: '"v2"' });
+  });
+});
+
 describe('handleHtml', () => {
   it('passes non-HTML content types through untouched (no fetch)', async () => {
     const cache = new MemoryCache();
@@ -326,12 +502,12 @@ describe('handleHtml', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('passes non-2xx statuses through untouched', async () => {
+  it('passes every status other than exact 200 through untouched', async () => {
     const cache = new MemoryCache();
     const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('must not fetch')));
     const config = makeConfig(fetchImpl);
 
-    for (const status of [199, 301, 304, 404, 500]) {
+    for (const status of [199, 201, 204, 206, 299, 301, 304, 404, 500]) {
       const ctx = htmlCtx({ status });
       expect(await handleHtml(ctx, cache, config)).toBe(ctx.html);
     }
@@ -363,6 +539,18 @@ describe('handleHtml', () => {
     const ctx = htmlCtx({ html: '<body>headless page</body>' });
 
     expect(await handleHtml(ctx, cache, makeConfig(fetchImpl))).toBe(ctx.html);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('does not fetch when the only </head> is inert raw text', async () => {
+    const cache = new MemoryCache();
+    const fetchImpl = vi.fn<Fetcher>(() =>
+      Promise.resolve(new Response(RAW_JSONLD, { status: 200 }))
+    );
+    const ctx = htmlCtx({ html: '<head><iframe>template </head> without an end tag' });
+
+    expect(await handleHtml(ctx, cache, makeConfig(fetchImpl))).toBe(ctx.html);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('injects end-to-end: fetch → MemoryCache → snippet before </head>', async () => {

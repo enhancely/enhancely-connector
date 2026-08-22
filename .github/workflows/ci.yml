@@ -50,3 +50,29 @@ jobs:
 
       - name: Format check
         run: pnpm format:check
+
+  opentofu:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/modules/lambda-edge-injector
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.12.6
+          tofu_wrapper: false
+
+      - name: Format check
+        run: tofu fmt -check -recursive
+
+      - name: Initialize
+        run: tofu init -backend=false -input=false
+
+      - name: Validate
+        run: tofu validate -no-color
+
+      - name: Test
+        run: tofu test -no-color

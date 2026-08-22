@@ -3,13 +3,17 @@ import { shouldAttemptInjection } from '../src/gate.js';
 
 const okInput = {
   method: 'GET',
-  responseOk: true,
+  status: 200,
   contentType: 'text/html; charset=utf-8',
+  contentEncoding: null,
+  cacheControl: null,
+  contentDisposition: null,
+  xRobotsTag: null,
   apiKey: 'sk-test',
 };
 
 describe('shouldAttemptInjection', () => {
-  it('allows GET + 2xx + text/html + key', () => {
+  it('allows GET + exact 200 + text/html + key', () => {
     expect(shouldAttemptInjection(okInput)).toBe(true);
   });
 
@@ -29,14 +33,39 @@ describe('shouldAttemptInjection', () => {
     }
   });
 
-  it('rejects non-2xx origin responses', () => {
-    expect(shouldAttemptInjection({ ...okInput, responseOk: false })).toBe(false);
+  it('rejects every status other than 200', () => {
+    for (const status of [199, 201, 204, 206, 301, 404, 500]) {
+      expect(shouldAttemptInjection({ ...okInput, status })).toBe(false);
+    }
   });
 
   it('rejects non-HTML content types', () => {
     for (const contentType of ['application/json', 'text/plain', 'text/htmlx', null]) {
       expect(shouldAttemptInjection({ ...okInput, contentType })).toBe(false);
     }
+  });
+
+  it('rejects encoded, no-transform, and attachment responses before body work', () => {
+    expect(shouldAttemptInjection({ ...okInput, contentEncoding: 'gzip' })).toBe(false);
+    expect(shouldAttemptInjection({ ...okInput, cacheControl: 'public, no-transform' })).toBe(
+      false
+    );
+    expect(
+      shouldAttemptInjection({ ...okInput, contentDisposition: 'attachment; filename="page.html"' })
+    ).toBe(false);
+    expect(
+      shouldAttemptInjection({
+        ...okInput,
+        contentDisposition: 'inline, attachment; filename="page.html"',
+      })
+    ).toBe(false);
+  });
+
+  it('rejects noindex/none robots directives', () => {
+    for (const xRobotsTag of ['noindex', 'index, nofollow, none', 'googlebot: noindex']) {
+      expect(shouldAttemptInjection({ ...okInput, xRobotsTag })).toBe(false);
+    }
+    expect(shouldAttemptInjection({ ...okInput, xRobotsTag: 'index, follow' })).toBe(true);
   });
 
   it('rejects a missing or empty API key', () => {

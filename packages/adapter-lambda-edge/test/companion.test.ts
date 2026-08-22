@@ -1,8 +1,6 @@
 /**
- * Companion entrypoint tests: origin-response events with the Enhancely API
- * mocked via the core's `fetchImpl` config seam. The companion never fetches
- * the origin, so unlike the injector tests no local HTTP server is needed —
- * every upstream interaction is one Enhancely call at most.
+ * The paired origin-response companion is cache-cap-only. These tests make the
+ * request-economy invariant executable: no path can reach Enhancely.
  */
 import type { CloudFrontResponseEvent, CloudFrontResultResponse } from 'aws-lambda';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,54 +11,34 @@ import {
   __setConfigOverridesForTests,
 } from '../src/config.js';
 import type { BakedConnectorConfig } from '../src/config.js';
-import {
-  handler,
-  __resetCompanionStateForTests,
-  __resetUpstreamMemoForTests,
-} from '../src/companion.js';
+import { handler } from '../src/companion.js';
 import { makeEvent } from './fixtures.js';
 
-// Keep the no-key path hermetic (never walk the AWS credential chain).
+// Keep the missing-key path hermetic (never walk the AWS credential chain).
 vi.mock('@aws-sdk/client-ssm', () => {
   class SSMClient {}
   class GetParameterCommand {}
   return { SSMClient, GetParameterCommand };
 });
 
-const JSONLD_RAW = '{"@context":"https://schema.org","@type":"Article","headline":"Hi"}';
-const STILL_PROCESSING = JSON.stringify({
-  type: 'https://enhancely.ai/problems/still-processing',
-  status: 202,
-});
-const TTL_MS = 60_000;
+let enhancelyFetch: ReturnType<typeof vi.fn>;
 
-type MockCall = { url: string; init: RequestInit };
-let calls: MockCall[];
-
-function setUp(
-  baked: Partial<BakedConnectorConfig>,
-  responses: Array<() => Response | Promise<Response>>
-): void {
-  calls = [];
-  let index = 0;
-  const fetchImpl = (url: string, init: RequestInit): Promise<Response> => {
-    calls.push({ url, init });
-    const next = responses[Math.min(index++, responses.length - 1)];
-    if (next === undefined) throw new Error('mock exhausted');
-    return Promise.resolve(next());
-  };
+function setUp(baked: Partial<BakedConnectorConfig> = {}): void {
+  enhancelyFetch = vi.fn(async () => {
+    throw new Error('the cache-cap-only companion must never call Enhancely');
+  });
   __setBakedConfigForTests({
     apiKey: 'sk-test-key',
-    cacheTtlMs: TTL_MS,
+    cacheTtlMs: 60_000,
+    nonPageMemoTtlMs: 60_000,
     autoRegister: true,
     ...baked,
   });
-  __setConfigOverridesForTests({ fetchImpl });
+  __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
 }
 
 async function invokeCompanion(event: CloudFrontResponseEvent): Promise<CloudFrontResultResponse> {
-  const result = await handler(event);
-  return result as CloudFrontResultResponse;
+  return (await handler(event)) as CloudFrontResultResponse;
 }
 
 function cacheControlOf(result: CloudFrontResultResponse): string | undefined {
@@ -68,75 +46,123 @@ function cacheControlOf(result: CloudFrontResultResponse): string | undefined {
 }
 
 beforeEach(() => {
-  __resetCompanionStateForTests();
-  __resetUpstreamMemoForTests();
+  __resetAdapterConfigForTests();
+  setUp();
 });
+
 afterEach(() => {
   __resetAdapterConfigForTests();
 });
 
-describe('companion — registration via the single register-or-revalidate POST', () => {
-  it('registers an unknown HTML page with ONE POST carrying the page URL', async () => {
-    setUp({}, [() => new Response('processing', { status: 201 })]);
-    await invokeCompanion(makeEvent({ uri: '/pricing' }));
+describe('companion — zero Enhancely calls', () => {
+  it('caps eligible handback HTML without any Enhancely lookup or registration', async () => {
+    const result = await invokeCompanion(
+      makeEvent({
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'max-age=3600',
+        },
+      })
+    );
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.url).toBe('https://app.enhancely.ai/api/v1/jsonld');
-    expect(calls[0]?.init.method).toBe('POST');
-    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({
-      url: 'https://www.example.com/pricing',
-    });
-    const headers = calls[0]?.init.headers as Record<string, string>;
-    expect(headers['Accept']).toBe('application/ld+json');
+    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=60, must-revalidate');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 
-  it('suppresses repeat POSTs for the same URL within the pending window', async () => {
-    setUp({}, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '300' } }),
-    ]);
-    await invokeCompanion(makeEvent({ uri: '/pricing' }));
-    await invokeCompanion(makeEvent({ uri: '/pricing' }));
-    expect(calls).toHaveLength(1);
-  });
-
-  it('REGISTERS a Set-Cookie response (the injector injects those pages)', async () => {
-    setUp({}, [() => new Response('processing', { status: 201 })]);
+  it('ignores autoRegister because this trigger can never prove body injectability', async () => {
+    setUp({ autoRegister: false });
     await invokeCompanion(
       makeEvent({
         responseHeaders: {
           'content-type': 'text/html; charset=utf-8',
-          'set-cookie': 'AWSALB=abc; Path=/',
+          'cache-control': 'max-age=3600',
         },
       })
     );
-    expect(calls).toHaveLength(1);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 
-  it('registers even when the CloudFront copy is compressed (encoding ignored)', async () => {
-    setUp({}, [() => new Response('processing', { status: 201 })]);
-    await invokeCompanion(
-      makeEvent({
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          'content-encoding': 'br',
-        },
-      })
-    );
-    expect(calls).toHaveLength(1);
-  });
+  it('uses only the local config-retry cap when the API key is unavailable', async () => {
+    __resetAdapterConfigForTests();
+    setUp({ apiKey: 'not-a-valid-key', assertedDefaultTtlSeconds: 3600 });
 
-  it('uses the conditional GET instead when autoRegister is off (cap-only mode)', async () => {
-    setUp({ autoRegister: false }, [() => new Response('not found', { status: 404 })]);
-    await invokeCompanion(makeEvent({ uri: '/pricing' }));
+    const result = await invokeCompanion(makeEvent());
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.init.method).toBe('GET');
-    expect(calls[0]?.url).toContain('/api/v1/jsonld/');
-    // 404 on the GET path with autoRegister disabled → no follow-up POST.
+    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=30, must-revalidate');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 });
 
-describe('companion — gates (no Enhancely call, response untouched)', () => {
+describe('companion — cache-lifetime capping', () => {
+  it('caps a lifetime-less pass-through only under the operator assertion', async () => {
+    setUp({ assertedDefaultTtlSeconds: 86_400 });
+    const result = await invokeCompanion(makeEvent());
+    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=60, must-revalidate');
+  });
+
+  it('does not create cacheability without an explicit lifetime or assertion', async () => {
+    const event = makeEvent();
+    const result = await invokeCompanion(event);
+    expect(result).toBe(event.Records[0]?.cf.response);
+  });
+
+  it('preserves an already shorter explicit origin lifetime', async () => {
+    const result = await invokeCompanion(
+      makeEvent({
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'max-age=15',
+        },
+      })
+    );
+    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=15, must-revalidate');
+  });
+
+  it('does not cap Set-Cookie unless the operator explicitly allows it', async () => {
+    setUp({ assertedDefaultTtlSeconds: 86_400 });
+    const event = makeEvent({
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'set-cookie': 'session=abc; Path=/',
+      },
+    });
+    expect(await invokeCompanion(event)).toBe(event.Records[0]?.cf.response);
+
+    __resetAdapterConfigForTests();
+    setUp({ assertedDefaultTtlSeconds: 86_400, capSetCookieResponses: true });
+    const capped = await invokeCompanion(event);
+    expect(cacheControlOf(capped)).toBe('max-age=0, s-maxage=60, must-revalidate');
+  });
+
+  it.each([
+    ['request Cookie', { requestHeaders: { cookie: 'session=abc' } }],
+    ['request Authorization', { requestHeaders: { authorization: 'Bearer test' } }],
+    [
+      'private response',
+      {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'private, max-age=3600',
+        },
+      },
+    ],
+    [
+      'no-store response',
+      {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store, max-age=3600',
+        },
+      },
+    ],
+  ])('does not rewrite %s', async (_name, options) => {
+    const event = makeEvent(options);
+    const result = await invokeCompanion(event);
+    expect(result).toBe(event.Records[0]?.cf.response);
+  });
+});
+
+describe('companion — permanent gates stay untouched', () => {
   const gateCases: Array<[string, Parameters<typeof makeEvent>[0]]> = [
     ['non-GET', { method: 'POST' }],
     ['non-200', { status: '404' }],
@@ -151,31 +177,48 @@ describe('companion — gates (no Enhancely call, response untouched)', () => {
         },
       },
     ],
+    [
+      'no-transform',
+      {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'public, max-age=3600, no-transform',
+        },
+      },
+    ],
+    [
+      'attachment',
+      {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'content-disposition': 'attachment; filename="page.html"',
+        },
+      },
+    ],
+    ['known non-HTML extension', { uri: '/bundle.css' }],
+    ['Range request', { requestHeaders: { range: 'bytes=0-99' } }],
     ['no custom origin', { noCustomOrigin: true }],
     ['path escape', { uri: '/../secret', originPath: '/de' }],
-    ['missing host', { host: null, originDomain: '' }],
   ];
 
   for (const [name, options] of gateCases) {
-    it(`${name} → no call, byte-identical pass-through`, async () => {
-      setUp({}, [() => new Response('never', { status: 500 })]);
+    it(`${name} → untouched and no Enhancely call`, async () => {
       const event = makeEvent(options);
       const result = await invokeCompanion(event);
-      expect(calls).toHaveLength(0);
       expect(result).toBe(event.Records[0]?.cf.response);
+      expect(enhancelyFetch).not.toHaveBeenCalled();
     });
   }
 
-  it('excluded path → no call, untouched (checked before config work)', async () => {
-    setUp({ excludePaths: ['/private/*'] }, [() => new Response('never', { status: 500 })]);
+  it('excluded path is checked before config work', async () => {
+    setUp({ excludePaths: ['/private/*'] });
     const event = makeEvent({ uri: '/private/page' });
     const result = await invokeCompanion(event);
-    expect(calls).toHaveLength(0);
     expect(result).toBe(event.Records[0]?.cf.response);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 
-  it('tripwire: X-Enhancely-Injected on the response → abstain entirely', async () => {
-    setUp({}, [() => new Response('never', { status: 500 })]);
+  it('an injected marker is a never-touch invariant', async () => {
     const event = makeEvent({
       responseHeaders: {
         'content-type': 'text/html; charset=utf-8',
@@ -183,205 +226,23 @@ describe('companion — gates (no Enhancely call, response untouched)', () => {
       },
     });
     const result = await invokeCompanion(event);
-    expect(calls).toHaveLength(0);
     expect(result).toBe(event.Records[0]?.cf.response);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 });
 
-describe('companion — cache-lifetime capping', () => {
-  it('caps a lifetime-less pass-through under the operator assertion', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const result = await invokeCompanion(makeEvent());
-    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=45, must-revalidate');
+describe('companion — fail-open', () => {
+  it('returns undefined for a malformed event without records', async () => {
+    await expect(handler({ Records: [] } as unknown as CloudFrontResponseEvent)).resolves.toBe(
+      undefined
+    );
   });
 
-  it('never caps without the assertion when the origin declared no lifetime', async () => {
-    setUp({}, [() => new Response('processing', { status: 201 })]);
+  it('returns the original response if an unexpected error occurs', async () => {
     const event = makeEvent();
-    const result = await invokeCompanion(event);
-    expect(result).toBe(event.Records[0]?.cf.response);
-  });
-
-  it('shortens an explicit origin lifetime without any assertion', async () => {
-    setUp({}, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const result = await invokeCompanion(
-      makeEvent({
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          'cache-control': 'max-age=3600',
-        },
-      })
-    );
-    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=45, must-revalidate');
-  });
-
-  it('invalid Expires (e.g. "0") means already-stale: capped to s-maxage=0, never freshened', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const result = await invokeCompanion(
-      makeEvent({
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          expires: '0',
-        },
-      })
-    );
-    // RFC 9111: invalid Expires = expired. The assertion path must not turn
-    // that into 45 s of shared freshness.
-    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=0, must-revalidate');
-  });
-
-  it('Set-Cookie response: registered but NOT capped without the flag', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const result = await invokeCompanion(
-      makeEvent({
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          'set-cookie': 'AWSALB=abc; Path=/',
-        },
-      })
-    );
-    expect(calls).toHaveLength(1); // registered …
-    expect(cacheControlOf(result)).toBeUndefined(); // … but not rewritten
-  });
-
-  it('Set-Cookie response IS capped under capSetCookieResponses', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400, capSetCookieResponses: true }, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const result = await invokeCompanion(
-      makeEvent({
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          'set-cookie': 'AWSALB=abc; Path=/',
-        },
-      })
-    );
-    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=45, must-revalidate');
-    // The rewrite keeps the Set-Cookie itself untouched.
-    expect(result.headers?.['set-cookie']?.[0]?.value).toBe('AWSALB=abc; Path=/');
-  });
-
-  it('private/no-store responses are never capped, flag or not', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400, capSetCookieResponses: true }, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const event = makeEvent({
-      responseHeaders: {
-        'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store',
-      },
-    });
-    const result = await invokeCompanion(event);
-    expect(calls).toHaveLength(1); // still registered
-    expect(result).toBe(event.Records[0]?.cf.response); // never rewritten
-  });
-
-  it('requests carrying credentials are registered but never capped', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400, capSetCookieResponses: true }, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const event = makeEvent({ requestHeaders: { authorization: 'Basic abc' } });
-    const result = await invokeCompanion(event);
-    expect(calls).toHaveLength(1);
-    expect(result).toBe(event.Records[0]?.cf.response);
-  });
-
-  it('strips validators when capping so a 304 cannot re-pin the uninjected body', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => new Response('processing', { status: 201, headers: { 'Retry-After': '45' } }),
-    ]);
-    const result = await invokeCompanion(
-      makeEvent({
-        responseHeaders: {
-          'content-type': 'text/html; charset=utf-8',
-          etag: '"origin-etag"',
-          'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT',
-        },
-      })
-    );
-    expect(result.headers?.['etag']).toBeUndefined();
-    expect(result.headers?.['last-modified']).toBeUndefined();
-  });
-});
-
-describe('companion — ready-record skew and cache filling', () => {
-  it('caps an uninjected response although the record is ready (skew outcome)', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => new Response(JSONLD_RAW, { status: 200, headers: { ETag: '"v1"' } }),
-    ]);
-    const result = await invokeCompanion(makeEvent());
-    // revalidate = cacheTtlMs → s-maxage = 60 (TTL_MS / 1000).
-    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=60, must-revalidate');
-  });
-
-  it('the fetched snippet fills the cache: the second event needs no call', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => new Response(JSONLD_RAW, { status: 200, headers: { ETag: '"v1"' } }),
-    ]);
-    await invokeCompanion(makeEvent());
-    await invokeCompanion(makeEvent());
-    expect(calls).toHaveLength(1);
-  });
-});
-
-describe('companion — resilience', () => {
-  it('202 Problem-JSON is never mistaken for content', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => new Response(STILL_PROCESSING, { status: 202, headers: { 'Retry-After': '30' } }),
-    ]);
-    const result = await invokeCompanion(makeEvent());
-    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=30, must-revalidate');
-  });
-
-  it('a rejecting Enhancely call fails open (capped by the error backoff)', async () => {
-    setUp({ assertedDefaultTtlSeconds: 86_400 }, [
-      () => {
-        throw new TypeError('network down');
-      },
-    ]);
-    const result = await invokeCompanion(makeEvent());
-    // Core error backoff = 10 s.
-    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=10, must-revalidate');
-  });
-
-  it('a lookup that consumes the whole budget opens the global upstream memo', async () => {
-    setUp({ timeoutMs: 20, assertedDefaultTtlSeconds: 86_400 }, [
-      () =>
-        new Promise<Response>((resolve) =>
-          setTimeout(() => resolve(new Response('slow', { status: 500 })), 30)
-        ),
-    ]);
-    await invokeCompanion(makeEvent({ uri: '/first' }));
-    expect(calls).toHaveLength(1);
-
-    // Different URL, same environment: parked — no upstream call, still capped.
-    const second = await invokeCompanion(makeEvent({ uri: '/second' }));
-    expect(calls).toHaveLength(1);
-    const capValue = cacheControlOf(second);
-    expect(capValue).toMatch(/^max-age=0, s-maxage=(\d+), must-revalidate$/);
-    const sMaxage = Number(/s-maxage=(\d+)/.exec(capValue ?? '')?.[1]);
-    expect(sMaxage).toBeGreaterThanOrEqual(1);
-    expect(sMaxage).toBeLessThanOrEqual(10);
-  });
-
-  it('a thrown error inside the handler fails open to the original response', async () => {
-    setUp({}, [() => new Response('processing', { status: 201 })]);
-    const event = makeEvent();
-    // Sabotage: a response object whose headers getter throws.
-    Object.defineProperty(event.Records[0]?.cf.response, 'headers', {
-      get() {
-        throw new Error('boom');
-      },
-    });
-    const result = await handler(event);
-    expect(result).toBe(event.Records[0]?.cf.response);
+    const response = event.Records[0]?.cf.response;
+    if (response === undefined) throw new Error('fixture missing response');
+    response.headers = null as never;
+    await expect(handler(event)).resolves.toBe(response);
   });
 });

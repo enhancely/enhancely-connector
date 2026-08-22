@@ -17,6 +17,7 @@ function attempt(overrides: Partial<AttemptInput> = {}): AttemptInput {
     contentType: 'text/html; charset=utf-8',
     contentEncoding: null,
     cacheControl: null,
+    contentDisposition: null,
     hasSetCookie: false,
     ...overrides,
   };
@@ -107,6 +108,16 @@ describe('shouldAttempt', () => {
       expect(shouldAttempt(attempt({ cacheControl }))).toBe(true);
     }
   );
+
+  it('rejects no-transform and attachment representations', () => {
+    expect(shouldAttempt(attempt({ cacheControl: 'public, no-transform' }))).toBe(false);
+    expect(shouldAttempt(attempt({ contentDisposition: 'attachment; filename="page.html"' }))).toBe(
+      false
+    );
+    expect(
+      shouldAttempt(attempt({ contentDisposition: 'inline, attachment; filename="page.html"' }))
+    ).toBe(false);
+  });
 });
 
 describe('charsetOf', () => {
@@ -148,7 +159,9 @@ describe('forwardedHeaders', () => {
       cfHeaders({
         host: 'www.example.com',
         'accept-encoding': 'gzip, br',
-        connection: 'keep-alive',
+        connection: 'keep-alive, x-connection-local',
+        'x-connection-local': 'must-not-forward',
+        'proxy-connection': 'keep-alive',
         'keep-alive': 'timeout=5',
         'proxy-authenticate': 'Basic',
         'proxy-authorization': 'Basic Zm9v',

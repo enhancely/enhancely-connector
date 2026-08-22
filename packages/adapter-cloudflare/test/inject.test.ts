@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   injectSnippetBuffered,
+  MAX_HTML_BYTES,
   type RewriterElementLike,
   type RewriterLike,
 } from '../src/inject.js';
@@ -131,6 +132,60 @@ describe('injectSnippetBuffered', () => {
     await expect(result.text()).resolves.toBe(headless);
   });
 
+  it('does not resolve the snippet provider until a real head slot was buffered', async () => {
+    const provider = vi.fn(async () => SNIPPET);
+    const headless = '<html><body>no head here</body></html>';
+
+    const result = await injectSnippetBuffered(
+      htmlResponse(headless),
+      provider,
+      () => new FakeRewriter()
+    );
+
+    expect(provider).not.toHaveBeenCalled();
+    await expect(result.text()).resolves.toBe(headless);
+  });
+
+  it.each([
+    '<svg><head></head></svg>',
+    '<math><head></head></math>',
+    '<html><body><head></head></body></html>',
+    '<html><body><template><head></head></template></body></html>',
+  ])('does not treat a foreign/inert lexical head as injectable: %s', async (document) => {
+    const provider = vi.fn(async () => SNIPPET);
+    const createRewriter = vi.fn(() => new FakeRewriter());
+
+    const result = await injectSnippetBuffered(htmlResponse(document), provider, createRewriter);
+
+    expect(provider).not.toHaveBeenCalled();
+    expect(createRewriter).not.toHaveBeenCalled();
+    await expect(result.text()).resolves.toBe(document);
+  });
+
+  it('does not resolve the snippet provider when rewriting fails mid-stream', async () => {
+    const provider = vi.fn(async () => SNIPPET);
+    const result = await injectSnippetBuffered(
+      htmlResponse(HTML),
+      provider,
+      () => new MidStreamErrorRewriter()
+    );
+
+    expect(provider).not.toHaveBeenCalled();
+    await expect(result.text()).resolves.toBe(HTML);
+  });
+
+  it('resolves the snippet provider once after successful head preflight', async () => {
+    const provider = vi.fn(async () => SNIPPET);
+    const result = await injectSnippetBuffered(
+      htmlResponse(HTML),
+      provider,
+      () => new FakeRewriter()
+    );
+
+    expect(provider).toHaveBeenCalledTimes(1);
+    await expect(result.text()).resolves.toContain(SNIPPET);
+  });
+
   it('drops the stale content-length header on the rewritten response', async () => {
     const result = await injectSnippetBuffered(
       htmlResponse(HTML, { 'content-length': String(HTML.length), 'x-custom': 'kept' }),
@@ -143,5 +198,54 @@ describe('injectSnippetBuffered', () => {
     expect(result.headers.get('content-length')).not.toBe(String(HTML.length));
     expect(result.headers.get('x-custom')).toBe('kept');
     await expect(result.text()).resolves.toContain(SNIPPET);
+  });
+
+  it('does not call the provider for a declared legacy charset', async () => {
+    const provider = vi.fn(async () => SNIPPET);
+    const response = new Response(new Uint8Array([0x3c, 0x68, 0x65, 0x61, 0x64, 0x3e]), {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=windows-1252' },
+    });
+
+    const result = await injectSnippetBuffered(response, provider, () => new FakeRewriter());
+
+    expect(provider).not.toHaveBeenCalled();
+    expect(result.headers.get('content-type')).toBe('text/html; charset=windows-1252');
+  });
+
+  it('does not call the provider when a chunked body exceeds the hard byte cap', async () => {
+    const provider = vi.fn(async () => SNIPPET);
+    const chunk = new Uint8Array(MAX_HTML_BYTES + 1).fill(0x61);
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }
+    );
+
+    const result = await injectSnippetBuffered(response, provider, () => new FakeRewriter());
+
+    expect(provider).not.toHaveBeenCalled();
+    expect((await result.arrayBuffer()).byteLength).toBe(MAX_HTML_BYTES + 1);
+  });
+
+  it('removes validators/ranges and declares UTF-8 after injection', async () => {
+    const result = await injectSnippetBuffered(
+      htmlResponse(HTML, {
+        etag: '"origin"',
+        'last-modified': 'Sat, 22 Aug 2026 00:00:00 GMT',
+        'accept-ranges': 'bytes',
+      }),
+      SNIPPET,
+      () => new FakeRewriter()
+    );
+
+    expect(result.headers.get('etag')).toBeNull();
+    expect(result.headers.get('last-modified')).toBeNull();
+    expect(result.headers.get('accept-ranges')).toBeNull();
+    expect(result.headers.get('content-type')).toBe('text/html; charset=utf-8');
   });
 });

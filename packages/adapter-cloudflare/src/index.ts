@@ -3,12 +3,11 @@
  *
  * Flow per request:
  *   1. Pass the request through to the origin unchanged.
- *   2. Gate: GET + 2xx + text/html + API key configured — else return as-is.
- *   3. Ask injector-core for the page's JSON-LD snippet (cache + ETag + timeout
- *      + fail-open all live in the core).
- *   4. Append the snippet as the last child of <head> via HTMLRewriter,
- *      fully buffered (see src/inject.ts) so a mid-stream rewrite error can
- *      never truncate the body on the wire.
+ *   2. Gate: GET + exact 200 + text/html + API key configured — else return.
+ *   3. Parse and fully buffer through HTMLRewriter to prove a real <head>
+ *      insertion slot (see src/inject.ts).
+ *   4. Only then ask injector-core for JSON-LD and replace that slot. Cache,
+ *      ETag, timeout and fail-open behavior all live in the core.
  *
  * Fail-open invariant: everything after the origin fetch is wrapped in
  * try/catch; any surprise returns the untouched origin response. A document
@@ -18,25 +17,31 @@ import { defineConfig, getJsonLdSnippet, MemoryCache } from '@enhancely/injector
 import type { CacheBackend } from '@enhancely/injector-core';
 import { shouldAttemptInjection } from './gate.js';
 import { injectSnippetBuffered } from './inject.js';
-import { KVCacheBackend } from './kv-cache.js';
+import { getKvCacheBackend } from './kv-cache.js';
 
 export { shouldAttemptInjection } from './gate.js';
 export type { GateInput } from './gate.js';
 export { injectSnippetBuffered } from './inject.js';
 export type { RewriterElementLike, RewriterLike } from './inject.js';
-export { KVCacheBackend, kvExpirationTtlSeconds, kvKeyFor } from './kv-cache.js';
+export {
+  getKvCacheBackend,
+  KVCacheBackend,
+  kvEntryExpirationTtlSeconds,
+  kvExpirationTtlSeconds,
+  kvKeyFor,
+} from './kv-cache.js';
 export type { KVNamespaceLike } from './kv-cache.js';
 
 export interface Env {
   /** Required. Set via `wrangler secret put ENHANCELY_API_KEY` — never in wrangler.toml. */
   ENHANCELY_API_KEY?: string;
-  /** Optional API base override (default: https://app.enhancely.ai — TODO: confirm). */
+  /** Optional API base override (confirmed production default: https://app.enhancely.ai). */
   ENHANCELY_BASE?: string;
   /** Optional numeric override for the per-call AbortSignal timeout (default 800). */
   ENHANCELY_TIMEOUT_MS?: string;
   /** Optional numeric override for cache freshness TTL (default 300000 = 5 min). */
   ENHANCELY_CACHE_TTL_MS?: string;
-  /** "true" enables self-registration of unknown pages (POST on 404). */
+  /** "true" uses one register-or-revalidate POST for lookup or self-registration. */
   ENHANCELY_AUTO_REGISTER?: string;
   /** Optional KV namespace for a distributed cache; falls back to per-isolate memory. */
   JSONLD_CACHE?: KVNamespace;
@@ -68,8 +73,12 @@ export default {
         apiKey === undefined ||
         !shouldAttemptInjection({
           method: request.method,
-          responseOk: response.ok,
+          status: response.status,
           contentType: response.headers.get('content-type'),
+          contentEncoding: response.headers.get('content-encoding'),
+          cacheControl: response.headers.get('cache-control'),
+          contentDisposition: response.headers.get('content-disposition'),
+          xRobotsTag: response.headers.get('x-robots-tag'),
           apiKey,
         })
       ) {
@@ -89,20 +98,17 @@ export default {
 
       const cache: CacheBackend =
         env.JSONLD_CACHE !== undefined
-          ? new KVCacheBackend(env.JSONLD_CACHE, config.cacheTtlMs)
+          ? getKvCacheBackend(env.JSONLD_CACHE, config.cacheTtlMs)
           : memoryCache;
 
-      // Core handles normalization, caching, ETag revalidation, timeout and
-      // all fail-open cases; null means "leave the page alone".
-      const snippet = await getJsonLdSnippet(request.url, cache, config);
-      if (snippet === null) return response;
-
-      // Append as last child of <head> ≙ immediately before </head>.
-      // No <head> in the document → handler never fires → original content.
-      // Buffered (not streamed) so a mid-stream HTMLRewriter error fails open
-      // to the untouched origin response instead of truncating the body —
-      // see src/inject.ts for the trade-off notes.
-      return await injectSnippetBuffered(response, snippet, () => new HTMLRewriter());
+      // HTMLRewriter must first prove and buffer a real insertion slot. Only
+      // then does the provider touch cache/Enhancely, so headless or malformed
+      // HTML costs no API request. A null lookup restores the untouched clone.
+      return await injectSnippetBuffered(
+        response,
+        () => getJsonLdSnippet(request.url, cache, config),
+        () => new HTMLRewriter()
+      );
     } catch {
       // Fail-open: any unexpected error serves the untouched origin response.
       return response;
