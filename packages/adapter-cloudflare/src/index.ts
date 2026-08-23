@@ -13,11 +13,12 @@
  * try/catch; any surprise returns the untouched origin response. A document
  * without <head> makes HTMLRewriter a no-op — content still passes through.
  */
-import { defineConfig, getJsonLdSnippet, MemoryCache } from '@enhancely/injector-core';
+import { defineConfig, getJsonLdSnippet } from '@enhancely/injector-core';
 import type { CacheBackend } from '@enhancely/injector-core';
 import { shouldAttemptInjection } from './gate.js';
 import { injectSnippetBuffered } from './inject.js';
 import { getKvCacheBackend } from './kv-cache.js';
+import { CurrentConfigMemoryCache } from './memory-cache.js';
 
 export { shouldAttemptInjection } from './gate.js';
 export type { GateInput } from './gate.js';
@@ -28,6 +29,7 @@ export {
   KVCacheBackend,
   kvEntryExpirationTtlSeconds,
   kvExpirationTtlSeconds,
+  kvCacheScopeFor,
   kvKeyFor,
 } from './kv-cache.js';
 export type { KVNamespaceLike } from './kv-cache.js';
@@ -47,11 +49,16 @@ export interface Env {
   JSONLD_CACHE?: KVNamespace;
 }
 
-/** Parse an optional numeric env var; anything non-positive/non-numeric → undefined. */
-function parsePositiveInt(value: string | undefined): number | undefined {
-  if (value === undefined) return undefined;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+/** Largest millisecond delay accepted safely by common edge timer implementations. */
+const MAX_CONFIG_MILLISECONDS = 2_147_483_647;
+
+/** Parse an optional millisecond env var; malformed, unsafe or overflowing → undefined. */
+export function parsePositiveInt(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_CONFIG_MILLISECONDS
+    ? parsed
+    : undefined;
 }
 
 /**
@@ -59,7 +66,7 @@ function parsePositiveInt(value: string | undefined): number | undefined {
  * configured. Isolates are recycled by the platform, so hit rates are modest —
  * KV is the recommended production setup (see README).
  */
-const memoryCache = new MemoryCache();
+const memoryCache = new CurrentConfigMemoryCache();
 
 export default {
   async fetch(request, env, _ctx): Promise<Response> {
@@ -98,8 +105,13 @@ export default {
 
       const cache: CacheBackend =
         env.JSONLD_CACHE !== undefined
-          ? getKvCacheBackend(env.JSONLD_CACHE, config.cacheTtlMs)
-          : memoryCache;
+          ? await getKvCacheBackend(
+              env.JSONLD_CACHE,
+              config.cacheTtlMs,
+              config.enhancelyBase,
+              config.apiKey
+            )
+          : memoryCache.for(config.enhancelyBase, config.apiKey);
 
       // HTMLRewriter must first prove and buffer a real insertion slot. Only
       // then does the provider touch cache/Enhancely, so headless or malformed

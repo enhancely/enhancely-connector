@@ -71,6 +71,7 @@ locals {
     nonPageMemoTtlMs          = var.non_page_memo_ttl_ms
     capSetCookieResponses     = var.cap_set_cookie_responses
     excludePaths              = var.exclude_paths
+    includeHosts              = var.include_hosts
   })
 
   # Accept either conventional SSM spelling (`name` or `/name`) when building
@@ -207,6 +208,11 @@ resource "aws_lambda_function" "injector" {
     precondition {
       condition     = local.effective_timeout_ms + var.origin_timeout_ms <= local.configurable_network_timeout_budget_ms
       error_message = "The effective timeout_ms + origin_timeout_ms must be at most 6000 ms. The fixed 10-second Lambda timeout reserves 2000 ms for first-invocation SSM config and 2000 ms for cold-start, abort settlement, and returning the fail-open response."
+    }
+
+    precondition {
+      condition     = length(var.include_hosts) == 0 || var.host_in_cache_key_asserted
+      error_message = "A non-empty include_hosts policy requires host_in_cache_key_asserted = true after verifying that viewer Host is in the associated CloudFront cache key (or that the hosts use separate distributions). An origin request policy alone is insufficient."
     }
   }
 }

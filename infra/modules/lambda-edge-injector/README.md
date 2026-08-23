@@ -59,6 +59,8 @@ module "enhancely_injector" {
 
   name          = "acme-enhancely-injector"
   auto_register = true
+  include_hosts = ["www.example.com"]
+  host_in_cache_key_asserted = true # after checking the behavior's cache policy
   exclude_paths = ["/account/*", "/checkout/*"]
   tags          = { managed-by = "terraform" }
 }
@@ -151,6 +153,8 @@ organization. Setting `create_ssm_parameter = true` creates only a
 | `origin_timeout_ms`            | `2000`           | Origin fetch/re-fetch timeout; max `6000`, and its sum with `timeout_ms` must be ≤ `6000`                                                                                                                 |
 | `cache_ttl_ms`                 | `300000`         | JSON-LD memory-cache freshness; stale entries retain their ETag                                                                                                                                           |
 | `auto_register`                | `false`          | `false`: conditional GET only. `true`: one register-or-revalidate POST that reads known pages or registers unknown real HTML pages                                                                        |
+| `include_hosts`                | `[]`             | Exact public page hostnames enabled before SSM, connector-origin, Enhancely, or companion work. No wildcards/schemes/paths/ports. Empty = all hosts.                                                      |
+| `host_in_cache_key_asserted`   | `false`          | Required operator assertion for non-empty `include_hosts`: Viewer Host is in the associated cache key, or hosts use separate distributions. Does not configure CloudFront.                                |
 | `exclude_paths`                | `[]`             | Canonicalized request paths skipped before config or network work                                                                                                                                         |
 | `non_page_memo_ttl_ms`         | `1800000`        | Origin-request memo only for hard handbacks that can neither be injected nor safely generated; redirects, 404s and small veto responses are not stored                                                    |
 | `asserted_default_ttl_seconds` | `0`              | Optional retry-cache cap assertion; keep `0` if any associated behavior has DefaultTTL `0`                                                                                                                |
@@ -181,6 +185,22 @@ known-safe 800/2000/2000 ms runtime defaults are used.
 collapses duplicate slashes and dot segments. Reserved, non-ASCII, malformed,
 and double-encoded octets remain literal.
 
+`include_hosts` is an injector selector, not an access-control rule: excluded
+hosts continue through CloudFront normally and byte-identically. Matching is
+exact and case-insensitive after IDNA/Punycode canonicalization; a final DNS
+dot stays distinct. An explicitly supplied malformed hand-written baked policy
+matches nothing. It prevents SSM/origin/Enhancely/cache-cap work, not the
+Lambda@Edge invocation already selected by the cache behavior; use narrower
+behaviors or separate distributions to avoid that invocation cost. Because
+origin-facing Lambda triggers do not run on cache hits, a
+host-dependent policy is safe across multiple aliases only when the viewer
+`Host` is part of the behavior's **cache policy** or the aliases use separate
+distributions. An origin request policy alone does not partition cached
+objects. See AWS's [default cache-key definition](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/understanding-the-cache-key.html)
+and [header caching rules](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/header-caching.html).
+The module refuses a non-empty `include_hosts` list until the operator sets
+`host_in_cache_key_asserted = true` after verifying that external configuration.
+
 `asserted_default_ttl_seconds` is an operator assertion that every associated
 behavior has at least that DefaultTTL. Use the smallest value across those
 behaviors. A conservative understatement is safe; an overstatement is not.
@@ -201,13 +221,23 @@ could replay one visitor's `Set-Cookie` to another visitor.
 
 ## Requirements and trade-offs
 
-- AWS provider `>= 5.77`. Provider 6 currently emits a deprecation warning for
+- AWS provider `>= 5.77, < 7.0`. Provider 6 currently emits a deprecation warning for
   the region attribute retained for 5.77 compatibility; validation and tests
   support both major versions.
 - Pass an `us-east-1` provider; the module enforces this at plan/apply time.
 - The distribution's origin request policy should forward the viewer `Host`
   header. Origins that cannot receive it, such as S3 website endpoints, can use
   the static origin custom header `X-Enhancely-Page-Host` for the public host.
+  Host fields must resolve to one non-empty value; an empty static override
+  vetoes connector work rather than falling back to the origin hostname.
+- When `include_hosts` distinguishes aliases on one custom-origin behavior,
+  viewer `Host` must be in the **cache policy** (which also forwards it). The
+  static page-host header is fixed per origin and cannot distinguish several
+  viewer aliases.
+- For representation-faithful direct origin fetches on query-dependent pages,
+  the cache policy or origin request policy must expose **all query strings**
+  to the origin-facing Lambda event, as required by AWS's
+  [Lambda@Edge query-string restriction](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/edge-function-restrictions-all.html#edge-function-restrictions-query-string).
 - The default origin-request function performs its own network fetch. The
   compatibility mode lets CloudFront perform the first fetch, but its second
   identity re-fetch is still direct. S3 REST including S3 OAC is pass-through;

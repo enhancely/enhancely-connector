@@ -1449,6 +1449,45 @@ describe('handler — retryable pass-through cache policy', () => {
     expect(originHits).toBe(0);
   });
 
+  it('includeHosts: excluded public host performs no lookup, re-fetch, or cache rewrite', async () => {
+    __setBakedConfigForTests({
+      apiKey: 'sk-test',
+      includeHosts: ['www.example.com'],
+      assertedDefaultTtlSeconds: 86_400,
+    });
+    const event = eventFor('/page', {
+      host: 'media.example.com',
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'max-age=3600',
+        etag: '"keep"',
+      },
+    });
+    const result = await invoke(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(result?.headers?.['cache-control']?.[0]?.value).toBe('max-age=3600');
+    expect(result?.headers?.['etag']?.[0]?.value).toBe('"keep"');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+    expect(originHits).toBe(0);
+  });
+
+  it('includeHosts: static public page-host override drives filter and lookup URL', async () => {
+    __setBakedConfigForTests({ apiKey: 'sk-test', includeHosts: ['public.example.com'] });
+    const result = await invoke(
+      eventFor('/page', {
+        host: 'origin.example.com',
+        originCustomHeaders: { 'x-enhancely-page-host': 'public.example.com' },
+      })
+    );
+
+    expect(result?.body).toContain(SNIPPET);
+    expect(originHits).toBe(1);
+    expect(String(enhancelyFetch.mock.calls[0]?.[0])).toContain(
+      encodeURIComponent('https://public.example.com/page')
+    );
+  });
+
   it('excludePaths: a non-matching path still injects normally', async () => {
     __setBakedConfigForTests({
       apiKey: 'sk-test',

@@ -8,6 +8,7 @@
   "assertedDefaultTtlSeconds": 0,
   "capSetCookieResponses": false,
   "excludePaths": [],
+  "includeHosts": [],
   "originTimeoutMs": 2000,
   "ssmParameterName": "/enhancely/connector/api-key",
   "ssmRegion": "us-east-1",

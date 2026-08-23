@@ -9,6 +9,7 @@ import {
 } from '../src/index.js';
 import type { AttemptInput } from '../src/index.js';
 import { cfHeaders } from './fixtures.js';
+import { resolvePageRequestTarget } from '../src/shared.js';
 
 function attempt(overrides: Partial<AttemptInput> = {}): AttemptInput {
   return {
@@ -254,6 +255,60 @@ describe('buildPageUrl', () => {
     expect(buildPageUrl('www.example.com', '/search', 'q=a&page=2')).toBe(
       'https://www.example.com/search?q=a&page=2'
     );
+  });
+});
+
+describe('resolvePageRequestTarget', () => {
+  const request = () => ({
+    headers: cfHeaders({ host: 'www.example.com' }),
+    origin: {
+      custom: {
+        customHeaders: {},
+        domainName: 'origin.example.com',
+        keepaliveTimeout: 5,
+        path: '',
+        port: 443,
+        protocol: 'https' as const,
+        readTimeout: 30,
+        sslProtocols: ['TLSv1.2' as const],
+      },
+    },
+    uri: '/page',
+    querystring: 'a=1',
+  });
+
+  it('resolves one shared origin/public target', () => {
+    expect(resolvePageRequestTarget(request())).toEqual({
+      originHost: 'www.example.com',
+      pageHost: 'www.example.com',
+      pageUrl: 'https://www.example.com/page?a=1',
+    });
+  });
+
+  it('gives the static public page-host override precedence', () => {
+    const input = request();
+    input.origin.custom.customHeaders = cfHeaders({
+      'x-enhancely-page-host': 'public.example.com',
+    });
+    expect(resolvePageRequestTarget(input)?.pageHost).toBe('public.example.com');
+  });
+
+  it('rejects duplicate Host or public page-host field instances', () => {
+    const duplicateHost = request();
+    duplicateHost.headers = cfHeaders({ host: ['www.example.com', 'evil.example'] });
+    expect(resolvePageRequestTarget(duplicateHost)).toBeNull();
+
+    const duplicateOverride = request();
+    duplicateOverride.origin.custom.customHeaders = cfHeaders({
+      'x-enhancely-page-host': ['public.example.com', 'evil.example'],
+    });
+    expect(resolvePageRequestTarget(duplicateOverride)).toBeNull();
+  });
+
+  it('rejects an explicitly empty public page-host override instead of using the origin host', () => {
+    const input = request();
+    input.origin.custom.customHeaders = cfHeaders({ 'x-enhancely-page-host': '' });
+    expect(resolvePageRequestTarget(input)).toBeNull();
   });
 });
 

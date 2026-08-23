@@ -50,6 +50,24 @@ export function kvEntryExpirationTtlSeconds(
  */
 const MAX_VERBATIM_KEY_BYTES = 400;
 
+/** Hex SHA-256 without ever materializing secret input in a KV key. */
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Non-secret cache scope for one Enhancely API base/key identity.
+ *
+ * A shared KV namespace may outlive a key rotation or be bound to several
+ * Worker deployments. Without this scope, a fresh record written under one
+ * Enhancely project could be served under another without an API call. The
+ * digest keeps the Bearer key itself out of the KV dashboard and logs.
+ */
+export function kvCacheScopeFor(enhancelyBase: string, apiKey: string): Promise<string> {
+  return sha256Hex(JSON.stringify([enhancelyBase, apiKey]));
+}
+
 /**
  * Map a cache key (the normalized page URL) to a KV-safe key.
  *
@@ -57,17 +75,21 @@ const MAX_VERBATIM_KEY_BYTES = 400;
  * deliberately swallowed (fail-open), an oversized key would otherwise
  * *silently* lose both caching and the 429 retry backoff — every view of a
  * long-URL page would re-hit the Enhancely API. Keys over
- * {@link MAX_VERBATIM_KEY_BYTES} UTF-8 bytes are therefore replaced by a
- * stable digest: `sha256:` + lowercase hex SHA-256 of the key (71 bytes,
- * well under the 512-byte limit). Short keys pass through unchanged.
+ * {@link MAX_VERBATIM_KEY_BYTES} including the versioned project-scope prefix
+ * are therefore replaced by a stable URL digest. Short URLs remain readable
+ * after that non-secret prefix. Both forms stay well under 512 bytes.
  */
-export async function kvKeyFor(key: string): Promise<string> {
+export async function kvKeyFor(key: string, scope: string): Promise<string> {
+  if (!/^[0-9a-f]{64}$/.test(scope)) {
+    throw new TypeError('KV cache scope must be a lowercase SHA-256 hex digest');
+  }
+  const prefix = `v1:${scope}:`;
   const bytes = new TextEncoder().encode(key);
-  if (bytes.byteLength <= MAX_VERBATIM_KEY_BYTES) return key;
+  if (new TextEncoder().encode(prefix).byteLength + bytes.byteLength <= MAX_VERBATIM_KEY_BYTES) {
+    return `${prefix}${key}`;
+  }
 
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
-  return `sha256:${hex}`;
+  return `${prefix}sha256:${await sha256Hex(key)}`;
 }
 
 function isCacheEntry(value: unknown): value is CacheEntry {
@@ -93,12 +115,13 @@ function isCacheEntry(value: unknown): value is CacheEntry {
 export class KVCacheBackend implements CacheBackend {
   constructor(
     private readonly kv: KVNamespaceLike,
-    private readonly cacheTtlMs: number
+    private readonly cacheTtlMs: number,
+    private readonly scope: string
   ) {}
 
   async get(key: string): Promise<CacheEntry | undefined> {
     try {
-      const value = await this.kv.get(await kvKeyFor(key), 'json');
+      const value = await this.kv.get(await kvKeyFor(key, this.scope), 'json');
       return isCacheEntry(value) ? value : undefined;
     } catch {
       return undefined;
@@ -107,7 +130,7 @@ export class KVCacheBackend implements CacheBackend {
 
   async set(key: string, entry: CacheEntry): Promise<void> {
     try {
-      await this.kv.put(await kvKeyFor(key), JSON.stringify(entry), {
+      await this.kv.put(await kvKeyFor(key, this.scope), JSON.stringify(entry), {
         expirationTtl: kvEntryExpirationTtlSeconds(this.cacheTtlMs, entry),
       });
     } catch {
@@ -117,24 +140,39 @@ export class KVCacheBackend implements CacheBackend {
 }
 
 /**
- * Stable backend identity per Worker isolate, KV binding and TTL. Core
- * singleflight/write serialization is keyed by the CacheBackend object; a new
- * wrapper on every request would therefore defeat coalescing even though all
- * wrappers address the same KV namespace.
+ * Stable backend identity per Worker isolate, KV binding, TTL, API base and
+ * project key. Core singleflight/write serialization is keyed by the
+ * CacheBackend object; a new wrapper on every request would therefore defeat
+ * coalescing even though all wrappers address the same KV namespace.
  */
-const backendMemo = new WeakMap<KVNamespaceLike, Map<number, KVCacheBackend>>();
+interface BackendMemo {
+  identity: string;
+  backend: Promise<KVCacheBackend>;
+}
 
-export function getKvCacheBackend(kv: KVNamespaceLike, cacheTtlMs: number): KVCacheBackend {
-  let byTtl = backendMemo.get(kv);
-  if (byTtl === undefined) {
-    byTtl = new Map();
-    backendMemo.set(kv, byTtl);
-  }
+const backendMemo = new WeakMap<KVNamespaceLike, BackendMemo>();
 
-  let backend = byTtl.get(cacheTtlMs);
-  if (backend === undefined) {
-    backend = new KVCacheBackend(kv, cacheTtlMs);
-    byTtl.set(cacheTtlMs, backend);
-  }
+export function getKvCacheBackend(
+  kv: KVNamespaceLike,
+  cacheTtlMs: number,
+  enhancelyBase: string,
+  apiKey: string
+): Promise<KVCacheBackend> {
+  const identity = JSON.stringify([cacheTtlMs, enhancelyBase, apiKey]);
+  const current = backendMemo.get(kv);
+  if (current?.identity === identity) return current.backend;
+
+  // One Worker isolate has one stable binding set. Replace, rather than retain,
+  // old raw API-key identities across a rollout; scoped KV records themselves
+  // remain available if that project becomes active again later.
+  const backend = kvCacheScopeFor(enhancelyBase, apiKey).then(
+    (scope) => new KVCacheBackend(kv, cacheTtlMs, scope)
+  );
+  backendMemo.set(kv, { identity, backend });
+  void backend.catch(() => {
+    // WebCrypto is mandatory on Workers, but a transient runtime failure must
+    // not poison this binding's memo for the rest of the isolate lifetime.
+    if (backendMemo.get(kv)?.backend === backend) backendMemo.delete(kv);
+  });
   return backend;
 }

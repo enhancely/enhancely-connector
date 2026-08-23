@@ -55,10 +55,23 @@ function report(name, ok, detail) {
 async function get(path, extraHeaders = {}) {
   const headers = { 'user-agent': 'enhancely-conformance/1', ...extraHeaders };
   if (auth) headers.authorization = `Basic ${Buffer.from(auth).toString('base64')}`;
-  // A fresh query string on every call keeps each assertion on a cache MISS,
-  // so we measure the functions rather than a cached artefact of an earlier one.
-  const bust = `${path.includes('?') ? '&' : '?'}c=${Date.now()}${Math.random().toString(36).slice(2, 7)}`;
+  // This suite requires all query strings in the CloudFront cache key. A fresh
+  // value should keep each assertion on a cache MISS, so we measure the edge
+  // functions rather than an artefact cached by an earlier assertion. Randomise
+  // the parameter NAME too, so one hard-coded allowlist cannot accidentally
+  // make cacheable fixtures look correctly configured. X-Cache below detects a
+  // violated miss assumption; the operator must still verify the cache/origin
+  // request policies because an uncacheable response also reports a miss.
+  const nonce = `${Date.now()}${Math.random().toString(36).slice(2, 7)}`;
+  const bust = `${path.includes('?') ? '&' : '?'}enhancely_conformance_${nonce}=1`;
   const response = await fetch(`${base}${path}${bust}`, { headers, redirect: 'manual' });
+  const cloudFrontCache = response.headers.get('x-cache') ?? '';
+  if (cloudFrontCache.toLowerCase().includes('hit from cloudfront')) {
+    throw new Error(
+      `Conformance request was served from cache (${cloudFrontCache}). Ensure this suite's ` +
+        'random query parameter reaches the cache key before using its results.'
+    );
+  }
   const bytes = Buffer.from(await response.arrayBuffer());
   return {
     status: response.status,

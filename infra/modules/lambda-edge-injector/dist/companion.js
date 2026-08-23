@@ -213,6 +213,102 @@ function matchesExcludedPath(patterns, pathname) {
   return false;
 }
 
+// ../injector-core/dist/host-filter.js
+function hasForbiddenHostCharacter(value) {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 32 || codePoint === 127 || "\\/?#@%".includes(character))
+      return true;
+  }
+  return false;
+}
+function isDnsHostname(hostname) {
+  if (hostname === "" || hostname.length > 254)
+    return false;
+  const bare = hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+  if (bare === "" || bare.length > 253)
+    return false;
+  for (const label of bare.split(".")) {
+    if (label.length === 0 || label.length > 63)
+      return false;
+    for (let index = 0; index < label.length; index += 1) {
+      const code = label.charCodeAt(index);
+      const alphaNumeric = code >= 48 && code <= 57 || code >= 97 && code <= 122 || code >= 65 && code <= 90;
+      if (!alphaNumeric && code !== 45)
+        return false;
+    }
+    if (label.startsWith("-") || label.endsWith("-"))
+      return false;
+  }
+  return true;
+}
+function parsedDnsHostname(authority) {
+  try {
+    const parsed = new URL(`https://${authority}/`);
+    if (parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "" || parsed.hostname === "") {
+      return null;
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    return isDnsHostname(hostname) ? hostname : null;
+  } catch {
+    return null;
+  }
+}
+function canonicalConfiguredHost(value) {
+  if (value === "" || value !== value.trim() || hasForbiddenHostCharacter(value))
+    return null;
+  if (value.includes(":"))
+    return null;
+  return parsedDnsHostname(value);
+}
+function canonicalRequestHost(value) {
+  if (value === "" || value !== value.trim() || hasForbiddenHostCharacter(value))
+    return null;
+  let hostnamePart = value;
+  let portPart = null;
+  if (value.startsWith("[")) {
+    const close = value.indexOf("]");
+    if (close < 0)
+      return null;
+    hostnamePart = value.slice(0, close + 1);
+    const suffix = value.slice(close + 1);
+    if (suffix !== "") {
+      if (!suffix.startsWith(":"))
+        return null;
+      portPart = suffix.slice(1);
+    }
+  } else {
+    const colon = value.lastIndexOf(":");
+    if (colon >= 0) {
+      if (value.indexOf(":") !== colon)
+        return null;
+      hostnamePart = value.slice(0, colon);
+      portPart = value.slice(colon + 1);
+    }
+  }
+  if (hostnamePart === "")
+    return null;
+  if (portPart !== null && !/^0*443$/.test(portPart))
+    return null;
+  return parsedDnsHostname(value);
+}
+function isHostIncluded(host, includeHosts) {
+  if (includeHosts.length === 0)
+    return true;
+  const candidate = canonicalRequestHost(host);
+  if (candidate === null)
+    return false;
+  let matched = false;
+  for (const configured of includeHosts) {
+    const canonical = canonicalConfiguredHost(configured);
+    if (canonical === null)
+      return false;
+    if (canonical === candidate)
+      matched = true;
+  }
+  return matched;
+}
+
 // ../injector-core/dist/robots.js
 var VALUE_BEARING_ROBOTS_DIRECTIVES = /* @__PURE__ */ new Set([
   "max-image-preview",
@@ -373,6 +469,24 @@ function shouldAttemptGeneratedResponse(input) {
   if (!isInjectableRepresentation(input)) return false;
   return input.contentEncoding === null;
 }
+function buildPageUrl(host, uri, querystring) {
+  return `https://${host}${uri}${querystring !== "" ? `?${querystring}` : ""}`;
+}
+function resolvePageRequestTarget(request) {
+  const hostEntries = request.headers["host"];
+  if (hostEntries !== void 0 && hostEntries.length !== 1) return null;
+  const originHost = hostEntries?.[0]?.value ?? request.origin?.custom?.domainName ?? "";
+  if (originHost === "") return null;
+  const pageHostEntries = request.origin?.custom?.customHeaders[PAGE_HOST_HEADER];
+  if (pageHostEntries !== void 0 && pageHostEntries.length !== 1) return null;
+  const pageHost = pageHostEntries?.[0]?.value ?? originHost;
+  if (pageHost === "") return null;
+  return {
+    originHost,
+    pageHost,
+    pageUrl: buildPageUrl(pageHost, request.uri, request.querystring)
+  };
+}
 function buildOriginUrl(request) {
   const custom = request.origin?.custom;
   if (custom === void 0) return null;
@@ -392,6 +506,7 @@ function buildOriginUrl(request) {
   if (resolved.pathname !== custom.path && !resolved.pathname.startsWith(prefix)) return null;
   return url;
 }
+var PAGE_HOST_HEADER = "x-enhancely-page-host";
 function headerValue(headers, name) {
   return headers[name]?.[0]?.value ?? null;
 }
@@ -664,6 +779,15 @@ function parseBaked(raw) {
     );
     if (patterns.length > 0) baked.excludePaths = patterns;
   }
+  if (Object.hasOwn(source, "includeHosts")) {
+    if (Array.isArray(source["includeHosts"])) {
+      baked.includeHosts = source["includeHosts"].map(
+        (entry) => typeof entry === "string" ? entry : ""
+      );
+    } else {
+      baked.includeHosts = [""];
+    }
+  }
   return baked;
 }
 function readBakedConfig() {
@@ -779,6 +903,9 @@ function getNonPageMemoTtlMs() {
 function getExcludePaths() {
   return bakedConfig()?.excludePaths ?? [];
 }
+function getIncludeHosts() {
+  return bakedConfig()?.includeHosts ?? [];
+}
 
 // src/companion.ts
 function capOptions() {
@@ -802,6 +929,8 @@ var handler = async (event) => {
     if (matchesExcludedPath(getExcludePaths(), request.uri)) return response;
     if (NON_HTML_EXTENSION.test(request.uri)) return response;
     if (request.headers["range"] !== void 0) return response;
+    const target = resolvePageRequestTarget(request);
+    if (target === null || !isHostIncluded(target.pageHost, getIncludeHosts())) return response;
     const input = {
       method: request.method,
       status: response.status,

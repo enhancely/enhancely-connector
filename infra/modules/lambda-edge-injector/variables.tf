@@ -54,6 +54,31 @@ variable "auto_register" {
   description = "Self-registration mode: on a stale/missing JSON-LD cache entry, use one register-or-revalidate POST that reads known pages or registers unknown proven HTML pages. Fresh positive/negative cache entries make no API request."
 }
 
+variable "include_hosts" {
+  type        = list(string)
+  default     = []
+  description = "Exact public page hostnames on which connector work is enabled. Empty preserves the all-host behavior. No wildcards, schemes, paths, credentials, or ports. Matching is case-insensitive after IDNA/Punycode canonicalization; a final DNS dot remains distinct. Checked before SSM, the connector origin fetch, Enhancely, or companion cache rewriting. IMPORTANT: when aliases share a distribution/behavior, Viewer Host must also be in the CloudFront cache key; an origin-request policy alone does not isolate cached objects by alias."
+
+  validation {
+    condition = (
+      length(distinct([for host in var.include_hosts : lower(host)])) == length(var.include_hosts) &&
+      alltrue([
+        for host in var.include_hosts :
+        host == trimspace(host) &&
+        length(host) <= (endswith(host, ".") ? 254 : 253) &&
+        can(regex("^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?$", host))
+      ])
+    )
+    error_message = "include_hosts entries must be unique exact DNS hostnames (Unicode names in Punycode), without whitespace, wildcard, scheme, path, credentials, or port."
+  }
+}
+
+variable "host_in_cache_key_asserted" {
+  type        = bool
+  default     = false
+  description = "Operator assertion required when include_hosts is non-empty: the associated CloudFront cache behavior includes viewer Host in its cache key (or every listed host uses a separate distribution). This module cannot inspect the external behavior and does not configure its cache policy."
+}
+
 variable "exclude_paths" {
   type        = list(string)
   default     = []

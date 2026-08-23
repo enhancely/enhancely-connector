@@ -210,12 +210,14 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["CloudFront-Cache-Miss"] --> B{"GET, nicht ausgeschlossen,<br/>kein Range, kein offensichtliches Asset,<br/>unterstützter Custom Origin?"}
+    A["CloudFront-Cache-Miss"] --> B{"GET, nicht ausgeschlossen,<br/>kein Range, kein offensichtliches Asset?"}
 
     B -- "nein" --> HB["Handback an CloudFront"]
-    B -- "ja" --> OM{"Origin-Fehler-Circuit aktiv?"}
-    OM -- "ja" --> HB
-    OM -- "nein" --> K{"Config und API-Key verfügbar?"}
+    B -- "ja" --> H{"Öffentlicher Host eindeutig<br/>und falls gesetzt in includeHosts?"}
+    H -- "nein" --> HB
+    H -- "ja" --> OM{"Unterstützter Custom Origin<br/>und Origin-Circuit frei?"}
+    OM -- "nein" --> HB
+    OM -- "ja" --> K{"Config und API-Key verfügbar?"}
     K -- "nein" --> HB
     K -- "ja" --> M{"Hard-Handback-Memo aktiv?"}
     M -- "ja" --> HB
@@ -257,7 +259,7 @@ flowchart TD
     GU --> CF
 
     HB --> O2["Origin-Fetch durch CloudFront"]
-    O2 --> COMP{"Companion-Cap-Gates:<br/>GET, nicht ausgeschlossen, keine Asset-Endung,<br/>kein Range, exakt 200 HTML,<br/>Header-Charset passend, indexierbar,<br/>kein no-transform / keine gültige<br/>Nicht-inline-Disposition,<br/>syntaktisch nutzbarer Custom Origin?"}
+    O2 --> COMP{"Companion-Cap-Gates:<br/>GET, Pfad/Host erlaubt, keine Asset-Endung,<br/>kein Range, exakt 200 HTML,<br/>Header-Charset passend, indexierbar,<br/>kein no-transform / keine gültige<br/>Nicht-inline-Disposition,<br/>syntaktisch nutzbarer Custom Origin?"}
     COMP -- "nein" --> PASS["Byte-identischer Pass-through"]
     COMP -- "ja" --> CCFG["Config auflösen<br/>(einzige optionale I/O;<br/>0 Origin / 0 Enhancely)"]
     CCFG --> HASCFG{"Config verfügbar?"}
@@ -267,6 +269,32 @@ flowchart TD
     CAPCFG --> CF
     CAPMEMO --> CF
 ```
+
+### CloudFront-Voraussetzungen für Host und Query
+
+`includeHosts`/`include_hosts` ist eine Lambda@Edge-Auswahl, keine
+Zugriffskontrolle. Ein ausgeschlossener Host wird normal ausgeliefert, löst aber vor
+SSM, Connector-Origin-Fetch, Enhancely und Companion-Cap einen lokalen Exit aus. Die
+Liste enthält exakte öffentliche Hostnamen ohne Wildcards; leer bedeutet weiterhin
+alle Hosts. Maßgeblich ist derselbe Host wie in der Enhancely-URL:
+`X-Enhancely-Page-Host`, falls statisch gesetzt, sonst der Request-`Host`.
+Beide Felder müssen genau einen nichtleeren Wert besitzen; ein explizit leerer
+statischer Override führt zum lokalen Exit statt zum Origin-Host-Fallback.
+Der lokale Exit spart keine Lambda@Edge-Invocation, die CloudFront anhand des
+Behaviors bereits ausgelöst hat; dafür sind engere Behaviors oder getrennte
+Distributionen nötig.
+
+Origin-Trigger laufen nur bei Cache-Misses. Wenn mehrere Aliase dieselbe Distribution
+und Behavior teilen, muss Viewer-`Host` deshalb zusätzlich Teil der
+**CloudFront-Cache-Policy** sein; eine Origin Request Policy allein trennt Cache-Hits
+nicht. Alternativ sind getrennte Distributionen nötig. Der statische Page-Host-Header
+kann nicht zwischen mehreren Viewer-Aliassen unterscheiden. Außerdem müssen
+queryabhängige Origins über Cache- oder Origin-Request-Policy **alle Query Strings**
+im origin-facing Event verfügbar machen, damit der Direkt-Fetch dieselbe
+Repräsentation abruft.
+Das Terraform-Modul akzeptiert eine nichtleere `include_hosts`-Liste deshalb erst
+mit der ausdrücklichen Betreiberzusicherung `host_in_cache_key_asserted = true`;
+die externe Cache Policy kann das Lambda-Modul selbst nicht inspizieren.
 
 ## Reihenfolge der lokalen Prüfungen
 
@@ -278,34 +306,35 @@ Die Reihenfolge ist absichtlich günstig nach Kosten sortiert:
 3. Keine bekannte Nicht-HTML-Dateiendung wie `.css`, `.js`, `.json`, Bilder,
    Schriften, Medien, Archive oder Office-Dateien.
 4. Kein `Range`-Request.
-5. Unterstützter Custom Origin und nicht leerer virtueller Host.
-6. Kein aktiver Origin-Fehler-Circuit.
-7. API-Key/Config ist verfügbar.
-8. Kein aktives Hard-Handback-Memo.
-9. Origin zuerst holen. Netzwerk-, Timeout-, Protokoll- oder unvollständige
-   Body-Fehler öffnen den 10-Sekunden-Origin-Circuit und führen zum Handback.
-10. Ein wegen der Größe truncierter Body führt zum 30-Minuten-Hard-Handback-Memo.
-11. Kein vorhandener `X-Enhancely-Injected`-Marker.
-12. Exakt `200`; `Content-Type` kommt in genau einer Feldinstanz mit genau einem
+5. Eindeutiger öffentlicher Host; bei nichtleerem `includeHosts` exakter Treffer.
+6. Unterstützter Custom Origin und nicht leerer virtueller Host.
+7. Kein aktiver Origin-Fehler-Circuit.
+8. API-Key/Config ist verfügbar.
+9. Kein aktives Hard-Handback-Memo.
+10. Origin zuerst holen. Netzwerk-, Timeout-, Protokoll- oder unvollständige
+    Body-Fehler öffnen den 10-Sekunden-Origin-Circuit und führen zum Handback.
+11. Ein wegen der Größe truncierter Body führt zum 30-Minuten-Hard-Handback-Memo.
+12. Kein vorhandener `X-Enhancely-Injected`-Marker.
+13. Exakt `200`; `Content-Type` kommt in genau einer Feldinstanz mit genau einem
     eindeutigen Medientyp `text/html` vor; ein deklarierter Charset ist
     UTF-8-kompatibel. Top-Level-Kommas, Unicode-Pseudo-OWS und unausgeglichene
     HTTP-Quotes sind ein Veto.
-13. Kein `Cache-Control: no-transform` und keine gültige
+14. Kein `Cache-Control: no-transform` und keine gültige
     Nicht-`inline`-`Content-Disposition` (einschließlich `attachment` und
     unbekannter gültiger Typen). Ein explizites `no-transform` bleibt auch bei
     fehlerhaften Whitespace-/Semikolon-Trennern wirksam; unausgeglichene Quotes
     vetoen konservativ.
-14. Kein `Content-Encoding` auf dem angeforderten Identity-Response.
-15. Kein `X-Robots-Tag: noindex` oder `none`; die Sperre bleibt auch bei
+15. Kein `Content-Encoding` auf dem angeforderten Identity-Response.
+16. Kein `X-Robots-Tag: noindex` oder `none`; die Sperre bleibt auch bei
     fehlerhaften Whitespace-/Semikolon-Trennern wirksam.
-16. Der tatsächliche Body ist UTF-8-sicher beziehungsweise eindeutig sicher dekodierbar.
-17. Ein realer, parser-sicherer `</head>`-Einfügepunkt existiert.
-18. Header und HTML plus minimaler Script-Wrapper passen grundsätzlich in die
+17. Der tatsächliche Body ist UTF-8-sicher beziehungsweise eindeutig sicher dekodierbar.
+18. Ein realer, parser-sicherer `</head>`-Einfügepunkt existiert.
+19. Header und HTML plus minimaler Script-Wrapper passen grundsätzlich in die
     CloudFront-Limits.
-19. Die öffentliche URL ist absolut HTTP(S), enthält keine Credentials und ist nach
+20. Die öffentliche URL ist absolut HTTP(S), enthält keine Credentials und ist nach
     `normalizeLite` ein Fixpunkt. Ein Fehler endet lokal vor Cache und API.
-20. Erst jetzt: JSON-LD-Cache prüfen und bei Bedarf Enhancely aufrufen.
-21. Mit der tatsächlichen Snippet-Größe die exakte Response-Quota prüfen.
+21. Erst jetzt: JSON-LD-Cache prüfen und bei Bedarf Enhancely aufrufen.
+22. Mit der tatsächlichen Snippet-Größe die exakte Response-Quota prüfen.
 
 `Set-Cookie`, `private` und `no-store` verhindern im empfohlenen Origin-Request-Pfad
 keine Injektion. Es gibt dort nur eine Origin-Antwort; sie wird inklusive dieser Header
@@ -323,7 +352,7 @@ lokaler Cache/Backoff `0`, echter stale/miss Lookup `1`.
 | Fall pro Viewer-Request                                                                                                                                                                                   |                                 Origin gesamt | Enhancely extern | Companion                       | Ergebnis                                                                                                                                                  |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------: | ---------------: | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | CloudFront-Cache-Hit                                                                                                                                                                                      |                                             0 |                0 | nein                            | Bereits gecachter Response.                                                                                                                               |
-| Non-GET, ausgeschlossener Pfad, Range, nicht unterstützter Origin oder fehlender Host                                                                                                                     |                                             1 |                0 | ja, aber Gate-Exit              | Normaler CloudFront-Originpfad, unverändert.                                                                                                              |
+| Non-GET, ausgeschlossener Pfad/Host, Range, nicht unterstützter Origin oder fehlender Host                                                                                                                |                                             1 |                0 | ja, aber Gate-Exit              | Normaler CloudFront-Originpfad, unverändert; keine SSM-/Connector-Origin-/Enhancely-Arbeit und kein Companion-Cap.                                        |
 | Offensichtliche Asset-Endung; Origin liefert Nicht-HTML, Status ungleich `200` oder sogar unerwartet `200 text/html`                                                                                      |                                             1 |                0 | ja, aber Extension-Gate         | Beide Funktionen schließen Asset-Endungen aus. Keine Injektion, kein künstlicher Companion-Cap.                                                           |
 | Fehlende Config/API-Key                                                                                                                                                                                   |                                             1 |                0 | ja                              | Der Injector gibt vor dem Direkt-Fetch zurück. Der Companion darf nur die Config auflösen und bei sonst geeigneter Antwort sicher auf deren Retry kappen. |
 | Reproduzierbarer Redirect oder kleine `4xx`-/`5xx`-Antwort                                                                                                                                                |                                             1 |                0 | nein                            | Status, Header und Body werden aus dem ersten Fetch zurückgegeben.                                                                                        |
@@ -363,13 +392,14 @@ möglichen Cache-Begrenzung verlangt er in dieser Reihenfolge:
 2. `GET` und kein `excludePaths`-Treffer.
 3. Keine bekannte Nicht-HTML-Dateiendung.
 4. Kein `Range`-Request.
-5. Exakt `200` und genau eine eindeutige `Content-Type: text/html`-Feldinstanz ohne
+5. Eindeutiger öffentlicher Host; bei nichtleerem `includeHosts` exakter Treffer.
+6. Exakt `200` und genau eine eindeutige `Content-Type: text/html`-Feldinstanz ohne
    mehrdeutiges Top-Level-Komma, Unicode-Pseudo-OWS oder unausgeglichene Quotes;
    kompatibler deklarierter Charset, kein
    `no-transform` und keine gültige Nicht-`inline`-Disposition. `Content-Encoding`
    ist erlaubt, weil der Companion den Body weder liest noch verändert.
-6. Kein `X-Robots-Tag: noindex` oder `none`.
-7. `buildOriginUrl` kann aus dem Event syntaktisch eine sichere Custom-Origin-URL
+7. Kein `X-Robots-Tag: noindex` oder `none`.
+8. `buildOriginUrl` kann aus dem Event syntaktisch eine sichere Custom-Origin-URL
    ableiten. Die Funktion erkennt S3-Origins und unsichere Path-Escapes, aber nicht die
    tatsächliche Netzwerkerreichbarkeit oder eine erforderliche Request-Signatur.
 
@@ -513,22 +543,22 @@ getrennt und immer auf 60 Sekunden begrenzt.
 Es gibt bewusst **keinen einzelnen „Connector-Cache“**. Folgende Ebenen und Uhren sind
 unabhängig voneinander:
 
-| Ebene / Zustand                                            | Standard und Scope                                                                                                              | Wirkung                                                                                                 |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| CloudFront-Seitencache                                     | Keine feste Connector-TTL; Origin-Header und Cache-Behavior bestimmen die Laufzeit.                                             | Cache-Hits umgehen beide Lambda-Origin-Trigger: 0 Origin, 0 Enhancely.                                  |
-| Positiver JSON-LD-Eintrag                                  | 5 Minuten frisch, konfigurierbar; pro Backend-Key. Memory lokal je Execution Environment/Isolate, KV namespaceweit.             | Währenddessen kein Enhancely-Netzwerkrequest.                                                           |
-| Negativer JSON-LD-Eintrag (`404`, ignored, `{}`, rejected) | 5 Minuten frisch, konfigurierbar; mit demselben Backend-Scope.                                                                  | Währenddessen keine Injektion und kein erneuter Enhancely-Request.                                      |
-| `201/202` mit `Retry-After`                                | `min(cacheTtlMs, max(1 s, Hint))`; ohne Hint volle Cache-TTL.                                                                   | Re-Poll erst nach dem angegebenen Termin.                                                               |
-| Normaler API-Fehler/Timeout                                | 10 Sekunden URL-lokal.                                                                                                          | Stale positive Daten bleiben verwendbar; sonst keine Injektion.                                         |
-| GET-Rate-Limit                                             | URL-lokal: Hint mindestens 1 Sekunde, maximal 60 Sekunden; ohne Hint 10 Sekunden. Shared Circuit: maximal 60 Sekunden.          | Circuit für alle URLs mit demselben Enhancely-Base/API-Key/Fetch-Implementierungs-Scope.                |
-| Register-POST `429`                                        | URL-lokal: Hint mindestens 1 Sekunde, maximal 24 Stunden; ohne nutzbaren Hint 10 Sekunden. Shared Circuit: maximal 60 Sekunden. | Die betroffene URL respektiert lange Limits; andere URLs werden höchstens 60 Sekunden gebremst.         |
-| Register-POST `403`                                        | Mit `Retry-After` URL-lokal mindestens 1 Sekunde und maximal 24 Stunden; sonst terminal-negativ für die volle JSON-LD-TTL.      | Kein Shared Circuit: Plan-/Registrierungslimits einer URL unterdrücken keine kalten Reads anderer URLs. |
-| Enhancely-Timeout-Memo des Origin-Request-Injectors        | 10 Sekunden pro Injector-Execution-Environment, wenn ein Call mindestens 90 % seines Timeouts verbraucht.                       | Andere URLs überspringen in diesem Fenster den Enhancely-Netzwerkaufruf.                                |
-| Hard-Handback-/Non-Page-Memo des Injectors                 | 30 Minuten, konfigurierbar; pro vollständiger öffentlicher URL inklusive Query und pro Injector-Execution-Environment.          | Überspringt bei Wiederholungen den bereits bekannten, nicht nutzbaren Klassifizierungs-Fetch.           |
-| Cache-Cap-Ziel des Companion bei vorhandener Config        | Dasselbe `nonPageMemoTtlMs`, standardmäßig 30 Minuten; kein eigener Companion-Memoeintrag.                                      | Verkürzt nur eine bereits sicher cachebare Handback-Antwort; 0 Origin und 0 Enhancely.                  |
-| Origin-Fehler-Circuits                                     | 10 Sekunden; Endpoint+VHost für bewiesene DNS/TCP/TLS-Setupfehler, exakter Request für spätere/unklare Fehler.                  | Verhindert einen bekannten aussichtslosen direkten Origin-Fetch; CloudFront bleibt fail-open zuständig. |
-| Fehlende Config / SSM-Fehler                               | 30 Sekunden negative Config-Cooldown.                                                                                           | Danach wird SSM erneut versucht.                                                                        |
-| Erfolgreich geladene Config/API-Key                        | Lebensdauer der Lambda-Execution-Environment.                                                                                   | Gleichzeitige erste Auflösungen teilen einen In-flight-Request.                                         |
+| Ebene / Zustand                                            | Standard und Scope                                                                                                                                                          | Wirkung                                                                                                 |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| CloudFront-Seitencache                                     | Keine feste Connector-TTL; Origin-Header und Cache-Behavior bestimmen die Laufzeit.                                                                                         | Cache-Hits umgehen beide Lambda-Origin-Trigger: 0 Origin, 0 Enhancely.                                  |
+| Positiver JSON-LD-Eintrag                                  | 5 Minuten frisch, konfigurierbar; pro Backend-Key. Memory lokal je Execution Environment/Isolate, KV namespaceweit und zusätzlich per Enhancely-Base/API-Key-Hash getrennt. | Währenddessen kein Enhancely-Netzwerkrequest; ein geteilter KV-Namespace mischt keine Projekte.         |
+| Negativer JSON-LD-Eintrag (`404`, ignored, `{}`, rejected) | 5 Minuten frisch, konfigurierbar; mit demselben Backend-Scope.                                                                                                              | Währenddessen keine Injektion und kein erneuter Enhancely-Request.                                      |
+| `201/202` mit `Retry-After`                                | `min(cacheTtlMs, max(1 s, Hint))`; ohne Hint volle Cache-TTL.                                                                                                               | Re-Poll erst nach dem angegebenen Termin.                                                               |
+| Normaler API-Fehler/Timeout                                | 10 Sekunden URL-lokal.                                                                                                                                                      | Stale positive Daten bleiben verwendbar; sonst keine Injektion.                                         |
+| GET-Rate-Limit                                             | URL-lokal: Hint mindestens 1 Sekunde, maximal 60 Sekunden; ohne Hint 10 Sekunden. Shared Circuit: maximal 60 Sekunden.                                                      | Circuit für alle URLs mit demselben Enhancely-Base/API-Key/Fetch-Implementierungs-Scope.                |
+| Register-POST `429`                                        | URL-lokal: Hint mindestens 1 Sekunde, maximal 24 Stunden; ohne nutzbaren Hint 10 Sekunden. Shared Circuit: maximal 60 Sekunden.                                             | Die betroffene URL respektiert lange Limits; andere URLs werden höchstens 60 Sekunden gebremst.         |
+| Register-POST `403`                                        | Mit `Retry-After` URL-lokal mindestens 1 Sekunde und maximal 24 Stunden; sonst terminal-negativ für die volle JSON-LD-TTL.                                                  | Kein Shared Circuit: Plan-/Registrierungslimits einer URL unterdrücken keine kalten Reads anderer URLs. |
+| Enhancely-Timeout-Memo des Origin-Request-Injectors        | 10 Sekunden pro Injector-Execution-Environment, wenn ein Call mindestens 90 % seines Timeouts verbraucht.                                                                   | Andere URLs überspringen in diesem Fenster den Enhancely-Netzwerkaufruf.                                |
+| Hard-Handback-/Non-Page-Memo des Injectors                 | 30 Minuten, konfigurierbar; pro vollständiger öffentlicher URL inklusive Query und pro Injector-Execution-Environment.                                                      | Überspringt bei Wiederholungen den bereits bekannten, nicht nutzbaren Klassifizierungs-Fetch.           |
+| Cache-Cap-Ziel des Companion bei vorhandener Config        | Dasselbe `nonPageMemoTtlMs`, standardmäßig 30 Minuten; kein eigener Companion-Memoeintrag.                                                                                  | Verkürzt nur eine bereits sicher cachebare Handback-Antwort; 0 Origin und 0 Enhancely.                  |
+| Origin-Fehler-Circuits                                     | 10 Sekunden; Endpoint+VHost für bewiesene DNS/TCP/TLS-Setupfehler, exakter Request für spätere/unklare Fehler.                                                              | Verhindert einen bekannten aussichtslosen direkten Origin-Fetch; CloudFront bleibt fail-open zuständig. |
+| Fehlende Config / SSM-Fehler                               | 30 Sekunden negative Config-Cooldown.                                                                                                                                       | Danach wird SSM erneut versucht.                                                                        |
+| Erfolgreich geladene Config/API-Key                        | Lebensdauer der Lambda-Execution-Environment.                                                                                                                               | Gleichzeitige erste Auflösungen teilen einen In-flight-Request.                                         |
 
 Das Hard-Handback-Memo nutzt lokal die vollständige öffentliche URL inklusive Query.
 Die CloudFront-Query-Cache-Key-Policy entscheidet zusätzlich, ob Varianten überhaupt
@@ -661,8 +691,9 @@ Schreibserialisierung gelten daher sicher innerhalb eines Worker-Isolates, nicht
 globale CAS-Garantie zwischen allen Isolates.
 
 Der logische Core-Key bleibt immer die normalisierte URL und ist identisch mit der an
-Enhancely gesendeten URL. Nur die physische KV-Ablage ersetzt Schlüssel über 400
-UTF-8-Bytes durch `sha256:<hex>`, damit das Cloudflare-KV-Keylimit nicht zu stillen
+Enhancely gesendeten URL. Die physische KV-Ablage stellt jedem Schlüssel einen
+nicht geheimen Projektscope voran und ersetzt lange URLs durch
+`v1:<scope>:sha256:<url-hash>`, damit das Cloudflare-KV-Keylimit nicht zu stillen
 Cache-Misses führt.
 
 ## Timeouts und harte Limits
@@ -700,14 +731,17 @@ kombiniert.
 Sein Ablauf unterscheidet sich grundlegend:
 
 1. CloudFront holt den Origin-Response: **Origin Nr. 1**.
-2. Der Handler sieht nur Status und Header, nicht den Body.
-3. Nur bei geeignetem `200 text/html` wird der JSON-LD-Cache beziehungsweise
+2. Der Handler sieht nur Status und Header, nicht den Body, und wendet zuerst die
+   lokalen Request- und Response-Gates an.
+3. Bei einem danach noch geeigneten `200 text/html` prüft er den eindeutigen
+   öffentlichen Host und gegebenenfalls `includeHosts`.
+4. Erst nach diesem Host-Gate werden Config und JSON-LD-Cache beziehungsweise
    Enhancely betrachtet.
-4. Nur wenn ein Snippet vorhanden ist, holt der Handler den Origin noch einmal mit
+5. Nur wenn ein Snippet vorhanden ist, holt der Handler den Origin noch einmal mit
    `Accept-Encoding: identity`: **Origin Nr. 2**. Dabei werden die ursprünglichen
    Request-Header und die statischen Custom-Origin-Header wiedergegeben; wie bei
    CloudFront haben statische Custom-Origin-Header bei Namensgleichheit Vorrang.
-5. Erst dann kann injiziert werden; Metadaten beider Antworten müssen konsistent sein.
+6. Erst dann kann injiziert werden; Metadaten beider Antworten müssen konsistent sein.
 
 Damit ist dieser Modus eine bewusste Ausnahme vom Body-/Head-Beweis vor dem
 Enhancely-Aufruf: Beim ersten Response sind nur Status und Header sichtbar. Auch wenn

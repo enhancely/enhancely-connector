@@ -982,4 +982,35 @@ describe('origin-request — fail-open', () => {
     expect(originHits).toBe(0);
     expect(enhancelyFetch).not.toHaveBeenCalled();
   });
+
+  it('returns before config, connector-origin, and Enhancely work for an excluded host', async () => {
+    __resetAdapterConfigForTests();
+    __setBakedConfigForTests({ apiKey: 'sk-test', includeHosts: ['www.example.com'] });
+    __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
+
+    const result = await invoke(makeRequestEvent({ host: 'media.example.com' }));
+    expect(isPassThrough(result)).toBe(true);
+    expect(originHits).toBe(0);
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('uses the static public page-host override for filtering and lookup identity', async () => {
+    __resetAdapterConfigForTests();
+    __setBakedConfigForTests({ apiKey: 'sk-test', includeHosts: ['public.example.com'] });
+    __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
+
+    const response = asResponse(
+      await invoke(
+        makeRequestEvent({
+          host: 'origin.example.com',
+          originCustomHeaders: { 'x-enhancely-page-host': 'public.example.com' },
+        })
+      )
+    );
+    expect(response.body).toContain(SNIPPET);
+    expect(originHits).toBe(1);
+    expect(String(enhancelyFetch.mock.calls[0]?.[0])).toContain(
+      encodeURIComponent('https://public.example.com/page')
+    );
+  });
 });

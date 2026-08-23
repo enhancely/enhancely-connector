@@ -64,28 +64,36 @@ URL-local server retry deadline extends that lifetime, preventing a day-scale
 403/429 backoff from being forgotten after ten minutes. Without the KV binding the
 worker falls back to a per-isolate in-memory cache bounded by both entry count
 and a conservative 16 MiB retained-string estimate (fine for dev, modest hit
-rates in production).
+rates in production). That budget is total per isolate: an in-place API
+base/key change replaces the fallback cache instead of retaining another
+16 MiB cache for each historical configuration.
 
 Workers KV is eventually consistent and has no compare-and-swap operation.
 The core prevents positive/negative write races inside one isolate, but a rare
 cross-isolate conflict cannot be made atomic with KV alone; choosing a cache
 with CAS/transaction semantics is part of the later distributed-cache phase.
 
-Workers KV limits keys to 512 bytes. Cache keys longer than 400 UTF-8 bytes
-(very long URLs) are transparently replaced by a stable
-`sha256:<hex-of-SHA-256>` digest (`kvKeyFor` in `src/kv-cache.ts`) so that
-long-URL pages keep their cache entries and 429 retry backoff instead of
-silently failing every KV read/write.
+Every KV key is prefixed with a non-secret SHA-256 scope derived from the
+Enhancely API base and API key. Reusing one KV namespace across a key rotation
+or several Worker deployments therefore cannot serve a record from another
+Enhancely project. v0.9.6 intentionally starts with a cold KV view because
+unscoped older keys are no longer read.
+
+Workers KV limits keys to 512 bytes. Scoped cache keys longer than 400 UTF-8
+bytes (very long URLs) are transparently replaced by a stable URL digest
+(`kvKeyFor` in `src/kv-cache.ts`) so that long-URL pages keep their cache
+entries and 429 retry backoff instead of silently failing every KV read/write.
 
 ## Env vars & bindings
 
-| Name                     | Kind           | Default                    | Notes                                                                                                                               |
-| ------------------------ | -------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `ENHANCELY_API_KEY`      | **secret**     | — (required)               | `sk-…` / `sk-org-…`. `wrangler secret put` — never in wrangler.toml, never client-side.                                             |
-| `ENHANCELY_BASE`         | var (optional) | `https://app.enhancely.ai` | Listed by the [official Enhancely API endpoints](https://docs.enhancely.ai/); override only for an explicitly selected environment. |
-| `ENHANCELY_TIMEOUT_MS`   | var (optional) | `800`                      | Per-call `AbortSignal.timeout` for the Enhancely API.                                                                               |
-| `ENHANCELY_CACHE_TTL_MS` | var (optional) | `300000` (5 min)           | Cache freshness window; ETag revalidation afterwards.                                                                               |
-| `JSONLD_CACHE`           | KV (optional)  | — (memory fallback)        | Distributed JSON-LD cache; strongly recommended in production.                                                                      |
+| Name                      | Kind           | Default                    | Notes                                                                                                                               |
+| ------------------------- | -------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `ENHANCELY_API_KEY`       | **secret**     | — (required)               | `sk-…` / `sk-org-…`. `wrangler secret put` — never in wrangler.toml, never client-side.                                             |
+| `ENHANCELY_BASE`          | var (optional) | `https://app.enhancely.ai` | Listed by the [official Enhancely API endpoints](https://docs.enhancely.ai/); override only for an explicitly selected environment. |
+| `ENHANCELY_TIMEOUT_MS`    | var (optional) | `800`                      | Per-call `AbortSignal.timeout`; strict positive decimal milliseconds, at most `2147483647`.                                         |
+| `ENHANCELY_CACHE_TTL_MS`  | var (optional) | `300000` (5 min)           | Cache freshness window; strict positive decimal milliseconds, at most `2147483647`; ETag revalidation afterwards.                   |
+| `ENHANCELY_AUTO_REGISTER` | var (optional) | `false`                    | Exact string `"true"` enables the one-step register-or-revalidate POST; every other value keeps conditional GET lookup-only mode.   |
+| `JSONLD_CACHE`            | KV (optional)  | — (memory fallback)        | Distributed JSON-LD cache; strongly recommended in production.                                                                      |
 
 ## Deploy
 

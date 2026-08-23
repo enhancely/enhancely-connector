@@ -239,6 +239,44 @@ export function buildPageUrl(host: string, uri: string, querystring: string): st
   return `https://${host}${uri}${querystring !== '' ? `?${querystring}` : ''}`;
 }
 
+export interface PageRequestTarget {
+  /** Host header the connector must present to the custom origin. */
+  originHost: string;
+  /** Public authority used in the page URL sent to Enhancely. */
+  pageHost: string;
+  /** Raw public page URL; injector-core applies the authoritative normalization. */
+  pageUrl: string;
+}
+
+/**
+ * Resolve the origin and public page hosts once for every Lambda entrypoint.
+ *
+ * CloudFront represents header field instances as arrays. A duplicated Host
+ * or page-host override is ambiguous and therefore cannot be used for safe
+ * connector work. An absent Host falls back to the custom-origin domain, as
+ * CloudFront itself does. A static `X-Enhancely-Page-Host` takes precedence
+ * for deployments whose origin cannot receive the public viewer Host.
+ */
+export function resolvePageRequestTarget(
+  request: Pick<CloudFrontRequest, 'headers' | 'origin' | 'uri' | 'querystring'>
+): PageRequestTarget | null {
+  const hostEntries = request.headers['host'];
+  if (hostEntries !== undefined && hostEntries.length !== 1) return null;
+  const originHost = hostEntries?.[0]?.value ?? request.origin?.custom?.domainName ?? '';
+  if (originHost === '') return null;
+
+  const pageHostEntries = request.origin?.custom?.customHeaders[PAGE_HOST_HEADER];
+  if (pageHostEntries !== undefined && pageHostEntries.length !== 1) return null;
+  const pageHost = pageHostEntries?.[0]?.value ?? originHost;
+  if (pageHost === '') return null;
+
+  return {
+    originHost,
+    pageHost,
+    pageUrl: buildPageUrl(pageHost, request.uri, request.querystring),
+  };
+}
+
 /**
  * URL for the origin fetch:
  * `{protocol}://{domainName}[:port]{originPath}{uri}[?querystring]` — exactly
@@ -341,24 +379,9 @@ export function withoutConditionalHeaders(headers: Record<string, string>): Reco
   return out;
 }
 
-/** First value of a static origin custom header, or null. */
-export function customHeaderValue(
-  request: Pick<CloudFrontRequest, 'origin'>,
-  name: string
-): string | null {
-  const value = request.origin?.custom?.customHeaders[name]?.[0]?.value ?? null;
-  return value !== null && value !== '' ? value : null;
-}
-
 /** First value of a (lowercase-keyed) CloudFront header, or null. */
 export function headerValue(headers: CloudFrontHeaders, name: string): string | null {
   return headers[name]?.[0]?.value ?? null;
-}
-
-/** Cache-Control is a list field: every CloudFront header entry is operative. */
-export function cacheControlValue(headers: CloudFrontHeaders): string | null {
-  const entries = headers['cache-control'];
-  return entries === undefined ? null : entries.map((entry) => entry.value).join(', ');
 }
 
 /** Combine every value of a list-like response header. */

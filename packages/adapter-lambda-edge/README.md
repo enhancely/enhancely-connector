@@ -313,6 +313,22 @@ double-encoded octets remain literal. An `X-Robots-Tag: noindex` or `none` on
 either the first response or the identity re-fetch vetoes injection. Other
 robots metadata must be stable across both responses.
 
+`includeHosts` is evaluated at the same early policy layer and accepts exact
+public hostnames only. A non-matching host performs no SSM lookup, connector
+origin fetch, Enhancely call/registration, or companion cache rewrite. Empty
+means all hosts for backwards compatibility; an explicitly supplied malformed
+hand-config policy matches nothing. The compared host is exactly the one used
+for the Enhancely page URL: static `X-Enhancely-Page-Host` first, otherwise the
+request `Host`.
+Each field must have exactly one non-empty value; an explicitly empty override
+vetoes connector work instead of silently falling back to the origin hostname.
+Because CloudFront has already invoked an associated function before this
+local check can run, use path-scoped behaviors or separate distributions when
+Lambda invocation cost itself must also be excluded.
+The Terraform module requires `host_in_cache_key_asserted = true` whenever
+`include_hosts` is non-empty, so the external cache-key prerequisite cannot be
+accepted accidentally.
+
 **Fail-open invariant:** the whole handler is wrapped in try/catch and always
 returns the original response — config unresolvable, re-fetch error/timeout/
 non-200/redirect, body over the generated-response quota, unexpected charset
@@ -366,6 +382,7 @@ SSM failure does not strand a warm execution environment.
 | `ssmRegion`                 | `us-east-1`                    | Region of the SSM parameter.                                                                                                                                                                                                                                                                                                                                                               |
 | `ssmTimeoutMs`              | `2000`                         | Bound on the SSM `GetParameter` call (fail-open on expiry).                                                                                                                                                                                                                                                                                                                                |
 | `excludePaths`              | `[]`                           | Paths skipped before config/API work; CloudFront-style `*`/`?`.                                                                                                                                                                                                                                                                                                                            |
+| `includeHosts`              | `[]`                           | Exact public page hostnames enabled before SSM, connector-origin, Enhancely, registration, or companion cache-cap work. No wildcard/scheme/path/port. TF: `include_hosts`.                                                                                                                                                                                                                 |
 | `assertedDefaultTtlSeconds` | `0` (off)                      | Asserted minimum DefaultTTL used to cap lifetime-less retries.                                                                                                                                                                                                                                                                                                                             |
 | `nonPageMemoTtlMs`          | `1800000` (30 min)             | How long origin-request remembers a hard veto, so repeats skip its classification fetch. Independent of the JSON-LD cache TTL.                                                                                                                                                                                                                                                             |
 | `capSetCookieResponses`     | `false`                        | Pair-wide assertion for the origin-request injector's generated fallback and companion, also honored by standalone origin-response: cap `Set-Cookie` responses on credential-less requests. **Never** enable on an origin that mints session cookies for anonymous requests — replayed `Set-Cookie` via downstream caches is the session-fixation pattern. TF: `cap_set_cookie_responses`. |
@@ -457,9 +474,18 @@ to the browser (non-negotiable rule #1 of this repo).
 - `X-Robots-Tag: noindex`/`none` on either response vetoes injection.
   Non-blocking robots metadata must be stable across both responses; a mismatch
   passes through rather than dropping or changing crawler policy.
-- Best results when the origin request policy **forwards the viewer `Host`
-  header** — it is used both for the re-fetch vhost and for the page URL sent
-  to Enhancely. Without it, the origin domain is used instead.
+- Forward the viewer `Host` when it is used for the origin vhost or public page
+  URL. Without it, configure the static origin header
+  `X-Enhancely-Page-Host`. If `includeHosts` distinguishes several aliases on
+  one behavior, viewer `Host` must be in the **cache policy**, not merely the
+  origin request policy: the default cache key contains the distribution name,
+  so a cache hit could otherwise cross aliases without invoking Lambda. The
+  static header cannot distinguish several aliases.
+- If the origin representation depends on query strings, configure the cache
+  policy or origin request policy for **all query strings**. AWS otherwise does
+  not guarantee complete `request.querystring` access to origin-facing edge
+  functions, so the connector cannot prove its direct fetch reproduces the
+  CloudFront origin request.
 
 ## Build & package
 
@@ -594,9 +620,10 @@ aws cloudfront update-distribution --id <DIST_ID> \
   --distribution-config file://dist-config.updated.json
 ```
 
-Recommended alongside: an origin request policy that forwards the viewer
-`Host` header, and a cache policy with a non-trivial TTL for HTML (so the
-injected page is actually cached and origin work stays a cache-miss cost).
+Recommended alongside: a cache policy with a non-trivial TTL for HTML (so the
+injected page is actually cached and origin work stays a cache-miss cost), all
+query strings when the origin varies on them, and the viewer `Host` in the
+cache key whenever multiple aliases have different connector policy.
 
 Verify:
 

@@ -103,6 +103,7 @@ The API key is a secret — it must never be exposed client-side or committed. `
 | `maxJsonLdBytes`            | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                                                                                                                                                                                                        |
 | `autoRegister`              | `false`                    | `false`: one conditional GET without registration. `true`: exactly one register-or-revalidate POST for lookup or registration. Only the explicit low-level compatibility API can still use GET→404→POST.                                                       |
 | `excludePaths`              | `[]`                       | Lambda@Edge-only path exclusions, checked before config/API work.                                                                                                                                                                                              |
+| `includeHosts`              | `[]`                       | Lambda@Edge-only exact public-host selector (TF: `include_hosts`). A non-matching host skips SSM, connector-origin fetch, Enhancely, registration, and companion cache rewriting. Empty keeps the historical all-host behavior.                                |
 | `assertedDefaultTtlSeconds` | `0` (off)                  | Asserted minimum DefaultTTL for bounded retry caching. Applied by origin-request-generated misses, standalone origin-response, and the companion's safe handback cap.                                                                                          |
 | `nonPageMemoTtlMs`          | `1800000` (30 min)         | origin-request only: how long a hard-veto verdict is remembered, so repeats skip its classification fetch.                                                                                                                                                     |
 | `capSetCookieResponses`     | `false`                    | Lambda pair-wide and standalone origin-response: extend the retry cap to `Set-Cookie` responses (credential-less requests only). Never enable on origins minting session cookies for anonymous requests.                                                       |
@@ -114,6 +115,19 @@ collapse. Reserved, non-ASCII, malformed, and double-encoded octets stay
 literal, so configure patterns in canonical literal form. A response carrying
 `X-Robots-Tag: noindex` or `none` is never injected; the same veto is applied
 to the identity re-fetch that supplies the replacement body.
+
+`includeHosts` accepts exact hostnames only: no wildcard, scheme, path,
+credentials, or port. Matching is case-insensitive after IDNA/Punycode
+canonicalization; a final DNS dot remains a distinct record identity. An
+explicitly supplied malformed hand-written policy value matches nothing rather
+than widening to every host. The filter prevents downstream connector work,
+but it cannot prevent the already-associated Lambda@Edge invocation itself;
+use narrower cache behaviors or separate distributions when invocation cost
+must also be avoided. This filter runs only on CloudFront cache misses. If
+multiple aliases share a distribution/behavior, the viewer `Host` must
+therefore also be in that behavior's **cache policy** (not only its origin
+request policy), or the aliases must use separate distributions. Otherwise a
+cached object can be reused across aliases without invoking either Lambda.
 
 ## Documentation
 
@@ -131,6 +145,8 @@ module "enhancely_injector" {
   source        = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=vX.Y.Z"
   providers     = { aws = aws.us_east_1 }
   auto_register = true
+  include_hosts = ["www.example.com"]
+  host_in_cache_key_asserted = true # after checking the behavior's cache policy
 }
 ```
 

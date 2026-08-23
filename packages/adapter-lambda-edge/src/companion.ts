@@ -25,7 +25,7 @@
  */
 import type { CloudFrontResponseEvent, CloudFrontResponseResult } from 'aws-lambda';
 
-import { matchesExcludedPath } from '@enhancely/injector-core';
+import { isHostIncluded, matchesExcludedPath } from '@enhancely/injector-core';
 
 import {
   blocksIndexing,
@@ -34,6 +34,7 @@ import {
   headerValues,
   INJECTED_MARKER_HEADER,
   NON_HTML_EXTENSION,
+  resolvePageRequestTarget,
   shouldAttemptGeneratedResponse,
 } from './shared.js';
 import type { AttemptInput } from './shared.js';
@@ -44,6 +45,7 @@ import {
   getCapSetCookieResponses,
   getConfigRetryInMs,
   getExcludePaths,
+  getIncludeHosts,
   getNonPageMemoTtlMs,
   resolveAdapterConfig,
 } from './config.js';
@@ -86,6 +88,11 @@ export const handler = async (
     if (matchesExcludedPath(getExcludePaths(), request.uri)) return response;
     if (NON_HTML_EXTENSION.test(request.uri)) return response;
     if (request.headers['range'] !== undefined) return response;
+
+    // A host excluded from the injector must also retain CloudFront's native
+    // cache semantics. This check precedes config/SSM and every cache cap.
+    const target = resolvePageRequestTarget(request);
+    if (target === null || !isHostIncluded(target.pageHost, getIncludeHosts())) return response;
 
     // Header-only eligibility is sufficient for a conservative cache cap, but
     // explicitly NOT sufficient for an Enhancely call. Content-Encoding is

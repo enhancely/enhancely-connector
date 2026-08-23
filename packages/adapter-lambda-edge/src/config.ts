@@ -91,10 +91,10 @@ export const DEFAULT_NON_PAGE_MEMO_TTL_MS = 1_800_000;
 /**
  * Shape of the deploy-time generated `connector-config.json` (all optional).
  *
- * NOTE for hand-rolled deployments: `excludePaths` and
+ * NOTE for hand-rolled deployments: `excludePaths`, `includeHosts` and
  * `assertedDefaultTtlSeconds` are honored ONLY via this baked file. A
  * deployment that supplies the key purely through SSM without shipping a
- * `connector-config.json` silently runs without both controls. The Terraform
+ * `connector-config.json` silently runs without those controls. The Terraform
  * module always bakes the file, so the supported path is unaffected.
  */
 export interface BakedConnectorConfig {
@@ -174,6 +174,15 @@ export interface BakedConnectorConfig {
    * the full request path. Checked before config/SSM resolution.
    */
   excludePaths?: string[];
+  /**
+   * Exact public page hostnames on which connector work is enabled. Missing
+   * or empty preserves the historical all-host behavior. The list is checked
+   * synchronously before SSM, the connector's origin fetch, Enhancely, or a
+   * companion cache cap. Entries are hostname-only (no wildcard, scheme,
+   * path, credentials, or port); an explicitly supplied malformed hand-written
+   * policy deliberately matches nothing rather than widening to every host.
+   */
+  includeHosts?: string[];
 }
 
 /* ------------------------------------------------------------------------ */
@@ -280,6 +289,18 @@ function parseBaked(raw: unknown): BakedConnectorConfig {
       (entry): entry is string => typeof entry === 'string' && entry !== ''
     );
     if (patterns.length > 0) baked.excludePaths = patterns;
+  }
+  if (Object.hasOwn(source, 'includeHosts')) {
+    if (Array.isArray(source['includeHosts'])) {
+      // Preserve an invalid item as an empty sentinel. Filtering junk out
+      // could turn an explicitly configured non-empty policy into [] and
+      // accidentally re-enable the connector on every host.
+      baked.includeHosts = source['includeHosts'].map((entry) =>
+        typeof entry === 'string' ? entry : ''
+      );
+    } else {
+      baked.includeHosts = [''];
+    }
   }
 
   return baked;
@@ -489,6 +510,15 @@ export function getNonPageMemoTtlMs(): number {
  */
 export function getExcludePaths(): readonly string[] {
   return bakedConfig()?.excludePaths ?? [];
+}
+
+/**
+ * Exact public page-host selector (baked `includeHosts`). Like exclude paths,
+ * this is available synchronously before API-key/SSM resolution. Empty means
+ * unrestricted for backwards compatibility.
+ */
+export function getIncludeHosts(): readonly string[] {
+  return bakedConfig()?.includeHosts ?? [];
 }
 
 /* ------------------------------------------------------------------------ */

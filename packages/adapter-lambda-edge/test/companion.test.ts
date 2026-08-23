@@ -94,6 +94,36 @@ describe('companion — zero Enhancely calls', () => {
 });
 
 describe('companion — cache-lifetime capping', () => {
+  it('leaves excluded public hosts and their native cache lifetime untouched', async () => {
+    setUp({ includeHosts: ['www.example.com'] });
+    const event = makeEvent({
+      host: 'media.example.com',
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'max-age=3600',
+      },
+    });
+    const result = await invokeCompanion(event);
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(cacheControlOf(result)).toBe('max-age=3600');
+    expect(enhancelyFetch).not.toHaveBeenCalled();
+  });
+
+  it('checks the static public page-host override rather than the origin-facing Host', async () => {
+    setUp({ includeHosts: ['public.example.com'] });
+    const result = await invokeCompanion(
+      makeEvent({
+        host: 'origin.example.com',
+        originCustomHeaders: { 'x-enhancely-page-host': 'public.example.com' },
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'max-age=3600',
+        },
+      })
+    );
+    expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=60, must-revalidate');
+  });
+
   it('caps a lifetime-less pass-through only under the operator assertion', async () => {
     setUp({ assertedDefaultTtlSeconds: 86_400 });
     const result = await invokeCompanion(makeEvent());

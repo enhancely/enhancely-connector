@@ -157,7 +157,7 @@ async function main() {
   const auth = process.env.ASSET_PATHS_AUTH;
   const known = await knownNonHtmlExtensions();
 
-  /** @type {{host: string, pathname: string, ext: string|null}[]} */
+  /** @type {{pathname: string, ext: string|null}[]} */
   const assets = [];
   let pages = 0;
   const externalHosts = new Set();
@@ -186,11 +186,15 @@ async function main() {
       if (ext === null || PAGE_EXTENSIONS.has(ext)) continue;
       // Only suggest what the injector already rejects by extension.
       if (!known.has(ext)) continue;
-      if (resolved.hostname !== base.hostname && !sharesRegistrableSuffix(resolved, base)) {
+      // A sibling hostname is not evidence of the same CloudFront
+      // distribution or cache behavior. Operators can analyse an alias
+      // explicitly by passing it as another page URL; never let a guessed
+      // eTLD+1 relationship produce customer routing recommendations.
+      if (resolved.hostname !== base.hostname) {
         externalHosts.add(resolved.hostname);
         continue;
       }
-      assets.push({ host: resolved.hostname, pathname: resolved.pathname, ext });
+      assets.push({ pathname: resolved.pathname, ext });
     }
   }
 
@@ -267,8 +271,9 @@ async function main() {
   );
   if (externalHosts.size > 0) {
     console.log(
-      `\n  Ignored ${externalHosts.size} external host(s) — they do not go through this ` +
-        `distribution: ${[...externalHosts].slice(0, 5).join(', ')}`
+      `\n  Ignored ${externalHosts.size} distinct off-host hostname(s) — hostname similarity does ` +
+        `not prove CloudFront distribution membership. Analyse an alias explicitly if ` +
+        `needed: ${[...externalHosts].slice(0, 5).join(', ')}`
     );
   }
   console.log(
@@ -309,12 +314,6 @@ function greedyCover(assets, patternsOf, target) {
     }
   }
   return { patterns: chosen, covered: (total - remaining.size) / total };
-}
-
-/** Treat www.example.com and assets.example.com as the same site. */
-function sharesRegistrableSuffix(a, b) {
-  const tail = (host) => host.split('.').slice(-2).join('.');
-  return tail(a.hostname) === tail(b.hostname);
 }
 
 main().catch((error) => {

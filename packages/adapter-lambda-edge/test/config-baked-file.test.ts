@@ -13,6 +13,7 @@ import {
   __resetAdapterConfigForTests,
   getAssertedDefaultTtlSeconds,
   getExcludePaths,
+  getIncludeHosts,
   resolveAdapterConfig,
 } from '../src/config.js';
 
@@ -42,6 +43,16 @@ describe('baked file read path (no test seam)', () => {
       JSON.stringify({ excludePaths: ['/account/*', '/login'], assertedDefaultTtlSeconds: 3600 })
     );
     expect(getExcludePaths()).toEqual(['/account/*', '/login']);
+  });
+
+  it('serves includeHosts synchronously and fail-closed from the real file', () => {
+    const file = join(dir, 'connector-config.json');
+    writeFileSync(file, JSON.stringify({ includeHosts: ['www.example.com'] }));
+    expect(getIncludeHosts()).toEqual(['www.example.com']);
+
+    __resetAdapterConfigForTests();
+    writeFileSync(file, JSON.stringify({ includeHosts: 'www.example.com' }));
+    expect(getIncludeHosts()).toEqual(['']);
   });
 
   it('feeds assertedDefaultTtlSeconds through resolution, including with a baked key', async () => {

@@ -35,7 +35,7 @@
  *
  * All connector logic (Enhancely API client, cache + ETag revalidation,
  * injection, fail-open orchestration) lives in @enhancely/injector-core; this
- * file only translates CloudFront event shapes (repo rule 7).
+ * file only translates CloudFront event shapes (repo rule 8).
  */
 import type {
   CloudFrontHeaders,
@@ -47,6 +47,7 @@ import {
   getJsonLdLookup,
   getJsonLdRegisterLookup,
   injectIntoHead,
+  isHostIncluded,
   matchesExcludedPath,
   MemoryCache,
   splitOutsideHttpQuotesStrict,
@@ -58,6 +59,7 @@ import {
   getCapSetCookieResponses,
   getConfigRetryInMs,
   getExcludePaths,
+  getIncludeHosts,
   getOriginTimeoutMs,
   resolveAdapterConfig,
 } from './config.js';
@@ -66,9 +68,7 @@ import { retryablePassThroughResponse } from './cache-cap.js';
 import {
   blocksIndexing,
   buildOriginUrl,
-  buildPageUrl,
   combinedHeaderValue,
-  customHeaderValue,
   forwardedHeaders,
   GENERATED_HTML_CONTENT_TYPE,
   GENERATED_RESPONSE_SAFETY_MARGIN_BYTES,
@@ -80,7 +80,7 @@ import {
   MAX_ORIGIN_BODY_BYTES,
   MAX_RESPONSE_HEADER_BYTES,
   originCustomHeaders,
-  PAGE_HOST_HEADER,
+  resolvePageRequestTarget,
   serializedHeaderBytes,
   shouldAttempt,
 } from './shared.js';
@@ -257,15 +257,12 @@ export const handler: CloudFrontResponseHandler = async (event) => {
       return response;
     }
 
+    const target = resolvePageRequestTarget(request);
+    if (target === null || !isHostIncluded(target.pageHost, getIncludeHosts())) return response;
+    const { originHost, pageUrl } = target;
+
     const originUrl = buildOriginUrl(request);
     if (originUrl === null) return response;
-
-    // Host header CloudFront sent to the origin (the viewer Host when the
-    // origin request policy forwards it — recommended, see README). This is
-    // what the origin re-fetch must present so vhosts resolve.
-    const originHost =
-      headerValue(request.headers, 'host') ?? request.origin?.custom?.domainName ?? '';
-    if (originHost === '') return response;
 
     // No resolvable API key → body pass-through (logged once per failed
     // resolution), with a bounded cache retry only for an otherwise eligible
@@ -281,13 +278,6 @@ export const handler: CloudFrontResponseHandler = async (event) => {
           });
     }
 
-    // Public page host for the Enhancely lookup. Origins that must NOT
-    // receive the viewer Host (S3 website endpoints reject foreign hosts, so
-    // their distributions cannot forward it) declare the public hostname as a
-    // static origin custom header instead: X-Enhancely-Page-Host.
-    const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
-    const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
-
     // Ask Enhancely FIRST — this needs no page body (cache + ETag + API call
     // only). With autoRegister, the register-or-revalidate POST discovers and
     // reads in one round-trip; lookup-only mode remains a conditional GET.
@@ -297,7 +287,7 @@ export const handler: CloudFrontResponseHandler = async (event) => {
     // not-yet-configured key (no snippet) likewise costs zero extra origin hits.
     const lookup = config.autoRegister
       ? await getJsonLdRegisterLookup(pageUrl, cache, config)
-      : await getJsonLdLookup(pageUrl, cache, { ...config, autoRegister: false });
+      : await getJsonLdLookup(pageUrl, cache, config);
     if (lookup.snippet === null) {
       return lookup.revalidateInMs === null
         ? response

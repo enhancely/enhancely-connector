@@ -82,8 +82,29 @@ run "default_origin_request_pair" {
         for source in data.archive_file.origin_request_pair.source :
         source.content if source.filename == "connector-config.json"
       ])).originTimeoutMs == 2000
+      && jsondecode(one([
+        for source in data.archive_file.origin_request_pair.source :
+        source.content if source.filename == "connector-config.json"
+      ])).includeHosts == []
     )
     error_message = "The baked defaults must keep separate 800 ms Enhancely and 2000 ms origin budgets."
+  }
+}
+
+run "include_hosts_baked_into_default_pair" {
+  command = plan
+
+  variables {
+    include_hosts              = ["www.example.com", "shop.example.com"]
+    host_in_cache_key_asserted = true
+  }
+
+  assert {
+    condition = jsondecode(one([
+      for source in data.archive_file.origin_request_pair.source :
+      source.content if source.filename == "connector-config.json"
+    ])).includeHosts == ["www.example.com", "shop.example.com"]
+    error_message = "The default pair must receive the exact include_hosts policy in its shared artifact."
   }
 }
 
@@ -156,6 +177,79 @@ run "standalone_origin_response_explicit_timeout_override" {
     ])).timeoutMs == 800
     error_message = "An explicit timeout_ms must override the compatibility mode's historical default."
   }
+}
+
+run "include_hosts_baked_into_standalone_compatibility" {
+  command = plan
+
+  variables {
+    deployment_mode            = "origin-response"
+    include_hosts              = ["www.example.com"]
+    host_in_cache_key_asserted = true
+  }
+
+  assert {
+    condition = jsondecode(one([
+      for source in data.archive_file.origin_response.source :
+      source.content if source.filename == "connector-config.json"
+    ])).includeHosts == ["www.example.com"]
+    error_message = "Standalone origin-response must receive the same include_hosts policy."
+  }
+}
+
+run "reject_invalid_include_hosts" {
+  command = plan
+
+  variables {
+    include_hosts              = ["www.example.com", "*.example.com"]
+    host_in_cache_key_asserted = true
+  }
+
+  expect_failures = [
+    var.include_hosts,
+  ]
+}
+
+run "allow_dns_maximum_include_host_lengths" {
+  command = plan
+
+  variables {
+    include_hosts = [
+      join(".", [for size in [63, 63, 63, 61] : join("", [for _ in range(size) : "a"])]),
+      "${join(".", [for size in [63, 63, 63, 61] : join("", [for _ in range(size) : "b"])])}."
+    ]
+    host_in_cache_key_asserted = true
+  }
+
+  assert {
+    condition     = length(var.include_hosts[0]) == 253 && length(var.include_hosts[1]) == 254
+    error_message = "The DNS boundary fixtures must remain 253 bytes without and 254 bytes with a final dot."
+  }
+}
+
+run "reject_254_character_include_host_without_final_dot" {
+  command = plan
+
+  variables {
+    include_hosts              = [join(".", [for size in [63, 63, 63, 62] : join("", [for _ in range(size) : "a"])])]
+    host_in_cache_key_asserted = true
+  }
+
+  expect_failures = [
+    var.include_hosts,
+  ]
+}
+
+run "reject_include_hosts_without_cache_key_assertion" {
+  command = plan
+
+  variables {
+    include_hosts = ["www.example.com"]
+  }
+
+  expect_failures = [
+    aws_lambda_function.injector,
+  ]
 }
 
 run "reject_unknown_deployment_mode" {

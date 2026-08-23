@@ -36,6 +36,7 @@ export {
   isValidUtf8,
 } from './encoding.js';
 export { matchesExcludedPath } from './exclude.js';
+export { isHostIncluded } from './host-filter.js';
 export { blocksIndexing } from './robots.js';
 export {
   hasNoTransformDirective,

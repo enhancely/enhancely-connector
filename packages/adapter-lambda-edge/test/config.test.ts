@@ -11,6 +11,7 @@ import {
   __resetAdapterConfigForTests,
   __setBakedConfigForTests,
   getConfigRetryInMs,
+  getIncludeHosts,
   getOriginTimeoutMs,
   resolveAdapterConfig,
 } from '../src/config.js';
@@ -56,6 +57,14 @@ afterEach(() => {
 });
 
 describe('resolveAdapterConfig — baked config', () => {
+  it('serves includeHosts synchronously and preserves invalid non-empty policy', () => {
+    __setBakedConfigForTests({ includeHosts: ['www.example.com', 'shop.example.com'] });
+    expect(getIncludeHosts()).toEqual(['www.example.com', 'shop.example.com']);
+
+    __setBakedConfigForTests({ includeHosts: ['www.example.com', 7 as never] });
+    expect(getIncludeHosts()).toEqual(['www.example.com', '']);
+  });
+
   it('uses the baked apiKey and never contacts SSM', async () => {
     __setBakedConfigForTests({
       apiKey: 'sk-baked',

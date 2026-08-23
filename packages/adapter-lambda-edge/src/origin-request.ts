@@ -100,7 +100,7 @@
  *
  * All connector logic (API client, cache + ETag revalidation, injection,
  * fail-open orchestration) lives in @enhancely/injector-core; this file only
- * translates CloudFront event shapes (repo rule 7). Everything it shares with
+ * translates CloudFront event shapes (repo rule 8). Everything it shares with
  * the origin-response entrypoint comes from ./shared.js, so the two triggers
  * cannot drift apart.
  */
@@ -118,6 +118,7 @@ import {
   getJsonLdLookup,
   getJsonLdRegisterLookup,
   injectIntoHead,
+  isHostIncluded,
   matchesExcludedPath,
   MemoryCache,
   normalizeForEnhancely,
@@ -127,6 +128,7 @@ import {
   getAssertedDefaultTtlSeconds,
   getCapSetCookieResponses,
   getExcludePaths,
+  getIncludeHosts,
   getNonPageMemoTtlMs,
   getOriginTimeoutMs,
   resolveAdapterConfig,
@@ -145,12 +147,9 @@ import { fetchOriginHtml, originFetchFailureScope } from './origin-fetch.js';
 import {
   blocksIndexing,
   buildOriginUrl,
-  buildPageUrl,
-  customHeaderValue,
   forwardedHeaders,
   GENERATED_HTML_CONTENT_TYPE,
   GENERATED_RESPONSE_SAFETY_MARGIN_BYTES,
-  headerValue,
   INJECTED_MARKER_HEADER,
   INJECTED_MARKER_VALUE,
   isUtf8SafeHtmlBytes,
@@ -159,7 +158,7 @@ import {
   MAX_RESPONSE_HEADER_BYTES,
   NON_HTML_EXTENSION,
   originCustomHeaders,
-  PAGE_HOST_HEADER,
+  resolvePageRequestTarget,
   serializedHeaderBytes,
   shouldAttemptGeneratedResponse,
   withoutConditionalHeaders,
@@ -603,16 +602,19 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // lookup without adding any private coordination header to the origin.
     if (request.headers['range'] !== undefined) return request;
 
+    // Host policy is deliberately request-only and synchronous: an excluded
+    // public hostname pays no SSM lookup, connector origin fetch, cache read,
+    // Enhancely call, registration, or companion cache rewrite. The target
+    // helper is shared by all three Lambda entrypoints so the checked host is
+    // exactly the one used in the URL sent to Enhancely.
+    const target = resolvePageRequestTarget(request);
+    if (target === null || !isHostIncluded(target.pageHost, getIncludeHosts())) return request;
+    const { originHost, pageUrl } = target;
+
     // Only custom origins can be re-issued by this adapter (S3 REST origins
     // speak a different protocol and would need SigV4 signing).
     const originUrl = buildOriginUrl(request);
     if (originUrl === null) return request;
-
-    // Host header CloudFront would have sent to the origin. The generated
-    // fetch must present it so name-based vhosts resolve to the right site.
-    const originHost =
-      headerValue(request.headers, 'host') ?? request.origin?.custom?.domainName ?? '';
-    if (originHost === '') return request;
 
     // Proven transport failures suppress this endpoint+vhost; ambiguous or
     // post-connect failures suppress only the exact request target. Either
@@ -632,12 +634,6 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // key costs literally nothing: CloudFront proceeds as usual.
     const config = await resolveAdapterConfig();
     if (config === null) return request;
-
-    // Public page host for the Enhancely lookup. Origins that must NOT receive
-    // the viewer Host (S3 website endpoints reject foreign hosts) declare the
-    // public hostname as a static origin custom header instead.
-    const pageHost = customHeaderValue(request, PAGE_HOST_HEADER) ?? originHost;
-    const pageUrl = buildPageUrl(pageHost, request.uri, request.querystring);
 
     // Already known not to be an injectable page: skip our fetch entirely, so
     // this costs exactly one CloudFront fetch and nothing else.
@@ -800,7 +796,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       const startedAt = Date.now();
       lookup = config.autoRegister
         ? await getJsonLdRegisterLookup(pageUrl, cache, config)
-        : await getJsonLdLookup(pageUrl, cache, { ...config, autoRegister: false });
+        : await getJsonLdLookup(pageUrl, cache, config);
       // config.timeoutMs is the ENHANCELY budget (getOriginTimeoutMs is the
       // separate origin-fetch budget and would be the wrong yardstick here).
       noteUpstreamCallDuration(Date.now() - startedAt, config.timeoutMs);
