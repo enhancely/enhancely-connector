@@ -25,7 +25,7 @@ export {
 } from './config.js';
 export { normalizeForEnhancely, normalizeLite } from './normalize.js';
 export { MemoryCache, isFresh } from './cache.js';
-export { fetchJsonLd, registerJsonLd, registerOrRevalidate, parseRetryAfter } from './client.js';
+export { fetchJsonLd, registerOrRevalidate, parseRetryAfter } from './client.js';
 export { buildScriptTag, findHeadInjectionPoint, injectIntoHead } from './inject.js';
 export {
   charsetOf,
@@ -190,7 +190,6 @@ function sameCacheEntry(left: CacheEntry | undefined, right: CacheEntry | undefi
     left.jsonldRaw === right.jsonldRaw &&
     left.etag === right.etag &&
     left.storedAt === right.storedAt &&
-    left.registrationPending === right.registrationPending &&
     left.retryNotBefore === right.retryNotBefore
   );
 }
@@ -204,8 +203,7 @@ function sameCacheEntryIgnoringRetry(
   return (
     left.jsonldRaw === right.jsonldRaw &&
     left.etag === right.etag &&
-    left.storedAt === right.storedAt &&
-    left.registrationPending === right.registrationPending
+    left.storedAt === right.storedAt
   );
 }
 
@@ -320,7 +318,6 @@ async function storeNotFoundMergingConcurrentBackoff(
 
     const merged: CacheEntry = {
       ...entry,
-      ...(current.registrationPending === true && { registrationPending: true }),
       retryNotBefore: Math.max(entry.retryNotBefore ?? 0, current.retryNotBefore),
     };
     await cache.set(key, merged);
@@ -381,8 +378,7 @@ function lookupDuringRateLimit(
  *   If-None-Match when we hold an ETag):
  *   - 200 → store + inject
  *   - 304/412 → refresh the stored entry's storedAt, serve from cache
- *   - 404 → store a NEGATIVE entry (stops dead-URL polling), inject nothing;
- *     the lookup path additionally fires ONE registration when autoRegister
+ *   - 404 → store a NEGATIVE entry (stops dead-URL polling), inject nothing
  *   - 202 pending → negative entry re-polling at the server's Retry-After
  *     (capped at cacheTtlMs), or resting a full TTL without a hint
  *   - terminal-negative (ignored / empty record / rejected) → negative entry
@@ -406,7 +402,6 @@ async function resolveLookup(
   config: InjectorConfig,
   call: (key: string, etag: string | null | undefined) => Promise<JsonLdFetchResult>,
   opts: {
-    registerOnNotFound: boolean;
     maxBackoffMs: number;
     flightMode: LookupFlightMode;
   }
@@ -419,9 +414,7 @@ async function resolveLookup(
     // tokens or PII that URL normalization could not remove safely.
     if (key === null) return { snippet: null, revalidateInMs: null };
 
-    const autoRegisterSuffix =
-      opts.registerOnNotFound && config.autoRegister ? ':auto-register' : ':lookup-only';
-    const flightKey = `${opts.flightMode}${autoRegisterSuffix}:${key}`;
+    const flightKey = `${opts.flightMode}:${key}`;
 
     return await runLookupSingleFlight(cache, flightKey, async () => {
       const cached = await cache.get(key);
@@ -462,7 +455,6 @@ async function resolveLookup(
             jsonldRaw: cached.jsonldRaw,
             etag: cached.etag,
             storedAt: Date.now(),
-            ...(cached.registrationPending === true && { registrationPending: true }),
           });
           return lookupFromEntry(refreshed, config.cacheTtlMs);
         }
@@ -489,8 +481,8 @@ async function resolveLookup(
         }
         case 'terminal-negative': {
           // Ignored record, never-succeeded generation, or rejected
-          // registration. The server knows the URL — re-registering it would be
-          // pure load, so unlike `not-found` this NEVER triggers autoRegister.
+          // registration. The server knows the URL; cache that answer for a
+          // full TTL because another registration attempt would be pure load.
           const entry = await storeIfSnapshotUnchanged(cache, key, cached, {
             jsonldRaw: null,
             etag: null,
@@ -499,103 +491,10 @@ async function resolveLookup(
           return lookupFromEntry(entry, config.cacheTtlMs);
         }
         case 'not-found': {
-          // Keep the explicit conditional-GET API backwards-compatible: it can
-          // still register after a 404. Higher-level auto-register callers use
-          // getJsonLdRegisterLookup directly and therefore need only one POST.
-          if (opts.registerOnNotFound && config.autoRegister) {
-            const registration = await registerOrRevalidate(config, key);
-            if (registration.status === 'ok') {
-              const entry = await storeIfSnapshotUnchanged(
-                cache,
-                key,
-                cached,
-                {
-                  jsonldRaw: registration.jsonldRaw,
-                  etag: registration.etag,
-                  storedAt: Date.now(),
-                },
-                true
-              );
-              return lookupFromEntry(entry, config.cacheTtlMs);
-            }
-
-            if (registration.status === 'pending') {
-              const entry = await storeIfSnapshotUnchanged(
-                cache,
-                key,
-                cached,
-                registration.retryAfterSeconds !== null
-                  ? {
-                      jsonldRaw: null,
-                      etag: null,
-                      storedAt: 0,
-                      registrationPending: true,
-                      retryNotBefore:
-                        Date.now() +
-                        Math.min(
-                          Math.max(registration.retryAfterSeconds, 1) * 1000,
-                          config.cacheTtlMs
-                        ),
-                    }
-                  : {
-                      jsonldRaw: null,
-                      etag: null,
-                      storedAt: Date.now(),
-                      registrationPending: true,
-                    }
-              );
-              return lookupFromEntry(entry, config.cacheTtlMs);
-            }
-
-            if (registration.status === 'terminal-negative') {
-              const entry = await storeIfSnapshotUnchanged(cache, key, cached, {
-                jsonldRaw: null,
-                etag: null,
-                storedAt: Date.now(),
-              });
-              return lookupFromEntry(entry, config.cacheTtlMs);
-            }
-
-            // The compatibility POST is still an Enhancely call: retain its
-            // URL-local Retry-After. Only a real 429 opens the shared circuit,
-            // and that circuit is capped separately at 60 s; a plan-limit 403
-            // must not suppress reads for other URLs. Treat the impossible
-            // hint-less 412 as a short transient error rather than caching the
-            // GET 404 for a full TTL and discarding the registration outcome.
-            if (
-              registration.status === 'rate-limited' ||
-              registration.status === 'registration-limited' ||
-              registration.status === 'error' ||
-              registration.status === 'not-modified'
-            ) {
-              const backoffMs =
-                (registration.status === 'rate-limited' ||
-                  registration.status === 'registration-limited') &&
-                registration.retryAfterSeconds !== null
-                  ? Math.min(
-                      Math.max(registration.retryAfterSeconds, 1) * 1000,
-                      MAX_REGISTER_BACKOFF_MS
-                    )
-                  : DEFAULT_RETRY_BACKOFF_MS;
-              const now = Date.now();
-              const retryNotBefore = now + backoffMs;
-              if (registration.status === 'rate-limited') {
-                recordRateLimitDeadline(config, now + Math.min(backoffMs, MAX_RETRY_BACKOFF_MS));
-              }
-              const entry = await storeBackoffMemo(cache, key, cached, {
-                jsonldRaw: null,
-                etag: null,
-                storedAt: 0,
-                retryNotBefore,
-              });
-              return lookupFromEntry(entry, config.cacheTtlMs);
-            }
-          }
           const entry = await storeNotFoundMergingConcurrentBackoff(cache, key, cached, {
             jsonldRaw: null,
             etag: null,
             storedAt: Date.now(),
-            ...(opts.registerOnNotFound && config.autoRegister && { registrationPending: true }),
           });
           return lookupFromEntry(entry, config.cacheTtlMs);
         }
@@ -619,7 +518,6 @@ async function resolveLookup(
             jsonldRaw: cached?.jsonldRaw ?? null,
             etag: cached?.etag ?? null,
             storedAt: cached?.storedAt ?? 0,
-            ...(cached?.registrationPending === true && { registrationPending: true }),
             retryNotBefore,
           };
           let served: CacheEntry = memo;
@@ -643,18 +541,17 @@ export async function getJsonLdLookup(
   config: InjectorConfig
 ): Promise<JsonLdLookupResult> {
   return resolveLookup(url, cache, config, (key, etag) => fetchJsonLd(config, key, etag), {
-    registerOnNotFound: true,
     maxBackoffMs: MAX_RETRY_BACKOFF_MS,
     flightMode: 'conditional-get',
   });
 }
 
 /**
- * Register-or-revalidate lookup for adapters that both DISCOVER pages and
- * consume snippets in one place (including every Lambda entrypoint): a single
- * `POST /api/v1/jsonld { url }` with `If-None-Match` replaces the GET→404→POST
- * pair — unknown URLs are registered, known ones are revalidated (412) or
- * fetched (200) in the same round-trip, and the entry this stores makes the
+ * Register-or-revalidate lookup for body-aware adapters that both discover
+ * pages and consume snippets in one place. A single
+ * `POST /api/v1/jsonld { url }` with `If-None-Match` registers unknown URLs and
+ * revalidates (412) or fetches (200) known ones in the same round-trip. The
+ * entry this stores makes the
  * NEXT miss inject. `autoRegister` is irrelevant here: the call itself is the
  * registration. URL-local register backoffs honor day-scale Retry-After
  * values, bounded by MAX_REGISTER_BACKOFF_MS; the shared 429 circuit remains
@@ -668,7 +565,6 @@ export async function getJsonLdRegisterLookup(
   config: InjectorConfig
 ): Promise<JsonLdLookupResult> {
   return resolveLookup(url, cache, config, (key, etag) => registerOrRevalidate(config, key, etag), {
-    registerOnNotFound: false,
     maxBackoffMs: MAX_REGISTER_BACKOFF_MS,
     flightMode: 'register-or-revalidate',
   });

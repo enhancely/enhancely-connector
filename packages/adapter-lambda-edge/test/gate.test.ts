@@ -4,12 +4,12 @@ import {
   buildPageUrl,
   charsetOf,
   forwardedHeaders,
+  resolvePageRequestTarget,
   serializedHeaderBytes,
-  shouldAttempt,
-} from '../src/index.js';
-import type { AttemptInput } from '../src/index.js';
+  shouldAttemptGeneratedResponse,
+} from '../src/shared.js';
+import type { AttemptInput } from '../src/shared.js';
 import { cfHeaders } from './fixtures.js';
-import { resolvePageRequestTarget } from '../src/shared.js';
 
 function attempt(overrides: Partial<AttemptInput> = {}): AttemptInput {
   return {
@@ -19,118 +19,93 @@ function attempt(overrides: Partial<AttemptInput> = {}): AttemptInput {
     contentEncoding: null,
     cacheControl: null,
     contentDisposition: null,
-    hasSetCookie: false,
     ...overrides,
   };
 }
 
-describe('shouldAttempt', () => {
+describe('shouldAttemptGeneratedResponse', () => {
   it('accepts GET + 200 + text/html without encoding', () => {
-    expect(shouldAttempt(attempt())).toBe(true);
-    expect(shouldAttempt(attempt({ contentType: 'text/html' }))).toBe(true);
-    expect(shouldAttempt(attempt({ contentType: 'TEXT/HTML; Charset="UTF-8"' }))).toBe(true);
+    expect(shouldAttemptGeneratedResponse(attempt())).toBe(true);
+    expect(shouldAttemptGeneratedResponse(attempt({ contentType: 'text/html' }))).toBe(true);
+    expect(
+      shouldAttemptGeneratedResponse(attempt({ contentType: 'TEXT/HTML; Charset="UTF-8"' }))
+    ).toBe(true);
   });
 
   it.each(['POST', 'HEAD', 'PUT', 'OPTIONS'])('rejects %s requests', (method) => {
-    expect(shouldAttempt(attempt({ method }))).toBe(false);
+    expect(shouldAttemptGeneratedResponse(attempt({ method }))).toBe(false);
   });
 
   it.each(['201', '204', '206', '301', '304', '404', '500'])(
     'rejects status %s (only exactly "200")',
     (status) => {
-      expect(shouldAttempt(attempt({ status }))).toBe(false);
+      expect(shouldAttemptGeneratedResponse(attempt({ status }))).toBe(false);
     }
   );
 
   it('rejects non-HTML content types', () => {
-    expect(shouldAttempt(attempt({ contentType: null }))).toBe(false);
-    expect(shouldAttempt(attempt({ contentType: 'application/json' }))).toBe(false);
-    expect(shouldAttempt(attempt({ contentType: 'text/plain' }))).toBe(false);
+    expect(shouldAttemptGeneratedResponse(attempt({ contentType: null }))).toBe(false);
+    expect(shouldAttemptGeneratedResponse(attempt({ contentType: 'application/json' }))).toBe(
+      false
+    );
+    expect(shouldAttemptGeneratedResponse(attempt({ contentType: 'text/plain' }))).toBe(false);
     // exact media-type match, not a prefix check
-    expect(shouldAttempt(attempt({ contentType: 'text/htmlx' }))).toBe(false);
+    expect(shouldAttemptGeneratedResponse(attempt({ contentType: 'text/htmlx' }))).toBe(false);
   });
 
   it('rejects non-UTF-8-compatible charsets (no transcoding support)', () => {
-    expect(shouldAttempt(attempt({ contentType: 'text/html; charset=iso-8859-1' }))).toBe(false);
-    expect(shouldAttempt(attempt({ contentType: 'text/html; charset=windows-1252' }))).toBe(false);
-    expect(shouldAttempt(attempt({ contentType: 'text/html; charset=us-ascii' }))).toBe(true);
-  });
-
-  it('rejects any Content-Encoding by default (second-gate: origin re-fetch answer)', () => {
-    expect(shouldAttempt(attempt({ contentEncoding: 'gzip' }))).toBe(false);
-    expect(shouldAttempt(attempt({ contentEncoding: 'br' }))).toBe(false);
-    // Explicit second param — same behavior as the default.
-    expect(shouldAttempt(attempt({ contentEncoding: 'gzip' }), false)).toBe(false);
-  });
-
-  it('IGNORES Content-Encoding when ignoreContentEncoding=true (first gate on the CloudFront response)', () => {
-    // The first gate re-fetches the origin with Accept-Encoding: identity, so a
-    // gzip/br first response must still PROCEED (it is not the body we inject).
-    expect(shouldAttempt(attempt({ contentEncoding: 'gzip' }), true)).toBe(true);
-    expect(shouldAttempt(attempt({ contentEncoding: 'br' }), true)).toBe(true);
-    expect(shouldAttempt(attempt({ contentEncoding: null }), true)).toBe(true);
-  });
-
-  it('still enforces every OTHER gate even when ignoreContentEncoding=true', () => {
-    // ignoreContentEncoding relaxes ONLY content-encoding — the rest still gate.
-    expect(shouldAttempt(attempt({ method: 'POST', contentEncoding: 'gzip' }), true)).toBe(false);
-    expect(shouldAttempt(attempt({ status: '404', contentEncoding: 'gzip' }), true)).toBe(false);
     expect(
-      shouldAttempt(attempt({ contentType: 'application/json', contentEncoding: 'gzip' }), true)
-    ).toBe(false);
-    expect(shouldAttempt(attempt({ hasSetCookie: true, contentEncoding: 'gzip' }), true)).toBe(
-      false
-    );
-    expect(
-      shouldAttempt(attempt({ cacheControl: 'no-store', contentEncoding: 'gzip' }), true)
+      shouldAttemptGeneratedResponse(attempt({ contentType: 'text/html; charset=iso-8859-1' }))
     ).toBe(false);
     expect(
-      shouldAttempt(
-        attempt({ contentType: 'text/html; charset=iso-8859-1', contentEncoding: 'gzip' }),
-        true
-      )
+      shouldAttemptGeneratedResponse(attempt({ contentType: 'text/html; charset=windows-1252' }))
     ).toBe(false);
+    expect(
+      shouldAttemptGeneratedResponse(attempt({ contentType: 'text/html; charset=us-ascii' }))
+    ).toBe(true);
   });
 
-  it('rejects responses carrying Set-Cookie (per-request representation)', () => {
-    expect(shouldAttempt(attempt({ hasSetCookie: true }))).toBe(false);
+  it('rejects a Content-Encoding because the fetched body must be identity bytes', () => {
+    expect(shouldAttemptGeneratedResponse(attempt({ contentEncoding: 'gzip' }))).toBe(false);
+    expect(shouldAttemptGeneratedResponse(attempt({ contentEncoding: 'br' }))).toBe(false);
   });
 
   it.each(['private', 'no-store', 'private, max-age=0', 's-maxage=10, no-store', 'PRIVATE'])(
-    'rejects Cache-Control %j (per-request representation)',
+    'accepts per-request Cache-Control %j because it returns the one fetched response',
     (cacheControl) => {
-      expect(shouldAttempt(attempt({ cacheControl }))).toBe(false);
-    }
-  );
-
-  it.each(['public, max-age=60', 'no-cache', 'max-age=0, must-revalidate'])(
-    'accepts shareable Cache-Control %j (directive match, not substring)',
-    (cacheControl) => {
-      expect(shouldAttempt(attempt({ cacheControl }))).toBe(true);
+      expect(shouldAttemptGeneratedResponse(attempt({ cacheControl }))).toBe(true);
     }
   );
 
   it('rejects no-transform and attachment representations', () => {
-    expect(shouldAttempt(attempt({ cacheControl: 'public, no-transform' }))).toBe(false);
-    expect(shouldAttempt(attempt({ contentDisposition: 'attachment; filename="page.html"' }))).toBe(
+    expect(shouldAttemptGeneratedResponse(attempt({ cacheControl: 'public, no-transform' }))).toBe(
       false
     );
     expect(
-      shouldAttempt(attempt({ contentDisposition: 'inline, attachment; filename="page.html"' }))
+      shouldAttemptGeneratedResponse(
+        attempt({ contentDisposition: 'attachment; filename="page.html"' })
+      )
+    ).toBe(false);
+    expect(
+      shouldAttemptGeneratedResponse(
+        attempt({ contentDisposition: 'inline, attachment; filename="page.html"' })
+      )
     ).toBe(false);
   });
 
   it('preserves field-instance boundaries so malformed quotes cannot heal', () => {
     expect(
-      shouldAttempt(
+      shouldAttemptGeneratedResponse(
         attempt({ contentType: ['text/html; profile="unterminated', 'application/json"'] })
       )
     ).toBe(false);
     expect(
-      shouldAttempt(attempt({ cacheControl: ['public, ext="unterminated', 'no-transform"'] }))
+      shouldAttemptGeneratedResponse(
+        attempt({ cacheControl: ['public, ext="unterminated', 'no-transform"'] })
+      )
     ).toBe(false);
     expect(
-      shouldAttempt(
+      shouldAttemptGeneratedResponse(
         attempt({ contentDisposition: ['inline; filename="unterminated', 'attachment"'] })
       )
     ).toBe(false);

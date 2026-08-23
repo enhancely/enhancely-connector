@@ -1,11 +1,9 @@
 /**
  * Retry cache-lifetime capping for UN-injected pass-through responses.
  *
- * Shared by the origin-response injector (`index.ts`) and the companion
- * entrypoint (`companion.ts`) — repo rule 5: neither trigger may duplicate the
- * other's gates. Pure functions: all configuration (the operator assertions)
- * is threaded in as parameters, so this module holds no state and reads no
- * config, matching `shared.ts`'s charter.
+ * Shared by the origin-request injector and its origin-response companion.
+ * Pure functions: all configuration (the operator assertions) is threaded in
+ * as parameters, so this module holds no state and reads no config.
  *
  * The invariant every branch enforces: the written TTL can only SHORTEN
  * effective shared cacheability, never extend it, and a response whose origin
@@ -172,15 +170,6 @@ function parseCacheDirective(
   return Number.isSafeInteger(seconds) ? { state: 'valid', seconds } : { state: 'invalid' };
 }
 
-/** Numeric Cache-Control directive value, or null when absent/invalid. */
-export function cacheDirectiveSeconds(
-  policy: string,
-  wanted: 'max-age' | 's-maxage'
-): number | null {
-  const parsed = parseCacheDirective(parseCacheControl(policy), wanted);
-  return parsed.state === 'valid' ? parsed.seconds : null;
-}
-
 const IMF_FIXDATE =
   /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
@@ -306,20 +295,48 @@ export function retrySharedTtlSeconds(
 }
 
 /**
+ * Config-independent safety gate for a possible retry cache cap.
+ *
+ * All operator assertions are baked and synchronously available, so the
+ * companion can apply this before resolving the API key from SSM. A `false`
+ * result means `retryablePassThroughResponse` must return the original object
+ * for every retry deadline: credentials, per-request cache semantics,
+ * disallowed Set-Cookie, malformed Cache-Control, or no explicit/asserted
+ * lifetime make a cap impossible.
+ */
+export function isRetryCacheCapCandidate(
+  response: CloudFrontResultResponse,
+  requestHeaders: CloudFrontHeaders,
+  opts: CapOptions
+): boolean {
+  if (requestHeaders['authorization'] !== undefined || requestHeaders['cookie'] !== undefined) {
+    return false;
+  }
+
+  const headers = response.headers ?? {};
+  if (parseCacheControlFields(headers) === null) return false;
+  if (hasPerRequestCacheControl(headerValues(headers, 'cache-control'))) return false;
+  if (headers['set-cookie'] !== undefined && !opts.capSetCookieResponses) return false;
+
+  // Whether a lifetime exists is independent of the actual positive retry
+  // duration. A one-second probe distinguishes an uncappable lifetime-less
+  // response (`null`) from every explicit/invalid/expired lifetime (`number`).
+  return retrySharedTtlSeconds(headers, 1_000, opts.assertedDefaultTtlSeconds) !== null;
+}
+
+/**
  * Keep a retryable pass-through response in CloudFront only until the core or
  * config resolver will try again. Validators for the untouched origin body
  * are removed deliberately: after this short TTL CloudFront must obtain a full
- * origin response, so the injecting entrypoint runs again (origin-response
- * re-fetches with the viewer's conditional headers stripped; origin-request
- * strips them from its own fetch too — either way a revalidation yields a full
- * 200 to inject into, never a 304 that re-pins the old uninjected body).
+ * origin response, so the origin-request injector runs again. Its own fetch
+ * strips viewer conditional headers, ensuring it receives a full 200 to
+ * evaluate rather than a 304 that re-pins the old uninjected body.
  *
  * Never add cacheability to a request carrying credentials/personalization.
  * In particular, s-maxage/public/must-revalidate override the normal shared
  * cache restriction on Authorization responses (RFC 9111 §3.5).
  *
- * Response-side vetoes (load-bearing for the companion, redundant behind the
- * origin-response injector's shouldAttempt gate):
+ * Response-side vetoes are load-bearing for the companion:
  * - `private`/`no-store` → NEVER rewritten: replacing them with an s-maxage
  *   would grant shared cacheability the origin explicitly forbade.
  * - `Set-Cookie` → rewritten only under the operator's
@@ -333,23 +350,9 @@ export function retryablePassThroughResponse(
   revalidateInMs: number,
   opts: CapOptions
 ): CloudFrontResultResponse {
-  if (requestHeaders['authorization'] !== undefined || requestHeaders['cookie'] !== undefined) {
-    return response;
-  }
+  if (!isRetryCacheCapCandidate(response, requestHeaders, opts)) return response;
 
   const originalHeaders = response.headers ?? {};
-  // Never replace an ambiguous/malformed policy. In particular, joining two
-  // individually unbalanced field instances can otherwise hide `no-store`
-  // inside a healed quoted-string and manufacture shared-cache semantics.
-  if (parseCacheControlFields(originalHeaders) === null) {
-    return response;
-  }
-  if (hasPerRequestCacheControl(headerValues(originalHeaders, 'cache-control'))) {
-    return response;
-  }
-  if (originalHeaders['set-cookie'] !== undefined && !opts.capSetCookieResponses) {
-    return response;
-  }
 
   const sharedTtlSeconds = retrySharedTtlSeconds(
     originalHeaders,

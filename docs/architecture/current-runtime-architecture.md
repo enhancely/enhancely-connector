@@ -26,7 +26,7 @@ Die zentralen Eigenschaften sind:
 - Ein CloudFront-Cache-Hit verursacht **0 Origin- und 0 Enhancely-Requests**.
 - Der normale injizierbare Cache-Miss verursacht **1 Origin-Request** und abhängig
   vom JSON-LD-Cache **0 oder höchstens 1 Enhancely-Request**.
-- Das empfohlene Funktionspaar verursacht pro Viewer-Request insgesamt **nie mehr als
+- Das unterstützte Funktionspaar verursacht pro Viewer-Request insgesamt **nie mehr als
   1 Enhancely-Request**; dieser kann ausschließlich im `origin-request`-Injector
   entstehen.
 - Reproduzierbare Redirects, Fehlerseiten und kleine Nicht-HTML-Antworten verursachen
@@ -68,30 +68,28 @@ Die Origin-Zahlen sind damit Architektur- und keine TCP-Zähler. CloudFront kann
 normalen Origin-Fetch gemäß seiner Origin-Konfiguration intern wiederholen, bei einer
 Origin Group auf ein Secondary Origin wechseln oder für eine Custom Error Response
 einen weiteren Seiten-Fetch ausführen. Solche Plattform-Retries, Failover- und
-Fehlerseiten-Fetches kommen zu den Tabellenwerten hinzu; das gilt auch für die spätere
-Compatibility-Tabelle.
+Fehlerseiten-Fetches kommen zu den Tabellenwerten hinzu.
 
-## Deployment-Modi und Origin-Grenze
+## Deployment und Origin-Grenze
 
-| Modus                                   | Aufbau                                 | Tatsächliche Origin-Semantik                                                                                                                                       |
-| --------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `origin-request` (Default)              | Origin-Request-Injector plus Companion | Der Injector klassifiziert per Direkt-Fetch. Generierbarer Pfad: dieser eine Fetch; Handback: danach normaler CloudFront-Fetch. Nur erreichbare Custom Origins.    |
-| `origin-response` (Compatibility-Modus) | Standalone Origin-Response-Injector    | Fetch 1 läuft über CloudFront; nur bei vorhandenem Snippet folgt Fetch 2 direkt aus der Lambda. Auch dieser Modus benötigt daher einen erreichbaren Custom Origin. |
+Es gibt genau einen unterstützten CloudFront-Aufbau: Origin-Request-Injector plus
+Origin-Response-Companion auf demselben Cache Behavior. Der Injector klassifiziert
+per Direkt-Fetch. Im generierbaren Pfad bleibt es bei diesem einen Fetch; bei einem
+Handback folgt der normale CloudFront-Fetch.
 
-Beide Injektionsmodi können aktuell nur `request.origin.custom` selbst abrufen.
+Der Injector kann aktuell nur `request.origin.custom` selbst abrufen.
 S3-REST-Origins einschließlich S3-OAC (`request.origin.s3`) werden an den normalen
 CloudFront-Pfad durchgereicht und nicht injiziert. Private VPC Origins und andere nicht
 direkt aus Lambda erreichbare Custom Origins können ebenfalls nicht injiziert werden;
-der Default-Pfad versucht zunächst seinen Direkt-Fetch und fällt bei dessen Fehler auf
+der Injector versucht zunächst seinen Direkt-Fetch und fällt bei dessen Fehler auf
 CloudFront zurück. Ein signaturgeschützter Custom Origin ist ausdrücklich nicht
-unterstützt: Der Direkt-Fetch ist unsigniert und ein Origin-`403` kann im Default-Pfad
-als generierter Response zurückgegeben werden. Diesen Modus dort nicht assoziieren.
+unterstützt: Der Direkt-Fetch ist unsigniert und ein Origin-`403` kann als generierter
+Response zurückgegeben werden. Das Funktionspaar dort nicht assoziieren.
 
 Origin Groups/Failover, Origin Shield und CloudFronts eigene
-Origin-Connection-/Retry-Semantik gelten nicht für einen direkten Lambda-Fetch: Im
-Compatibility-Modus wirken sie zwar auf den ersten CloudFront-Fetch, nicht jedoch auf
-den zweiten Body-Re-Fetch. Wer diese Semantik für jeden Fetch benötigt, braucht eine
-andere Integrationsarchitektur; der jetzige Connector verspricht sie nicht.
+Origin-Connection-/Retry-Semantik gelten nicht für den direkten Lambda-Fetch. Wer
+diese Semantik für jeden Fetch benötigt, braucht eine andere Integrationsarchitektur;
+der jetzige Connector verspricht sie nicht.
 
 ## Komponenten
 
@@ -206,7 +204,7 @@ sequenceDiagram
     end
 ```
 
-## Ablauf des empfohlenen CloudFront-Pfads
+## Ablauf des unterstützten CloudFront-Pfads
 
 ```mermaid
 flowchart TD
@@ -353,7 +351,7 @@ lokaler Cache/Backoff `0`, echter stale/miss Lookup `1`.
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------: | ---------------: | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | CloudFront-Cache-Hit                                                                                                                                                                                      |                                             0 |                0 | nein                            | Bereits gecachter Response.                                                                                                                               |
 | Non-GET, ausgeschlossener Pfad/Host, Range, nicht unterstützter Origin oder fehlender Host                                                                                                                |                                             1 |                0 | ja, aber Gate-Exit              | Normaler CloudFront-Originpfad, unverändert; keine SSM-/Connector-Origin-/Enhancely-Arbeit und kein Companion-Cap.                                        |
-| Offensichtliche Asset-Endung; Origin liefert Nicht-HTML, Status ungleich `200` oder sogar unerwartet `200 text/html`                                                                                      |                                             1 |                0 | ja, aber Extension-Gate         | Beide Funktionen schließen Asset-Endungen aus. Keine Injektion, kein künstlicher Companion-Cap.                                                           |
+| Offensichtliche Asset-Endung                                                                                                                                                                              |                                             1 |                0 | ja, aber Extension-Gate         | Beide Funktionen schließen Asset-Endungen vor weiterer Connector-Arbeit aus. Keine Injektion, kein künstlicher Companion-Cap.                             |
 | Fehlende Config/API-Key                                                                                                                                                                                   |                                             1 |                0 | ja                              | Der Injector gibt vor dem Direkt-Fetch zurück. Der Companion darf nur die Config auflösen und bei sonst geeigneter Antwort sicher auf deren Retry kappen. |
 | Reproduzierbarer Redirect oder kleine `4xx`-/`5xx`-Antwort                                                                                                                                                |                                             1 |                0 | nein                            | Status, Header und Body werden aus dem ersten Fetch zurückgegeben.                                                                                        |
 | Reproduzierbarer leerer `204`                                                                                                                                                                             |                                             1 |                0 | nein                            | Leerer `204` wird aus dem ersten Fetch zurückgegeben.                                                                                                     |
@@ -381,7 +379,7 @@ Execution Environment startet mit leeren lokalen Caches und Memos.
 Der Companion sieht bei einem Handback nur Request, Status und Header. Er kann weder
 Body, UTF-8-Bytes, Head-Struktur noch die kombinierte Response-Quota beweisen. Deshalb
 gilt die strikte Regel „Enhancely erst nach vollständig bewiesener
-Injektionsfähigkeit“ nun für das gesamte empfohlene Funktionspaar: Der Companion ruft
+Injektionsfähigkeit“ nun für das gesamte unterstützte Funktionspaar: Der Companion ruft
 Enhancely unter keinen Umständen auf.
 
 Er besitzt weder JSON-LD-Cache noch Lookup-Single-flight, Rate-Limit-Circuit oder
@@ -402,6 +400,11 @@ möglichen Cache-Begrenzung verlangt er in dieser Reihenfolge:
 8. `buildOriginUrl` kann aus dem Event syntaktisch eine sichere Custom-Origin-URL
    ableiten. Die Funktion erkennt S3-Origins und unsichere Path-Escapes, aber nicht die
    tatsächliche Netzwerkerreichbarkeit oder eine erforderliche Request-Signatur.
+9. Ein Cache-Cap ist grundsätzlich möglich: kein `Cookie`/`Authorization`, kein
+   `private`/`no-store`, kein unzulässiges `Set-Cookie`, eine syntaktisch eindeutige
+   Cache-Policy und entweder eine explizite Cache-Laufzeit oder eine positive
+   `assertedDefaultTtlSeconds`-Zusicherung. Diese rein lokalen Prüfungen laufen vor
+   Config/SSM.
 
 Ein VPC-only oder signaturgeschützter Custom Origin kann deshalb nicht automatisch am
 Companion-Gate erkannt werden. Liefert CloudFront nach dem Handback trotzdem ein nach
@@ -411,7 +414,8 @@ darf auf solchen Behaviors nicht eingesetzt werden; alternativ müssen die betro
 Pfade explizit ausgeschlossen werden.
 
 Erst danach löst der Companion seine serverseitige Config auf. Das ist seine einzige
-optionale I/O. Bei fehlender Config versucht er, die vorhandene sichere Cache-Laufzeit
+optionale I/O und geschieht nur für eine tatsächlich kappbare Antwort. Bei fehlender
+Config versucht er, die vorhandene sichere Cache-Laufzeit
 auf den verbleibenden Config-Retry zu begrenzen, standardmäßig etwa 30 Sekunden. Bei
 verfügbarer Config ist das Ziel `nonPageMemoTtlMs`, standardmäßig 30 Minuten. Dieser
 Wert entspricht dem Hard-Handback-Memo des Injectors und gibt diesem nach Ablauf wieder
@@ -427,8 +431,8 @@ Die Request-Zählung der Config-Auflösung ist getrennt von Origin und Enhancely
 | Config fehlt oder SSM-Auflösung schlägt fehl              | 30 Sekunden negativer Cooldown; gleichzeitige Auflösungen teilen einen In-flight-Request, danach neuer Versuch.          |
 
 Damit bleibt der Companion in allen Fällen bei **0 eigenen Origin-Requests und
-0 Enhancely-Requests**. Nur die erste Config-Auflösung eines neuen Lambda-
-Ausführungsumfelds kann die oben ausgewiesene SSM-I/O verursachen.
+0 Enhancely-Requests**. Nur der erste grundsätzlich kappbare Response eines neuen
+Lambda-Ausführungsumfelds kann die oben ausgewiesene SSM-I/O verursachen.
 
 Der Companion selbst speichert dabei kein solches Memo: Er berechnet den Cap bei jedem
 tatsächlich ausgelösten origin-response Event erneut. Ein wirksamer CloudFront-Cap
@@ -501,7 +505,7 @@ gesendete URL auseinanderlaufen zu lassen.
 Der Terraform-Default ist `auto_register = false`. Registrierung aus echtem Traffic
 wird erst mit der expliziten Aktivierung eingeschaltet.
 
-Im empfohlenen CloudFront-Paar kann ausschließlich der body-prüfende
+Im unterstützten CloudFront-Paar kann ausschließlich der body-prüfende
 `origin-request`-Injector einen der folgenden Calls ausführen. Der Companion besitzt
 keinen API-Pfad; damit bleibt das Paar auch bei einem Post-Lookup-Handback bei insgesamt
 höchstens einem Enhancely-Request pro Viewer-Request.
@@ -511,10 +515,10 @@ höchstens einem Enhancely-Request pro Viewer-Request.
 | `autoRegister = false` | `GET /api/v1/jsonld/{url}` mit `If-None-Match`, wenn ein ETag existiert    | Reines Lesen/Revalidieren. Ein `404` bleibt während der negativen TTL lokal.                                         |
 | `autoRegister = true`  | Genau ein `POST /api/v1/jsonld` mit `{ url }` und optional `If-None-Match` | Bekannte URL: Lesen/Revalidieren; unbekannte URL: Registrierung und Start der Generierung. Kein vorgeschaltetes GET. |
 
-Die beiden injizierenden Lambda-Entrypoints verwenden diesen Ein-Roundtrip-Pfad. Der
-cache-cap-only Companion verwendet keinen davon. Die ältere explizite Low-Level-API im
-Core kann aus Kompatibilitätsgründen noch `GET -> 404 -> POST` ausführen, wird vom
-empfohlenen Lambda-Aufbau aber nicht verwendet.
+`getJsonLdLookup` ist immer ein read-only GET. Bei aktiviertem `autoRegister` verwendet
+der Injector stattdessen direkt `getJsonLdRegisterLookup`; es gibt weder eine separate
+`registerJsonLd`-API noch einen `GET -> 404 -> POST`-Fallback. Der cache-cap-only
+Companion verwendet keinen API-Pfad.
 
 ### Antwortbehandlung
 
@@ -568,8 +572,8 @@ die normalisierte, querylose URL, die auch an Enhancely gesendet wird.
 ### JSON-LD-MemoryCache
 
 Dieser Cache existiert in den injizierenden Laufzeiten, insbesondere im
-`origin-request`-Injector und im Standalone-Compatibility-Handler. Der Companion
-instanziiert und verwendet keinen JSON-LD-Cache.
+`origin-request`-Injector. Der Companion instanziiert und verwendet keinen
+JSON-LD-Cache.
 
 - Maximal 5.000 Einträge.
 - Maximal geschätzte 16 MiB retained Strings.
@@ -627,10 +631,7 @@ Quotes erfundene `s-maxage`-Werte erzeugen. Eine syntaktisch uneindeutige
 `Cache-Control`-Feldmenge bleibt im Produktionspfad vollständig unverändert.
 Doppelte, aber einzeln parsebare Freshness-Direktiven sowie nicht strikt als modernes
 HTTP-Datum lesbare `Expires`-/`Date`-Werte werden konservativ als bereits stale (`0`)
-behandelt. Im Legacy-Origin-Response-Modus werden Direktiven-Namen für die
-Stabilitätsprüfung case-insensitiv, Extension-Werte dagegen byte- und case-sensitiv
-verglichen; doppelte Direktiven-Namen sind mehrdeutig und damit ein Veto.
-Proprietäre `X-Robots-Tag`-Argumente bleiben einschließlich Case und
+behandelt. Proprietäre `X-Robots-Tag`-Argumente bleiben einschließlich Case und
 Nicht-HTTP-Whitespace byte-stabil.
 
 Wenn sicher verkürzt werden kann, schreibt der Connector:
@@ -668,7 +669,7 @@ Die gewünschte Retry-Laufzeit kommt je nach Grund aus unterschiedlichen Uhren:
 | Negative/pending/transiente JSON-LD-Antwort im Injector          | Verbleibendes `revalidateInMs` aus Cache oder Backoff |
 | Snippet ready, aber der Origin-Request-Injector liefert Original | `cacheTtlMs`, standardmäßig 5 Minuten                 |
 | Geeignete Handback-Antwort im Companion bei vorhandener Config   | `nonPageMemoTtlMs`, standardmäßig 30 Minuten          |
-| Companion oder Standalone ohne auflösbare Config                 | Verbleibender Config-Retry, standardmäßig 30 Sekunden |
+| Companion ohne auflösbare Config                                 | Verbleibender Config-Retry, standardmäßig 30 Sekunden |
 | Aktives Enhancely-Timeout-Memo im Origin-Request-Injector        | Verbleibender Teil des 10-Sekunden-Fensters           |
 
 Das sind nur Zielwerte. Die zuvor genannten Credential-, Response- und
@@ -698,71 +699,27 @@ Cache-Misses führt.
 
 ## Timeouts und harte Limits
 
-| Limit                                                                    |                                                                            Default / Wert |
-| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------: |
-| Enhancely-Timeout des Origin-Request-Injectors im Terraform-Default-Paar |                                                                                    800 ms |
-| Enhancely-Aufrufe des Companion                                          |                                                                                         0 |
-| Enhancely-Timeout im Terraform-Compatibility-Modus                       |                                                                                  2.000 ms |
-| Origin-Fetch-Timeout                                                     |                                                                                  2.000 ms |
-| SSM-Timeout                                                              |                            2.000 ms, höchstens zwei SDK-Versuche innerhalb dieses Budgets |
-| Lambda-Hard-Timeout                                                      |                                                                               10 Sekunden |
-| Terraform-Budget für Enhancely + Origin                                  | Zusammen höchstens 6.000 ms; 2.000 ms SSM und 2.000 ms Fail-open-Reserve bleiben separat. |
-| Maximale JSON-LD-Antwort                                                 |                                                               256 KiB, streaming-begrenzt |
-| Maximale generierte Lambda@Edge-Antwort                                  |                                                           1 MiB inklusive Header und Body |
-| Maximale Response-Header                                                 |                                                                                    32 KiB |
-| Direkter Lambda-Origin-Body-Vorlimit                                     |                                                1.014.784 Bytes (`1 MiB - 32 KiB - 1 KiB`) |
-| Cloudflare-HTML-Puffer                                                   |                                                                                     2 MiB |
-| Sidecar-HTML-Puffer                                                      |                                                                                     2 MiB |
+| Limit                                          |                                                                            Default / Wert |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------: |
+| Enhancely-Timeout des Origin-Request-Injectors |                                                                                    800 ms |
+| Enhancely-Aufrufe des Companion                |                                                                                         0 |
+| Origin-Fetch-Timeout                           |                                                                                  2.000 ms |
+| SSM-Timeout                                    |                            2.000 ms, höchstens zwei SDK-Versuche innerhalb dieses Budgets |
+| Lambda-Hard-Timeout                            |                                                                               10 Sekunden |
+| Terraform-Budget für Enhancely + Origin        | Zusammen höchstens 6.000 ms; 2.000 ms SSM und 2.000 ms Fail-open-Reserve bleiben separat. |
+| Maximale JSON-LD-Antwort                       |                                                               256 KiB, streaming-begrenzt |
+| Maximale generierte Lambda@Edge-Antwort        |                                                           1 MiB inklusive Header und Body |
+| Maximale Response-Header                       |                                                                                    32 KiB |
+| Direkter Lambda-Origin-Body-Vorlimit           |                                                1.014.784 Bytes (`1 MiB - 32 KiB - 1 KiB`) |
+| Cloudflare-HTML-Puffer                         |                                                                                     2 MiB |
+| Sidecar-HTML-Puffer                            |                                                                                     2 MiB |
 
 Ungültige oder überbudgetierte handgeschriebene Timeout-Overrides werden gemeinsam
 ignoriert; der Adapter fällt auf die sicheren Defaults zurück. Außerhalb des
-Terraform-Moduls hat der Core grundsätzlich `800 ms`; der historische
-`2.000-ms`-Default des Standalone-Modus wird durch die Terraform-Konfiguration gesetzt.
-Beim Generieren reserviert Lambda zusätzlich 1 KiB Sicherheit: Das tatsächlich
+Terraform-Moduls hat der Core grundsätzlich `800 ms`. Beim Generieren reserviert
+Lambda zusätzlich 1 KiB Sicherheit: Das tatsächlich
 nutzbare Bodybudget ist `1 MiB - serialisierte Header - 1 KiB`; beim verbatim
 Base64-Response zählt die größere Base64-Länge.
-
-## Standalone `origin-response` als Compatibility-Modus
-
-Der alte standalone Origin-Response-Injector bleibt derzeit explizit über
-`deployment_mode = "origin-response"` verfügbar. Er wird nicht mit dem Companion
-kombiniert.
-
-Sein Ablauf unterscheidet sich grundlegend:
-
-1. CloudFront holt den Origin-Response: **Origin Nr. 1**.
-2. Der Handler sieht nur Status und Header, nicht den Body, und wendet zuerst die
-   lokalen Request- und Response-Gates an.
-3. Bei einem danach noch geeigneten `200 text/html` prüft er den eindeutigen
-   öffentlichen Host und gegebenenfalls `includeHosts`.
-4. Erst nach diesem Host-Gate werden Config und JSON-LD-Cache beziehungsweise
-   Enhancely betrachtet.
-5. Nur wenn ein Snippet vorhanden ist, holt der Handler den Origin noch einmal mit
-   `Accept-Encoding: identity`: **Origin Nr. 2**. Dabei werden die ursprünglichen
-   Request-Header und die statischen Custom-Origin-Header wiedergegeben; wie bei
-   CloudFront haben statische Custom-Origin-Header bei Namensgleichheit Vorrang.
-6. Erst dann kann injiziert werden; Metadaten beider Antworten müssen konsistent sein.
-
-Damit ist dieser Modus eine bewusste Ausnahme vom Body-/Head-Beweis vor dem
-Enhancely-Aufruf: Beim ersten Response sind nur Status und Header sichtbar. Auch wenn
-der anschließende Re-Fetch wegen Encoding, `noindex`, instabilen Metadaten, CSP, einem
-fehlenden Head oder der Quota scheitert, sind zwei logische Origin-Fetches angefallen.
-
-| Compatibility-Fall                                    | Origin gesamt | Enhancely extern |
-| ----------------------------------------------------- | ------------: | ---------------: |
-| CloudFront-Cache-Hit                                  |             0 |                0 |
-| Status ungleich `200` oder Nicht-HTML                 |             1 |                0 |
-| Geeignetes HTML, frischer negativer Cache             |             1 |                0 |
-| Geeignetes HTML, stale/miss, Ergebnis ohne Snippet    |             1 |      höchstens 1 |
-| Snippet vorhanden: Re-Fetch, Injektion oder Fail-open |             2 |              0/1 |
-
-Dieser Modus ist deshalb nicht der empfohlene Standard: Eine Injektion benötigt zwei
-Origin-Antworten und zusätzliche Konsistenzprüfungen. Er bleibt als bewusster
-Kompatibilitätspfad für bestehende, aus Lambda direkt erneut abrufbare Custom Origins
-erhalten. S3-REST einschließlich S3-OAC ist auch hier Pass-through. VPC Origins und
-signaturgeschützte oder anderweitig nicht direkt erreichbare Custom Origins können den
-zweiten Fetch nicht erfolgreich ausführen; Origin-Group-, Shield- und Retry-Semantik
-gilt ausschließlich für den ersten CloudFront-Fetch.
 
 ## Cloudflare und Sidecar
 

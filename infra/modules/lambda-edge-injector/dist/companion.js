@@ -66,7 +66,6 @@ function defineConfig(input) {
     timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     cacheTtlMs: input.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
     maxJsonLdBytes,
-    injectPosition: "before-head-close",
     autoRegister: input.autoRegister ?? false,
     ...input.fetchImpl !== void 0 && { fetchImpl: input.fetchImpl }
   };
@@ -666,20 +665,19 @@ function retrySharedTtlSeconds(headers, revalidateInMs, assertedDefaultTtlSecond
   }
   return assertedDefaultTtlSeconds > 0 ? Math.min(retryTtl, Math.floor(assertedDefaultTtlSeconds)) : null;
 }
-function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, opts) {
+function isRetryCacheCapCandidate(response, requestHeaders, opts) {
   if (requestHeaders["authorization"] !== void 0 || requestHeaders["cookie"] !== void 0) {
-    return response;
+    return false;
   }
+  const headers = response.headers ?? {};
+  if (parseCacheControlFields(headers) === null) return false;
+  if (hasPerRequestCacheControl(headerValues(headers, "cache-control"))) return false;
+  if (headers["set-cookie"] !== void 0 && !opts.capSetCookieResponses) return false;
+  return retrySharedTtlSeconds(headers, 1e3, opts.assertedDefaultTtlSeconds) !== null;
+}
+function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, opts) {
+  if (!isRetryCacheCapCandidate(response, requestHeaders, opts)) return response;
   const originalHeaders = response.headers ?? {};
-  if (parseCacheControlFields(originalHeaders) === null) {
-    return response;
-  }
-  if (hasPerRequestCacheControl(headerValues(originalHeaders, "cache-control"))) {
-    return response;
-  }
-  if (originalHeaders["set-cookie"] !== void 0 && !opts.capSetCookieResponses) {
-    return response;
-  }
   const sharedTtlSeconds = retrySharedTtlSeconds(
     originalHeaders,
     revalidateInMs,
@@ -718,10 +716,6 @@ var resolvedConfig = null;
 var negativeUntil = 0;
 var inflight = null;
 var NEGATIVE_TTL_MS = 3e4;
-var resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-var resolvedAssertedDefaultTtlSeconds = 0;
-var resolvedCapSetCookieResponses = false;
-var resolvedNonPageMemoTtlMs = DEFAULT_NON_PAGE_MEMO_TTL_MS;
 var bakedCache;
 var bakedOverride;
 var configOverrides = null;
@@ -832,10 +826,6 @@ function bakedConfig() {
 async function resolveOnce() {
   try {
     const baked = bakedConfig();
-    resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
-    resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
-    resolvedCapSetCookieResponses = baked?.capSetCookieResponses ?? false;
-    resolvedNonPageMemoTtlMs = baked?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
     let apiKey = baked?.apiKey;
     if (apiKey === void 0) {
       apiKey = await fetchApiKeyFromSsm(
@@ -892,13 +882,13 @@ function getConfigRetryInMs() {
   return negativeUntil - Date.now();
 }
 function getAssertedDefaultTtlSeconds() {
-  return resolvedAssertedDefaultTtlSeconds;
+  return bakedConfig()?.assertedDefaultTtlSeconds ?? 0;
 }
 function getCapSetCookieResponses() {
-  return resolvedCapSetCookieResponses;
+  return bakedConfig()?.capSetCookieResponses ?? false;
 }
 function getNonPageMemoTtlMs() {
-  return resolvedNonPageMemoTtlMs;
+  return bakedConfig()?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
 }
 function getExcludePaths() {
   return bakedConfig()?.excludePaths ?? [];
@@ -937,23 +927,19 @@ var handler = async (event) => {
       contentType: headerValues(response.headers, "content-type"),
       contentEncoding: null,
       cacheControl: headerValues(response.headers, "cache-control"),
-      contentDisposition: headerValues(response.headers, "content-disposition"),
-      hasSetCookie: response.headers["set-cookie"] !== void 0
+      contentDisposition: headerValues(response.headers, "content-disposition")
     };
     if (!shouldAttemptGeneratedResponse(input)) return response;
     if (blocksIndexing(combinedHeaderValue(response.headers, "x-robots-tag"))) return response;
     if (buildOriginUrl(request) === null) return response;
+    const options = capOptions();
+    if (!isRetryCacheCapCandidate(response, request.headers, options)) return response;
     const config = await resolveAdapterConfig();
     if (config === null) {
       const retryInMs = getConfigRetryInMs();
-      return retryInMs === null ? response : retryablePassThroughResponse(response, request.headers, retryInMs, capOptions());
+      return retryInMs === null ? response : retryablePassThroughResponse(response, request.headers, retryInMs, options);
     }
-    return retryablePassThroughResponse(
-      response,
-      request.headers,
-      getNonPageMemoTtlMs(),
-      capOptions()
-    );
+    return retryablePassThroughResponse(response, request.headers, getNonPageMemoTtlMs(), options);
   } catch (error) {
     console.error(
       "[enhancely-lambda-edge:companion] fail-open:",

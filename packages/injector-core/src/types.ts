@@ -22,15 +22,12 @@ export interface InjectorConfig {
    * The body is streamed and cancelled as soon as this limit is exceeded.
    */
   maxJsonLdBytes: number;
-  /** Only supported position today; kept in config for forward compatibility. */
-  injectPosition: 'before-head-close';
   /**
-   * When true, high-level snippet lookup uses ONE register-or-revalidate
+   * When true, snippet lookup uses ONE register-or-revalidate
    * `POST /api/v1/jsonld {url}`: known pages return their snippet in that same
    * call, while unknown pages are registered and start generation. The
    * negative cache still suppresses repeats until the next retry deadline.
-   * The explicit `getJsonLdLookup` conditional-GET API retains its historical
-   * GET→404→POST behavior for backwards compatibility. Default false.
+   * Default false.
    */
   autoRegister: boolean;
   /** Platform fetch override (defaults to globalThis.fetch). */
@@ -53,13 +50,6 @@ export interface CacheEntry {
   jsonldRaw: string | null;
   etag: string | null;
   storedAt: number;
-  /**
-   * True when this negative entry came from a 404 while auto-registration was
-   * enabled. Adapters can use this signal to cap downstream cache lifetime so
-   * a generated record is discovered after the core TTL instead of leaving an
-   * uninjected page in a CDN cache for its much longer default TTL.
-   */
-  registrationPending?: boolean;
   /**
    * Backoff memo (epoch ms), set after a 429, registration-limit 403, or an
    * upstream error/timeout.
@@ -102,8 +92,8 @@ export interface CacheBackend {
  *   snippet for this URL and asking again will not change that soon" —
  *   an `ignored` record, a record whose generation never succeeded (body
  *   `{}`), or a rejected registration (denylist / unregistered hostname).
- *   Stored as a negative entry for a full TTL and — unlike `not-found` —
- *   NEVER triggers auto-registration: the server already knows the URL.
+ *   Stored as a negative entry for a full TTL; the server already knows the
+ *   URL, so another registration attempt would only add load.
  * - `registration-limited`: the register endpoint refused this URL because a
  *   plan/registration cap was reached (HTTP 403 with `Retry-After`). The
  *   deadline is URL-local: it must never open the API-key-wide read circuit.

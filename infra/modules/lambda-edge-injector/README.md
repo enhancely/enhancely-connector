@@ -10,14 +10,17 @@ generatable HTML cache miss and asks Enhancely only after the origin response
 has proved that it is an injectable page. A hard handback can require a second
 normal CloudFront fetch.
 
-## Deployment modes
+## Architecture
 
-| `deployment_mode`          | Functions                                           | CloudFront associations                   | Use when                                                                                       |
-| -------------------------- | --------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `origin-request` (default) | origin-request injector + origin-response companion | both functions on the same cache behavior | Normal CloudFront origins; one origin hit per injectable miss                                  |
-| `origin-response`          | standalone origin-response injector                 | origin-response only                      | Existing directly reachable Custom Origins that intentionally retain the legacy two-fetch flow |
+The module creates exactly two Lambda@Edge functions that must be associated
+with the same cache behavior:
 
-The default injector fetches the origin first. Only an exact `200` UTF-8-safe
+- an `origin-request` injector;
+- an `origin-response` cache-cap-only companion.
+
+There is no deployment-mode switch and no standalone origin-response injector.
+
+The injector fetches the origin first. Only an exact `200` UTF-8-safe
 `text/html` response that is indexable, permits transformation, has no valid
 non-`inline` content disposition, and passes the remaining policy/quota gates can trigger an
 Enhancely lookup. It then generates either the injected page or the origin's
@@ -30,20 +33,11 @@ unreproducible pages. It can safely shorten eligible handback cache lifetimes
 so the injector eventually retries. The two functions use the same zip and
 baked config so their gates cannot drift.
 
-The compatibility mode retains the original re-fetch architecture. An injected
-cache miss costs two origin requests: CloudFront's fetch plus the connector's
-identity re-fetch. When `timeout_ms` is omitted, this mode also retains the
-historical 2000 ms Enhancely timeout; the default origin-request pair uses 800
-ms. Setting `timeout_ms` explicitly overrides the mode-dependent default.
-
-Both injectors can directly fetch only `request.origin.custom`. S3 REST
-Origins, including S3 OAC (`request.origin.s3`), pass through in both modes.
-Private VPC Origins cannot be injected. A sign-protected Custom Origin is
-unsupported: the Lambda fetch is unsigned, so do not associate the default
-origin-request mode there. In compatibility mode, CloudFront-managed failover,
-Origin Shield and connection retry rules apply to the first fetch only; the
-second identity body fetch still runs directly from Lambda. Neither current
-mode promises CloudFront-managed semantics for every fetch.
+The injector can directly fetch only `request.origin.custom`. S3 REST Origins,
+including S3 OAC (`request.origin.s3`), pass through. Private VPC Origins cannot
+be injected. A sign-protected Custom Origin is unsupported because the Lambda
+fetch is unsigned. CloudFront-managed Origin Group, Origin Shield and retry
+semantics do not apply to the injector's direct fetch.
 
 ## Usage
 
@@ -65,8 +59,6 @@ module "enhancely_injector" {
   tags          = { managed-by = "terraform" }
 }
 ```
-
-`deployment_mode = "origin-request"` is the default and may be omitted.
 
 For `terraform-aws-modules/cloudfront`, pass the pairing-safe output directly
 to each intended cache behavior:
@@ -90,42 +82,8 @@ dynamic "lambda_function_association" {
 }
 ```
 
-Both default-mode associations must be installed on the **same cache
-behavior**. Never associate the standalone origin-response injector next to the
-origin-request injector. The companion is the only supported origin-response
-partner.
-
-### Standalone compatibility mode
-
-```hcl
-module "enhancely_injector" {
-  source          = "git::https://github.com/enhancely/enhancely-connector.git//infra/modules/lambda-edge-injector?ref=vX.Y.Z"
-  providers       = { aws = aws.us_east_1 }
-  deployment_mode = "origin-response"
-}
-```
-
-The association output then contains only `origin-response`.
-
-## Existing-module migration
-
-Older module versions exposed `qualified_arn` and documented attaching it to
-`origin-response`. That output keeps exactly that meaning:
-
-- in `deployment_mode = "origin-response"`, `qualified_arn` is the standalone
-  origin-response ARN;
-- in the new default mode, `qualified_arn` is intentionally `null` and can
-  never silently point an old origin-response association at the
-  origin-request handler.
-
-To upgrade without changing architecture, add
-`deployment_mode = "origin-response"` in the same configuration change as the
-module-ref bump and review the plan before applying. To migrate to the default
-pair, replace the old association with
-`lambda_function_associations` in the same reviewed change. Lambda@Edge uses
-published, immutable versions; old replicated versions can linger after an
-association moves, so allow for AWS replication/deletion delays during staged
-rollouts.
+Both associations must be installed on the **same cache behavior**. The
+companion is the only supported origin-response function and never injects.
 
 ## API key
 
@@ -139,26 +97,25 @@ aws ssm put-parameter --region us-east-1 \
   --type SecureString --value 'sk-…'
 ```
 
-Until the parameter exists, both modes fail open and serve uninjected pages.
+Until the parameter exists, the pair fails open and serves uninjected pages.
 Use an organization key (`sk-org-…`) to cover all domains in one Enhancely
 organization. Setting `create_ssm_parameter = true` creates only a
 `REPLACE_ME` convenience placeholder and is intended for throwaway setups.
 
 ## Important inputs
 
-| Input                          | Default          | Meaning                                                                                                                                                                                                   |
-| ------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `deployment_mode`              | `origin-request` | Recommended pair or standalone compatibility mode                                                                                                                                                         |
-| `timeout_ms`                   | mode-dependent   | Optional Enhancely API timeout: `800` in origin-request, historical `2000` in origin-response; max `6000`, and its sum with `origin_timeout_ms` must be ≤ `6000`                                          |
-| `origin_timeout_ms`            | `2000`           | Origin fetch/re-fetch timeout; max `6000`, and its sum with `timeout_ms` must be ≤ `6000`                                                                                                                 |
-| `cache_ttl_ms`                 | `300000`         | JSON-LD memory-cache freshness; stale entries retain their ETag                                                                                                                                           |
-| `auto_register`                | `false`          | `false`: conditional GET only. `true`: one register-or-revalidate POST that reads known pages or registers unknown real HTML pages                                                                        |
-| `include_hosts`                | `[]`             | Exact public page hostnames enabled before SSM, connector-origin, Enhancely, or companion work. No wildcards/schemes/paths/ports. Empty = all hosts.                                                      |
-| `host_in_cache_key_asserted`   | `false`          | Required operator assertion for non-empty `include_hosts`: Viewer Host is in the associated cache key, or hosts use separate distributions. Does not configure CloudFront.                                |
-| `exclude_paths`                | `[]`             | Canonicalized request paths skipped before config or network work                                                                                                                                         |
-| `non_page_memo_ttl_ms`         | `1800000`        | Origin-request memo only for hard handbacks that can neither be injected nor safely generated; redirects, 404s and small veto responses are not stored                                                    |
-| `asserted_default_ttl_seconds` | `0`              | Optional retry-cache cap assertion; keep `0` if any associated behavior has DefaultTTL `0`                                                                                                                |
-| `cap_set_cookie_responses`     | `false`          | Pair-wide assertion used by origin-request fallback and companion (and by standalone origin-response) to cap anonymous `Set-Cookie` pass-throughs; unsafe for origins that mint anonymous session cookies |
+| Input                          | Default   | Meaning                                                                                                                                                                    |
+| ------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout_ms`                   | `800`     | Enhancely API timeout; max `6000`, and its sum with `origin_timeout_ms` must be ≤ `6000`                                                                                   |
+| `origin_timeout_ms`            | `2000`    | Direct origin-fetch timeout; max `6000`, and its sum with `timeout_ms` must be ≤ `6000`                                                                                    |
+| `cache_ttl_ms`                 | `300000`  | JSON-LD memory-cache freshness; stale entries retain their ETag                                                                                                            |
+| `auto_register`                | `false`   | `false`: conditional GET only. `true`: one register-or-revalidate POST that reads known pages or registers unknown real HTML pages                                         |
+| `include_hosts`                | `[]`      | Exact public page hostnames enabled before SSM, connector-origin, Enhancely, or companion work. No wildcards/schemes/paths/ports. Empty = all hosts.                       |
+| `host_in_cache_key_asserted`   | `false`   | Required operator assertion for non-empty `include_hosts`: Viewer Host is in the associated cache key, or hosts use separate distributions. Does not configure CloudFront. |
+| `exclude_paths`                | `[]`      | Canonicalized request paths skipped before config or network work                                                                                                          |
+| `non_page_memo_ttl_ms`         | `1800000` | Origin-request memo for hard handbacks that can neither be injected nor safely generated; redirects, 404s and small veto responses are not stored                          |
+| `asserted_default_ttl_seconds` | `0`       | Optional retry-cache cap assertion; keep `0` if any associated behavior has DefaultTTL `0`                                                                                 |
+| `cap_set_cookie_responses`     | `false`   | Pair-wide assertion used by the injector fallback and companion to cap anonymous `Set-Cookie` pass-throughs; unsafe for origins that mint anonymous session cookies        |
 
 ### Ten-second fail-open budget
 
@@ -173,9 +130,8 @@ first invocation conservatively:
   settlement, and serializing the original fail-open response.
 
 Terraform rejects either timeout above 6000 ms and rejects configurations where
-the effective `timeout_ms + origin_timeout_ms > 6000`. The origin-request
-defaults consume 2800 ms of that combined allowance; the historical
-origin-response defaults consume 4000 ms. Hand-written `connector-config.json`
+`timeout_ms + origin_timeout_ms > 6000`. The defaults consume 2800 ms of that
+combined allowance. Hand-written `connector-config.json`
 deployments get the same runtime protection: `timeoutMs + originTimeoutMs +
 ssmTimeoutMs` may not exceed 8000 ms; an unsafe set is ignored together and the
 known-safe 800/2000/2000 ms runtime defaults are used.
@@ -211,13 +167,11 @@ could replay one visitor's `Set-Cookie` to another visitor.
 
 ## Outputs
 
-- `lambda_function_associations` — recommended, pairing-safe map for the
-  selected mode.
-- `origin_request_qualified_arn` and `companion_qualified_arn` — non-null only
-  in the default mode.
-- `origin_response_qualified_arn` — non-null only in compatibility mode.
-- `qualified_arn` — deprecated alias for the standalone origin-response ARN;
-  deliberately null in the default mode.
+- `lambda_function_associations` — pairing-safe map for the required
+  origin-request injector and origin-response companion.
+- `injector_function_name` and `companion_function_name` — deployed Lambda
+  names.
+- `ssm_parameter_name` and `role_arn` — operational resource identifiers.
 
 ## Requirements and trade-offs
 
@@ -238,13 +192,12 @@ could replay one visitor's `Set-Cookie` to another visitor.
   the cache policy or origin request policy must expose **all query strings**
   to the origin-facing Lambda event, as required by AWS's
   [Lambda@Edge query-string restriction](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/edge-function-restrictions-all.html#edge-function-restrictions-query-string).
-- The default origin-request function performs its own network fetch. The
-  compatibility mode lets CloudFront perform the first fetch, but its second
-  identity re-fetch is still direct. S3 REST including S3 OAC is pass-through;
-  private VPC Origins are not injectable; sign-protected Custom Origins are
-  unsupported. Origin Group/Shield/retry semantics are not end-to-end.
-- Lambda@Edge generated-response quotas still apply. Responses the default
-  injector cannot safely generate are handed back to CloudFront and remembered
+- The origin-request function performs its own network fetch. S3 REST including
+  S3 OAC is pass-through; private VPC Origins are not injectable;
+  sign-protected Custom Origins are unsupported. Origin Group/Shield/retry
+  semantics are not end-to-end.
+- Lambda@Edge generated-response quotas still apply. Responses the injector
+  cannot safely generate are handed back to CloudFront and remembered
   briefly so repeats avoid the extra classification fetch.
 - No separate cache infrastructure is required. CloudFront caches page
   responses; each execution environment keeps the JSON-LD cache and uses ETag
@@ -255,7 +208,7 @@ could replay one visitor's `Set-Cookie` to another visitor.
 
 ## Upgrading
 
-Bump the pinned `?ref=`. Every release keeps the module's three bundled
-entrypoints (`index.js`, `origin-request.js`, and `companion.js`) synchronized
-with the corresponding adapter build and packages deploy-specific config into
-the generated zip at plan time.
+Bump the pinned `?ref=`. Every release keeps the module's two bundled
+entrypoints (`origin-request.js` and `companion.js`) synchronized with the
+corresponding adapter build and packages deploy-specific config into the
+generated zip at plan time.

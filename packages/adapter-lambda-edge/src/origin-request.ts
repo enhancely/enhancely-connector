@@ -1,108 +1,20 @@
 /**
- * CloudFront Lambda@Edge **origin-request** adapter for the Enhancely injector.
+ * CloudFront Lambda@Edge origin-request injector.
  *
- * Alternative entrypoint to `index.ts` (origin-response): same core, different
- * trigger — and a materially different cost profile AND coverage.
+ * It fetches the custom origin first and calls Enhancely only after the exact
+ * response is proven to be injectable 200 text/html with a real </head>. The
+ * same fetched response is then generated back to CloudFront, so normal paths
+ * cost one origin request and per-request metadata such as Set-Cookie or
+ * private/no-store remains attached to the representation that created it.
  *
- * WHY THIS EXISTS
- * An origin-response trigger cannot read the origin body, so `index.ts` has to
- * fetch the page a SECOND time and then prove the two responses describe the
- * same object (X-Robots-Tag, Cache-Control, Expires and CSP must all line up).
- * On an origin-request trigger a function may instead GENERATE the response;
- * CloudFront then never contacts the origin at all. There is exactly one
- * response, so there is nothing to reconcile:
+ * Reproducible non-HTML, non-200 and other veto responses are also returned
+ * from that first fetch without an Enhancely call. Only a response that cannot
+ * be generated safely under Lambda@Edge quotas is handed back to CloudFront;
+ * those verdicts are memoized so later requests avoid the discarded fetch.
  *
- *   origin-response:  CloudFront fetch + our re-fetch = 2 origin hits per
- *                     injected cache miss, plus four cross-response equality
- *                     gates that silently skip injection when they disagree.
- *   origin-request:   1 origin hit, no equality gates.
- *
- * COVERAGE: per-request state is injected here
- * `index.ts` skips any response carrying `Set-Cookie` or
- * `Cache-Control: private|no-store`, because a re-fetch cannot faithfully
- * reproduce a page that stamps new state into the viewer. That reasoning is a
- * property of the double fetch, not of the page — so this trigger does not
- * apply it. The response handed to the viewer IS the one the origin just
- * produced, Set-Cookie included verbatim. On sites behind a stickiness-enabled
- * load balancer, where every response carries a session cookie, the old rule
- * silently meant "never inject at all".
- *
- * CloudFront's cache policy and response cache directives determine whether a
- * generated response is cached; `Set-Cookie` alone is not a cache veto.
- * Injecting into a page that sets a cookie therefore does not make CloudFront
- * cache anything it would not have cached anyway — the shared-cookie risk is a
- * property of the distribution's cache policy, not of this injection.
- *
- * Precise wording matters here: the generated response is NOT byte-identical
- * to the passed-through one (ETag, Last-Modified and Content-Length are
- * deliberately dropped, see STALE_BODY_HEADERS). It is identical in the only
- * respect that governs caching.
- *
- * ORDER OF OPERATIONS — origin-first (changed in v0.9.0)
- * Up to v0.8.0 the Enhancely lookup ran BEFORE the origin fetch. That is the
- * cheapest order in origin hits, but it forces the adapter to decide from the
- * REQUEST alone whether a URL is worth asking about — and from the request
- * alone that is unknowable. The extension pre-filter catches assets; an
- * extension-less URI may still be a redirect, a JSON endpoint or a 404. Asking
- * Enhancely first would spend an API call and its latency on every such request.
- *
- * No request-side signal fixes this. `Accept` cannot: Googlebot sends the
- * wildcard media range WITHOUT `text/html` (Google Search Central), so
- * requiring `text/html` would exclude the single most important consumer of
- * the injected JSON-LD — while also accepting the wildcard excludes nothing,
- * because every script, image and XHR carries it too. Fetch
- * Metadata (`Sec-Fetch-Dest`) is absent on http://, on pre-2023 browsers and
- * on crawlers, and it is not normally part of the cache key — gating on a
- * header outside the cache key means the un-injected variant can win the cache
- * entry and be served to everyone.
- *
- * So the order is inverted: fetch the origin first, and look up only once the
- * RESPONSE proves this is a servable, injectable HTML page. That is exactly
- * what the Cloudflare and sidecar adapters do — they see the response before
- * deciding and never had this problem. The fetch is not extra work; CloudFront
- * would issue the same request, it just moves into this function:
- *
- *   HTML + snippet    → 1 own fetch, no CloudFront fetch  = 1
- *   HTML, no snippet  → 1 own fetch, response generated   = 1
- *   non-2xx (404, 3xx) → 1 own fetch, returned verbatim   = 1
- *   small status-200 veto → 1 own fetch, returned verbatim = 1
- *   over-quota/other 2xx → 1 own + 1 CloudFront fetch     = 2  (first time)
- *                         → 0 own + 1 CloudFront fetch     = 1  (remembered)
- *
- * A reproducible answer never costs two hits: its exact bytes are base64-
- * framed from the fetch already made (verbatimOriginResponse). For non-2xx,
- * CloudFront still applies an operator's configured custom error response.
- * Small status-200 vetoes (JSON, noindex, legacy charset,
- * ignored identity encoding) use the same safe primitive. Only responses that
- * cannot fit or whose successful status has not been live-validated hand back;
- * their verdict is memoized per execution environment (see nonPageMemo). No
- * private coordination header is added to the real origin request: a generic
- * origin or WAF may vary on any header, so doing so would not be customer-
- * independent. The companion repeats cheap request/response gates solely to
- * decide whether an eligible handback may receive a shorter cache lifetime;
- * it never performs a recovery lookup. Two consequences follow, both of which
- * the previous order could not deliver:
- *   - REGISTRATION is precise. The adapter knows the response is real HTML, so
- *     autoRegister no longer has to be forced off (v0.7.0/v0.8.0 could only
- *     have registered redirects, JSON endpoints and 404s).
- *   - The retry cache cap works. The un-injected response is now generated
- *     here, so assertedDefaultTtlSeconds bounds it directly instead of leaving
- *     CloudFront to cache the origin's own copy for the full DefaultTTL.
- *
- * FAIL-OPEN
- * Every failure path returns the untouched `request`. CloudFront then behaves
- * exactly as if this function were not associated at all — the cheapest and
- * least breakable fallback the platform offers. Notably this also covers the
- * 1 MB generated-response quota: where the origin-response adapter must fail
- * OPEN by returning a response it already holds (and a body over quota there
- * is a viewer-facing 502), here an oversized page simply hands control back to
- * CloudFront, which streams it with no size limit at all.
- *
- * All connector logic (API client, cache + ETag revalidation, injection,
- * fail-open orchestration) lives in @enhancely/injector-core; this file only
- * translates CloudFront event shapes (repo rule 8). Everything it shares with
- * the origin-response entrypoint comes from ./shared.js, so the two triggers
- * cannot drift apart.
+ * Any failure returns the untouched request, allowing CloudFront to perform
+ * its normal origin request. Connector logic lives in injector-core; shared
+ * Lambda gates and response accounting live in shared.ts and cache-cap.ts.
  */
 import type { OriginFetchResult } from './origin-fetch.js';
 import type {
@@ -230,9 +142,9 @@ const DISALLOWED_RESPONSE_HEADERS = new Set([
 const DISALLOWED_RESPONSE_HEADER_PREFIXES = ['x-amz-cf-', 'x-edge-'];
 
 /**
- * Headers that described the ORIGINAL bytes and would be wrong for the
- * injected ones. Same reasoning as the origin-response path: a validator or
- * digest computed over the uninjected body would either let a stale copy
+ * Headers that described the original bytes and would be wrong for the
+ * injected ones. A validator or digest computed over the uninjected body
+ * would either let a stale copy
  * circulate under a strong validator (ETag → 304 → the viewer never sees the
  * injected page) or make a verifying client reject the body as corrupted.
  */
@@ -275,9 +187,9 @@ function isDisallowedResponseHeader(name: string): boolean {
  * - `verbatim`  — the exact bytes, base64-framed: every header the origin sent
  *   still describes the body, Content-Encoding included.
  */
-export type BodyFidelity = 'injected' | 'decoded' | 'verbatim';
+type BodyFidelity = 'injected' | 'decoded' | 'verbatim';
 
-export function buildResponseHeaders(
+function buildResponseHeaders(
   allHeaders: Record<string, string[]>,
   fidelity: BodyFidelity = 'injected'
 ): CloudFrontHeaders {
@@ -318,11 +230,7 @@ function canonicalHeaderName(lowercase: string): string {
     .join('-');
 }
 
-/**
- * Per-execution-environment JSON-LD cache. Separate from the origin-response
- * entrypoint's cache by construction — only one of the two is ever bundled
- * into a given artifact.
- */
+/** Per-execution-environment JSON-LD cache. */
 let cache = new MemoryCache();
 
 /**
@@ -605,7 +513,7 @@ export const handler: CloudFrontRequestHandler = async (event) => {
     // Host policy is deliberately request-only and synchronous: an excluded
     // public hostname pays no SSM lookup, connector origin fetch, cache read,
     // Enhancely call, registration, or companion cache rewrite. The target
-    // helper is shared by all three Lambda entrypoints so the checked host is
+    // helper is shared by both Lambda entrypoints so the checked host is
     // exactly the one used in the URL sent to Enhancely.
     const target = resolvePageRequestTarget(request);
     if (target === null || !isHostIncluded(target.pageHost, getIncludeHosts())) return request;
@@ -629,9 +537,9 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       return request;
     }
 
-    // No resolvable API key → hand the request back untouched. Unlike the
-    // origin-response path there is no response to re-cache here, so a missing
-    // key costs literally nothing: CloudFront proceeds as usual.
+    // No resolvable API key → hand the request back untouched. There is no
+    // response to re-cache here, so a missing key costs nothing: CloudFront
+    // proceeds as usual.
     const config = await resolveAdapterConfig();
     if (config === null) return request;
 
@@ -689,9 +597,8 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       return request;
     }
 
-    // Over the conservative fetch cap. Handing the request back is strictly
-    // better than the origin-response path's equivalent: CloudFront fetches it
-    // itself and streams it with no generated-response quota at all.
+    // Over the conservative fetch cap: hand the request back so CloudFront can
+    // fetch and stream it without the generated-response quota.
     if (origin.truncated) {
       return memoizedPassThrough(request, pageUrl);
     }
@@ -704,15 +611,10 @@ export const handler: CloudFrontRequestHandler = async (event) => {
       return verbatimOriginResponse(origin, request) ?? memoizedPassThrough(request, pageUrl);
     }
 
-    // The ONE response gate. On the origin-response trigger this same check
-    // has to run twice — here there is only one representation, and it is the
-    // one we return.
-    //
-    // Note it is shouldAttemptGeneratedResponse, not shouldAttempt: pages that
-    // set a cookie or mark themselves private/no-store ARE injected here. The
-    // re-fetch-fidelity argument behind that veto does not exist on this
-    // trigger, and abstaining would not change what CloudFront caches — it
-    // would only drop the JSON-LD. See shared.ts for the full reasoning.
+    // The one response gate operates on the exact representation we return.
+    // Pages that set a cookie or mark themselves private/no-store remain
+    // eligible because this is not a second fetch; cache policy remains the
+    // operator's responsibility.
     if (
       !shouldAttemptGeneratedResponse({
         method: 'GET',
@@ -721,7 +623,6 @@ export const handler: CloudFrontRequestHandler = async (event) => {
         contentEncoding: origin.contentEncoding,
         cacheControl: origin.allHeaders['cache-control'] ?? null,
         contentDisposition: origin.allHeaders['content-disposition'] ?? null,
-        hasSetCookie: origin.hasSetCookie,
       })
     ) {
       // A non-2xx answer we can reproduce exactly goes straight back: one

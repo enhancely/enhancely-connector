@@ -25,10 +25,10 @@
 let upstreamDownUntil = 0;
 
 /** Window to park upstream calls after a timeout. Short: recovery must be quick. */
-export const UPSTREAM_DOWN_MS = 10_000;
+const UPSTREAM_DOWN_MS = 10_000;
 
 /** A call that used up (almost) the whole budget did not get an answer. */
-export const TIMEOUT_DETECTION_RATIO = 0.9;
+const TIMEOUT_DETECTION_RATIO = 0.9;
 
 /** True while calls should be parked (the memo window is open). */
 export function isUpstreamDown(): boolean {

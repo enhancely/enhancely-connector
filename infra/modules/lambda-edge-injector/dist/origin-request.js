@@ -27,15 +27,12 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// src/origin-request.ts
-var origin_request_exports = {};
-__export(origin_request_exports, {
-  __resetOriginRequestStateForTests: () => __resetOriginRequestStateForTests,
-  __resetUpstreamMemoForTests: () => __resetUpstreamMemoForTests,
-  buildResponseHeaders: () => buildResponseHeaders,
+// src/origin-request-entry.ts
+var origin_request_entry_exports = {};
+__export(origin_request_entry_exports, {
   handler: () => handler
 });
-module.exports = __toCommonJS(origin_request_exports);
+module.exports = __toCommonJS(origin_request_entry_exports);
 
 // ../injector-core/dist/config.js
 var DEFAULT_ENHANCELY_BASE = "https://app.enhancely.ai";
@@ -69,7 +66,6 @@ function defineConfig(input) {
     timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     cacheTtlMs: input.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
     maxJsonLdBytes,
-    injectPosition: "before-head-close",
     autoRegister: input.autoRegister ?? false,
     ...input.fetchImpl !== void 0 && { fetchImpl: input.fetchImpl }
   };
@@ -1302,9 +1298,6 @@ function isAttachmentDisposition(value) {
 var MAX_SCOPES_PER_FETCH_IMPL = 128;
 var missingGlobalFetchOwner = {};
 var rateLimitDeadlines = /* @__PURE__ */ new WeakMap();
-function __resetRateLimitCircuitForTests() {
-  rateLimitDeadlines = /* @__PURE__ */ new WeakMap();
-}
 function fetchOwner(config) {
   return config.fetchImpl ?? globalThis.fetch ?? missingGlobalFetchOwner;
 }
@@ -1428,12 +1421,12 @@ function sameCacheEntry(left, right) {
     return true;
   if (left === void 0 || right === void 0)
     return false;
-  return left.jsonldRaw === right.jsonldRaw && left.etag === right.etag && left.storedAt === right.storedAt && left.registrationPending === right.registrationPending && left.retryNotBefore === right.retryNotBefore;
+  return left.jsonldRaw === right.jsonldRaw && left.etag === right.etag && left.storedAt === right.storedAt && left.retryNotBefore === right.retryNotBefore;
 }
 function sameCacheEntryIgnoringRetry(left, right) {
   if (left === void 0 || right === void 0)
     return false;
-  return left.jsonldRaw === right.jsonldRaw && left.etag === right.etag && left.storedAt === right.storedAt && left.registrationPending === right.registrationPending;
+  return left.jsonldRaw === right.jsonldRaw && left.etag === right.etag && left.storedAt === right.storedAt;
 }
 async function storeIfSnapshotUnchanged(cache2, key, snapshot, entry, preferPositive = false) {
   return withCacheWriteLock(cache2, key, async () => {
@@ -1485,7 +1478,6 @@ async function storeNotFoundMergingConcurrentBackoff(cache2, key, snapshot, entr
     }
     const merged = {
       ...entry,
-      ...current.registrationPending === true && { registrationPending: true },
       retryNotBefore: Math.max(entry.retryNotBefore ?? 0, current.retryNotBefore)
     };
     await cache2.set(key, merged);
@@ -1517,8 +1509,7 @@ async function resolveLookup(url, cache2, config, call, opts) {
     const key = normalizeForEnhancely(url);
     if (key === null)
       return { snippet: null, revalidateInMs: null };
-    const autoRegisterSuffix = opts.registerOnNotFound && config.autoRegister ? ":auto-register" : ":lookup-only";
-    const flightKey = `${opts.flightMode}${autoRegisterSuffix}:${key}`;
+    const flightKey = `${opts.flightMode}:${key}`;
     return await runLookupSingleFlight(cache2, flightKey, async () => {
       const cached = await cache2.get(key);
       const rateLimitDeadline = getRateLimitDeadline(config);
@@ -1544,8 +1535,7 @@ async function resolveLookup(url, cache2, config, call, opts) {
           const refreshed = await storeIfSnapshotUnchanged(cache2, key, cached, {
             jsonldRaw: cached.jsonldRaw,
             etag: cached.etag,
-            storedAt: Date.now(),
-            ...cached.registrationPending === true && { registrationPending: true }
+            storedAt: Date.now()
           });
           return lookupFromEntry(refreshed, config.cacheTtlMs);
         }
@@ -1568,60 +1558,10 @@ async function resolveLookup(url, cache2, config, call, opts) {
           return lookupFromEntry(entry, config.cacheTtlMs);
         }
         case "not-found": {
-          if (opts.registerOnNotFound && config.autoRegister) {
-            const registration = await registerOrRevalidate(config, key);
-            if (registration.status === "ok") {
-              const entry2 = await storeIfSnapshotUnchanged(cache2, key, cached, {
-                jsonldRaw: registration.jsonldRaw,
-                etag: registration.etag,
-                storedAt: Date.now()
-              }, true);
-              return lookupFromEntry(entry2, config.cacheTtlMs);
-            }
-            if (registration.status === "pending") {
-              const entry2 = await storeIfSnapshotUnchanged(cache2, key, cached, registration.retryAfterSeconds !== null ? {
-                jsonldRaw: null,
-                etag: null,
-                storedAt: 0,
-                registrationPending: true,
-                retryNotBefore: Date.now() + Math.min(Math.max(registration.retryAfterSeconds, 1) * 1e3, config.cacheTtlMs)
-              } : {
-                jsonldRaw: null,
-                etag: null,
-                storedAt: Date.now(),
-                registrationPending: true
-              });
-              return lookupFromEntry(entry2, config.cacheTtlMs);
-            }
-            if (registration.status === "terminal-negative") {
-              const entry2 = await storeIfSnapshotUnchanged(cache2, key, cached, {
-                jsonldRaw: null,
-                etag: null,
-                storedAt: Date.now()
-              });
-              return lookupFromEntry(entry2, config.cacheTtlMs);
-            }
-            if (registration.status === "rate-limited" || registration.status === "registration-limited" || registration.status === "error" || registration.status === "not-modified") {
-              const backoffMs = (registration.status === "rate-limited" || registration.status === "registration-limited") && registration.retryAfterSeconds !== null ? Math.min(Math.max(registration.retryAfterSeconds, 1) * 1e3, MAX_REGISTER_BACKOFF_MS) : DEFAULT_RETRY_BACKOFF_MS;
-              const now = Date.now();
-              const retryNotBefore = now + backoffMs;
-              if (registration.status === "rate-limited") {
-                recordRateLimitDeadline(config, now + Math.min(backoffMs, MAX_RETRY_BACKOFF_MS));
-              }
-              const entry2 = await storeBackoffMemo(cache2, key, cached, {
-                jsonldRaw: null,
-                etag: null,
-                storedAt: 0,
-                retryNotBefore
-              });
-              return lookupFromEntry(entry2, config.cacheTtlMs);
-            }
-          }
           const entry = await storeNotFoundMergingConcurrentBackoff(cache2, key, cached, {
             jsonldRaw: null,
             etag: null,
-            storedAt: Date.now(),
-            ...opts.registerOnNotFound && config.autoRegister && { registrationPending: true }
+            storedAt: Date.now()
           });
           return lookupFromEntry(entry, config.cacheTtlMs);
         }
@@ -1638,7 +1578,6 @@ async function resolveLookup(url, cache2, config, call, opts) {
             jsonldRaw: cached?.jsonldRaw ?? null,
             etag: cached?.etag ?? null,
             storedAt: cached?.storedAt ?? 0,
-            ...cached?.registrationPending === true && { registrationPending: true },
             retryNotBefore
           };
           let served = memo;
@@ -1656,14 +1595,12 @@ async function resolveLookup(url, cache2, config, call, opts) {
 }
 async function getJsonLdLookup(url, cache2, config) {
   return resolveLookup(url, cache2, config, (key, etag) => fetchJsonLd(config, key, etag), {
-    registerOnNotFound: true,
     maxBackoffMs: MAX_RETRY_BACKOFF_MS,
     flightMode: "conditional-get"
   });
 }
 async function getJsonLdRegisterLookup(url, cache2, config) {
   return resolveLookup(url, cache2, config, (key, etag) => registerOrRevalidate(config, key, etag), {
-    registerOnNotFound: false,
     maxBackoffMs: MAX_REGISTER_BACKOFF_MS,
     flightMode: "register-or-revalidate"
   });
@@ -1685,10 +1622,6 @@ var resolvedConfig = null;
 var negativeUntil = 0;
 var inflight = null;
 var NEGATIVE_TTL_MS = 3e4;
-var resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-var resolvedAssertedDefaultTtlSeconds = 0;
-var resolvedCapSetCookieResponses = false;
-var resolvedNonPageMemoTtlMs = DEFAULT_NON_PAGE_MEMO_TTL_MS;
 var bakedCache;
 var bakedOverride;
 var configOverrides = null;
@@ -1799,10 +1732,6 @@ function bakedConfig() {
 async function resolveOnce() {
   try {
     const baked = bakedConfig();
-    resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
-    resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
-    resolvedCapSetCookieResponses = baked?.capSetCookieResponses ?? false;
-    resolvedNonPageMemoTtlMs = baked?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
     let apiKey = baked?.apiKey;
     if (apiKey === void 0) {
       apiKey = await fetchApiKeyFromSsm(
@@ -1855,16 +1784,16 @@ function resolveAdapterConfig() {
   return inflight;
 }
 function getOriginTimeoutMs() {
-  return resolvedOriginTimeoutMs;
+  return bakedConfig()?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
 }
 function getAssertedDefaultTtlSeconds() {
-  return resolvedAssertedDefaultTtlSeconds;
+  return bakedConfig()?.assertedDefaultTtlSeconds ?? 0;
 }
 function getCapSetCookieResponses() {
-  return resolvedCapSetCookieResponses;
+  return bakedConfig()?.capSetCookieResponses ?? false;
 }
 function getNonPageMemoTtlMs() {
-  return resolvedNonPageMemoTtlMs;
+  return bakedConfig()?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
 }
 function getExcludePaths() {
   return bakedConfig()?.excludePaths ?? [];
@@ -2160,20 +2089,19 @@ function retrySharedTtlSeconds(headers, revalidateInMs, assertedDefaultTtlSecond
   }
   return assertedDefaultTtlSeconds > 0 ? Math.min(retryTtl, Math.floor(assertedDefaultTtlSeconds)) : null;
 }
-function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, opts) {
+function isRetryCacheCapCandidate(response, requestHeaders, opts) {
   if (requestHeaders["authorization"] !== void 0 || requestHeaders["cookie"] !== void 0) {
-    return response;
+    return false;
   }
+  const headers = response.headers ?? {};
+  if (parseCacheControlFields(headers) === null) return false;
+  if (hasPerRequestCacheControl(headerValues(headers, "cache-control"))) return false;
+  if (headers["set-cookie"] !== void 0 && !opts.capSetCookieResponses) return false;
+  return retrySharedTtlSeconds(headers, 1e3, opts.assertedDefaultTtlSeconds) !== null;
+}
+function retryablePassThroughResponse(response, requestHeaders, revalidateInMs, opts) {
+  if (!isRetryCacheCapCandidate(response, requestHeaders, opts)) return response;
   const originalHeaders = response.headers ?? {};
-  if (parseCacheControlFields(originalHeaders) === null) {
-    return response;
-  }
-  if (hasPerRequestCacheControl(headerValues(originalHeaders, "cache-control"))) {
-    return response;
-  }
-  if (originalHeaders["set-cookie"] !== void 0 && !opts.capSetCookieResponses) {
-    return response;
-  }
   const sharedTtlSeconds = retrySharedTtlSeconds(
     originalHeaders,
     revalidateInMs,
@@ -2210,9 +2138,6 @@ function noteUpstreamCallDuration(elapsedMs, timeoutMs) {
   if (elapsedMs >= timeoutMs * TIMEOUT_DETECTION_RATIO) {
     upstreamDownUntil = Date.now() + UPSTREAM_DOWN_MS;
   }
-}
-function __resetUpstreamMemoForTests() {
-  upstreamDownUntil = 0;
 }
 
 // src/origin-fetch.ts
@@ -2296,15 +2221,15 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, maxHeaderBy
         // `elb.amazonaws.com`) whose certificate is issued for the public
         // domain, and the origin selects the right cert by SNI. Node would
         // otherwise default SNI to the origin hostname, the cert fails
-        // verification, the re-fetch rejects and the handler fails open (no
+        // verification, the fetch rejects and the handler fails open (no
         // injection). Using the same value as the Host header is correct for
         // every name-based vhosted origin and needs no per-site configuration.
         // Ignored for plain-http origins.
         servername: hostHeader,
         headers: {
           // Fallback identity — a forwarded viewer User-Agent (in
-          // extraHeaders) overrides it, so the origin sees the same UA it
-          // already answered.
+          // extraHeaders) overrides it, so the origin receives the intended
+          // request variant signal.
           "user-agent": "enhancely-connector-lambda-edge",
           // Full forwarded request header set from the caller.
           ...extraHeaders,
@@ -2330,12 +2255,6 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, maxHeaderBy
         const combinedHeader = (name) => allHeaders[name]?.join(", ") ?? null;
         const contentType = combinedHeader("content-type");
         const contentEncoding = combinedHeader("content-encoding");
-        const cacheControl = combinedHeader("cache-control");
-        const expires = combinedHeader("expires");
-        const contentDisposition = combinedHeader("content-disposition");
-        const hasSetCookie = allHeaders["set-cookie"] !== void 0;
-        const csp = combinedHeader("content-security-policy");
-        const cspReportOnly = combinedHeader("content-security-policy-report-only");
         const xRobotsTag = combinedHeader("x-robots-tag");
         const chunks = [];
         let size = 0;
@@ -2349,12 +2268,6 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, maxHeaderBy
               status,
               contentType,
               contentEncoding,
-              cacheControl,
-              expires,
-              contentDisposition,
-              hasSetCookie,
-              contentSecurityPolicy: csp,
-              contentSecurityPolicyReportOnly: cspReportOnly,
               xRobotsTag,
               body: Buffer.alloc(0),
               truncated: true,
@@ -2372,12 +2285,6 @@ function fetchOriginHtml(originUrl, hostHeader, timeoutMs, maxBytes, maxHeaderBy
             status,
             contentType,
             contentEncoding,
-            cacheControl,
-            expires,
-            contentDisposition,
-            hasSetCookie,
-            contentSecurityPolicy: csp,
-            contentSecurityPolicyReportOnly: cspReportOnly,
             xRobotsTag,
             body: Buffer.concat(chunks),
             truncated: false,
@@ -2618,14 +2525,6 @@ function decodedHtmlResponse(origin, html) {
     bodyEncoding: "text"
   };
 }
-function __resetOriginRequestStateForTests() {
-  cache = new MemoryCache();
-  nonPageMemo = /* @__PURE__ */ new Map();
-  nonPageMemoEstimatedBytes = 0;
-  originFailureMemo = /* @__PURE__ */ new Map();
-  originRequestFailureMemo = /* @__PURE__ */ new Map();
-  __resetRateLimitCircuitForTests();
-}
 var handler = async (event) => {
   const record = event.Records[0];
   if (!record) return void 0;
@@ -2694,8 +2593,7 @@ var handler = async (event) => {
       contentType: origin.allHeaders["content-type"] ?? null,
       contentEncoding: origin.contentEncoding,
       cacheControl: origin.allHeaders["cache-control"] ?? null,
-      contentDisposition: origin.allHeaders["content-disposition"] ?? null,
-      hasSetCookie: origin.hasSetCookie
+      contentDisposition: origin.allHeaders["content-disposition"] ?? null
     })) {
       const verbatim = verbatimOriginResponse(origin, request);
       if (verbatim !== null) return verbatim;
@@ -2776,8 +2674,5 @@ var handler = async (event) => {
 };
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
-  __resetOriginRequestStateForTests,
-  __resetUpstreamMemoForTests,
-  buildResponseHeaders,
   handler
 });

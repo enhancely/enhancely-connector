@@ -1,16 +1,10 @@
 /**
  * origin-request handler tests: a REAL local node:http origin (so the actual
  * fetch, Host header and header pass-through are exercised), with the Enhancely
- * API mocked through the core's `fetchImpl` seam — same approach as
- * handler.test.ts.
- *
- * The load-bearing assertions here are the ones that differ from the
- * origin-response trigger:
- *  - origin hit COUNT (0 without a snippet, exactly 1 with one),
- *  - pass-through returns the REQUEST, not a response,
- *  - per-request state (Set-Cookie, no-store) is injected rather than skipped,
- *  - the generated response carries the origin's own headers, minus the ones
- *    CloudFront forbids and the ones that no longer describe the body.
+ * API mocked through the core's `fetchImpl` seam. Load-bearing assertions cover
+ * one-origin-hit generation, fail-open request handback, per-request metadata,
+ * and preservation of origin headers except fields CloudFront forbids or that
+ * no longer describe an injected body.
  */
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -63,8 +57,8 @@ beforeAll(async () => {
     const path = new URL(req.url ?? '/', 'http://x.invalid').pathname;
 
     const routes: Record<string, () => void> = {
-      // Sets a session cookie AND marks itself uncacheable — the exact shape
-      // the origin-response trigger refuses and this one must inject into.
+      // Sets a session cookie and marks itself uncacheable. The injector must
+      // preserve both directives on the exact response it decorates.
       '/with-cookie': () => {
         res.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
@@ -462,7 +456,7 @@ describe('origin-request — injection feasibility is proven before Enhancely', 
   });
 });
 
-describe('origin-request — per-request state IS injected (differs from origin-response)', () => {
+describe('origin-request — per-request state is preserved while injecting', () => {
   it('injects into a response carrying Set-Cookie and no-store', async () => {
     const response = asResponse(await invoke(makeRequestEvent({ uri: '/with-cookie' })));
     expect(response.body).toContain(SNIPPET);
@@ -554,9 +548,9 @@ describe('origin-request — pass-through gates', () => {
   });
 
   it('falls back to the origin domain when the viewer Host header is absent', async () => {
-    // Mirrors the origin-response adapter: an origin request policy that does
-    // not forward Host still has to work, so the origin's own domain name is
-    // the fallback for both the fetch and the Enhancely page URL.
+    // An origin request policy that does not forward Host still has to work,
+    // so the origin's own domain name is the fallback for both the fetch and
+    // the Enhancely page URL.
     const response = asResponse(await invoke(makeRequestEvent({ host: null })));
     expect(response.body).toContain(SNIPPET);
     expect(lastHostHeader).toBe('127.0.0.1');
@@ -712,7 +706,7 @@ describe('origin-request — a non-page is fetched ONCE, then remembered (v0.9.1
   });
 });
 
-describe('origin-request — safe origin answers are returned verbatim, not re-fetched', () => {
+describe('origin-request — safe origin answers are returned from the direct fetch', () => {
   it('returns the origin answer with ONE origin hit and no Enhancely call', async () => {
     const response = asResponse(await invoke(makeRequestEvent({ uri: '/redirect' })));
     expect(response.status).toBe('302');
@@ -925,7 +919,7 @@ describe('origin-request — fail-open', () => {
     expect(isPassThrough(first)).toBe(true);
     expect(originHits).toBe(1);
 
-    // The same known-bad request skips our pre-fetch during the short memo.
+    // The same known-bad request skips our direct fetch during the short memo.
     const repeated = await invoke(makeRequestEvent({ uri: '/flaky-origin' }));
     expect(isPassThrough(repeated)).toBe(true);
     expect(originHits).toBe(1);

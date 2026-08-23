@@ -4,17 +4,13 @@
 # Creates the Lambda@Edge functions, their shared IAM role and an optional SSM
 # SecureString placeholder for the API key.
 #
-# Default (`deployment_mode = "origin-request"`):
+# Creates exactly one supported pair:
 #   - origin-request injector: fetches the origin once, then generates the page
 #   - origin-response companion: cache-cap only, never calls Enhancely or injects
 #
-# Compatibility (`deployment_mode = "origin-response"`):
-#   - standalone origin-response injector with the legacy re-fetch pattern
-#
-# Consume `lambda_function_associations` to keep event types paired with the
-# correct handlers. The legacy `qualified_arn` output is deliberately non-null
-# only in compatibility mode; it can never silently point an old
-# origin-response association at the origin-request handler.
+# Consume `lambda_function_associations` to install both handlers on the same
+# cache behavior. The module intentionally has no standalone origin-response
+# injector or deployment-mode switch.
 #
 # IMPORTANT: pass an us-east-1 provider — Lambda@Edge functions must be
 # created there (execution happens at the edge POPs, not in us-east-1):
@@ -35,14 +31,6 @@ data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
-  origin_request_mode = var.deployment_mode == "origin-request"
-
-  # The faster origin-first architecture can use the connector-wide 800 ms
-  # default without spending that budget on non-pages. Preserve the standalone
-  # origin-response module's historical 2000 ms effective default so upgrading
-  # an existing deployment does not silently shorten its Enhancely calls.
-  effective_timeout_ms = var.timeout_ms != null ? var.timeout_ms : (local.origin_request_mode ? 800 : 2000)
-
   companion_function_name = "${var.name}-companion"
 
   # Lambda@Edge functions in this module deliberately use a fixed 10-second
@@ -63,7 +51,7 @@ locals {
     enhancelyBase             = var.enhancely_base
     ssmParameterName          = var.ssm_parameter_name
     ssmRegion                 = "us-east-1"
-    timeoutMs                 = local.effective_timeout_ms
+    timeoutMs                 = var.timeout_ms
     originTimeoutMs           = var.origin_timeout_ms
     cacheTtlMs                = var.cache_ttl_ms
     autoRegister              = var.auto_register
@@ -79,7 +67,7 @@ locals {
   ssm_parameter_path = startswith(var.ssm_parameter_name, "/") ? var.ssm_parameter_name : "/${var.ssm_parameter_name}"
 }
 
-# Default pair: one zip, two handlers. Sharing the exact artifact/config makes
+# One zip, two handlers. Sharing the exact artifact/config makes
 # it impossible for the origin-request injector and its companion to drift.
 data "archive_file" "origin_request_pair" {
   type        = "zip"
@@ -93,22 +81,6 @@ data "archive_file" "origin_request_pair" {
   source {
     filename = "companion.js"
     content  = file("${path.module}/dist/companion.js")
-  }
-
-  source {
-    filename = "connector-config.json"
-    content  = local.connector_config
-  }
-}
-
-# Explicit compatibility artifact: the standalone origin-response injector.
-data "archive_file" "origin_response" {
-  type        = "zip"
-  output_path = "${path.module}/dist/lambda-${data.aws_caller_identity.current.account_id}-${var.name}-origin-response.zip"
-
-  source {
-    filename = "index.js"
-    content  = file("${path.module}/dist/index.js")
   }
 
   source {
@@ -185,8 +157,8 @@ resource "aws_iam_role_policy" "edge" {
 
 resource "aws_lambda_function" "injector" {
   function_name    = var.name
-  filename         = local.origin_request_mode ? data.archive_file.origin_request_pair.output_path : data.archive_file.origin_response.output_path
-  source_code_hash = local.origin_request_mode ? data.archive_file.origin_request_pair.output_base64sha256 : data.archive_file.origin_response.output_base64sha256
+  filename         = data.archive_file.origin_request_pair.output_path
+  source_code_hash = data.archive_file.origin_request_pair.output_base64sha256
   handler          = "index.handler"
   runtime          = "nodejs22.x"
   role             = aws_iam_role.edge.arn
@@ -206,8 +178,8 @@ resource "aws_lambda_function" "injector" {
     }
 
     precondition {
-      condition     = local.effective_timeout_ms + var.origin_timeout_ms <= local.configurable_network_timeout_budget_ms
-      error_message = "The effective timeout_ms + origin_timeout_ms must be at most 6000 ms. The fixed 10-second Lambda timeout reserves 2000 ms for first-invocation SSM config and 2000 ms for cold-start, abort settlement, and returning the fail-open response."
+      condition     = var.timeout_ms + var.origin_timeout_ms <= local.configurable_network_timeout_budget_ms
+      error_message = "timeout_ms + origin_timeout_ms must be at most 6000 ms. The fixed 10-second Lambda timeout reserves 2000 ms for first-invocation SSM config and 2000 ms for cold-start, abort settlement, and returning the fail-open response."
     }
 
     precondition {
@@ -217,13 +189,11 @@ resource "aws_lambda_function" "injector" {
   }
 }
 
-# The companion is inseparable from the default origin-request mode. It shares
-# the same zip and baked config, but exposes only the non-injecting companion
+# The companion is inseparable from the origin-request injector. It shares the
+# same zip and baked config, but exposes only the non-injecting companion
 # handler. A generated origin-request response never fires origin-response, so
 # this function sees only uninjected traffic handed back to CloudFront.
 resource "aws_lambda_function" "companion" {
-  count = local.origin_request_mode ? 1 : 0
-
   function_name    = local.companion_function_name
   filename         = data.archive_file.origin_request_pair.output_path
   source_code_hash = data.archive_file.origin_request_pair.output_base64sha256
@@ -241,11 +211,6 @@ resource "aws_lambda_function" "companion" {
     precondition {
       condition     = data.aws_region.current.name == "us-east-1"
       error_message = "Lambda@Edge functions must be created in us-east-1 — pass an us-east-1 aliased provider to this module (providers = { aws = aws.us_east_1 })."
-    }
-
-    precondition {
-      condition     = length(var.name) <= 54
-      error_message = "origin-request mode requires name to be at most 54 characters so the -companion Lambda function stays within AWS's 64-character limit. Longer legacy names remain supported with deployment_mode = \"origin-response\"."
     }
   }
 }

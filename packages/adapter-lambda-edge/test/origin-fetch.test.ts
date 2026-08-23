@@ -3,7 +3,7 @@
  *
  * An https custom origin is addressed by its internal DNS name (for example an
  * ALB `…elb.amazonaws.com`), but its certificate is issued for the PUBLIC
- * domain and selected by SNI. The re-fetch must present the public Host as the
+ * domain and selected by SNI. The direct fetch must present the public Host as the
  * TLS servername, otherwise cert verification fails and the injector silently
  * falls open. This works for any name-based virtual-hosted origin without
  * per-site logic.
@@ -165,14 +165,17 @@ describe('fetchOriginHtml TLS SNI', () => {
     );
 
     expect(result.contentType).toBe('text/html; charset=utf-8, application/json');
-    expect(result.contentDisposition).toBe('inline, attachment; filename="page.html"');
-    expect(result.cacheControl).toBe('public, no-transform');
     expect(result.xRobotsTag).toBe('follow, noindex');
-    expect(result.hasSetCookie).toBe(true);
     expect(result.allHeaders['content-type']).toEqual([
       'text/html; charset=utf-8',
       'application/json',
     ]);
+    expect(result.allHeaders['content-disposition']).toEqual([
+      'inline',
+      'attachment; filename="page.html"',
+    ]);
+    expect(result.allHeaders['cache-control']).toEqual(['public', 'no-transform']);
+    expect(result.allHeaders['x-robots-tag']).toEqual(['follow', 'noindex']);
     expect(result.allHeaders['set-cookie']).toEqual(['a=1', 'b=2']);
   });
 

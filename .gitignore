@@ -1,10 +1,9 @@
 node_modules/
 dist/
 # The Terraform module ships its bundle IN the repo (consumed via git source
-# at a tag) — re-include exactly its three Lambda entrypoint artifacts:
+# at a tag) — re-include exactly its two Lambda entrypoint artifacts:
 !infra/modules/lambda-edge-injector/dist/
 infra/modules/lambda-edge-injector/dist/*
-!infra/modules/lambda-edge-injector/dist/index.js
 !infra/modules/lambda-edge-injector/dist/origin-request.js
 !infra/modules/lambda-edge-injector/dist/companion.js
 *.tsbuildinfo

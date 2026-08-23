@@ -38,7 +38,7 @@ import {
   shouldAttemptGeneratedResponse,
 } from './shared.js';
 import type { AttemptInput } from './shared.js';
-import { retryablePassThroughResponse } from './cache-cap.js';
+import { isRetryCacheCapCandidate, retryablePassThroughResponse } from './cache-cap.js';
 import type { CapOptions } from './cache-cap.js';
 import {
   getAssertedDefaultTtlSeconds,
@@ -50,7 +50,7 @@ import {
   resolveAdapterConfig,
 } from './config.js';
 
-/** Both operator assertions, resolved after resolveAdapterConfig() settled. */
+/** Both baked operator assertions are available without config/SSM I/O. */
 function capOptions(): CapOptions {
   return {
     assertedDefaultTtlSeconds: getAssertedDefaultTtlSeconds(),
@@ -104,7 +104,6 @@ export const handler = async (
       contentEncoding: null,
       cacheControl: headerValues(response.headers, 'cache-control'),
       contentDisposition: headerValues(response.headers, 'content-disposition'),
-      hasSetCookie: response.headers['set-cookie'] !== undefined,
     };
     if (!shouldAttemptGeneratedResponse(input)) return response;
     if (blocksIndexing(combinedHeaderValue(response.headers, 'x-robots-tag'))) return response;
@@ -116,23 +115,25 @@ export const handler = async (
     // private/sign-protected origins it cannot fetch directly.
     if (buildOriginUrl(request) === null) return response;
 
+    // Baked cap assertions are available synchronously. Apply every invariant
+    // veto before config resolution so credentialed, private/no-store,
+    // disallowed Set-Cookie, malformed-policy, and uncachable lifetime-less
+    // responses never cause an SSM request that cannot affect their result.
+    const options = capOptions();
+    if (!isRetryCacheCapCandidate(response, request.headers, options)) return response;
+
     // Config resolution is the only I/O this function may perform. It proves
-    // that the connector is enabled and loads the operator's cap assertions;
-    // neither the core client nor an Enhancely URL is reachable from here.
+    // that the connector is enabled; neither the core client nor an Enhancely
+    // URL is reachable from here.
     const config = await resolveAdapterConfig();
     if (config === null) {
       const retryInMs = getConfigRetryInMs();
       return retryInMs === null
         ? response
-        : retryablePassThroughResponse(response, request.headers, retryInMs, capOptions());
+        : retryablePassThroughResponse(response, request.headers, retryInMs, options);
     }
 
-    return retryablePassThroughResponse(
-      response,
-      request.headers,
-      getNonPageMemoTtlMs(),
-      capOptions()
-    );
+    return retryablePassThroughResponse(response, request.headers, getNonPageMemoTtlMs(), options);
   } catch (error) {
     console.error(
       '[enhancely-lambda-edge:companion] fail-open:',

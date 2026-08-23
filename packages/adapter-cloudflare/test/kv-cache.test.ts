@@ -190,7 +190,6 @@ describe('KVCacheBackend', () => {
       jsonldRaw: null,
       etag: null,
       storedAt: 123,
-      registrationPending: true,
     };
 
     await backend.set('k', negative);

@@ -222,15 +222,9 @@ describe('buildScriptTag — XSS defense-in-depth (escapes literal <)', () => {
 describe('autoRegister (self-populating connector)', () => {
   const notFound = () => Promise.resolve(new Response('nf', { status: 404 }));
 
-  it('POSTs the page once on 404, then stays quiet for the negative-cache TTL', async () => {
+  it('keeps the explicit conditional-GET lookup read-only even when autoRegister is enabled', async () => {
     const cache = new MemoryCache();
-    const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
-    const fetchImpl = vi.fn<Fetcher>((url, init) => {
-      calls.push({ url, method: init.method, body: init.body });
-      return init.method === 'POST'
-        ? Promise.resolve(new Response('{"status":"processing"}', { status: 201 }))
-        : notFound();
-    });
+    const fetchImpl = vi.fn<Fetcher>(() => notFound());
     const config = defineConfig({
       apiKey: 'k',
       autoRegister: true,
@@ -242,35 +236,13 @@ describe('autoRegister (self-populating connector)', () => {
     expect(first.snippet).toBeNull();
     expect(first.revalidateInMs).toBeGreaterThan(19_000);
     expect(first.revalidateInMs).toBeLessThanOrEqual(20_000);
-    const posts = calls.filter((c) => c.method === 'POST');
-    expect(posts).toHaveLength(1);
-    expect(posts[0]?.url).toContain('/api/v1/jsonld');
-    expect(JSON.parse(String(posts[0]?.body))).toEqual({ url: 'https://ex.com/new-page' });
 
-    // Second view within the TTL: negative cache answers, no GET, no POST.
+    // Second view within the TTL: negative cache answers, no second GET.
     const second = await getJsonLdLookup('https://ex.com/new-page?variant=2', cache, config);
     expect(second.snippet).toBeNull();
     expect(second.revalidateInMs).toBeGreaterThan(19_000);
-    expect(fetchImpl.mock.calls).toHaveLength(2); // 1 GET + 1 POST only
-  });
-
-  it('keeps a ready record returned by the legacy follow-up POST', async () => {
-    const cache = new MemoryCache();
-    const raw = '{"@context":"https://schema.org","@type":"Article"}';
-    const fetchImpl = vi
-      .fn<Fetcher>()
-      .mockResolvedValueOnce(new Response('', { status: 404 }))
-      .mockResolvedValueOnce(new Response(raw, { status: 200, headers: { ETag: '"ready"' } }));
-    const config = defineConfig({ apiKey: 'k', autoRegister: true, fetchImpl });
-
-    const result = await getJsonLdLookup('https://ex.com/ready-race', cache, config);
-
-    expect(result.snippet).toContain(raw);
-    expect(await cache.get('https://ex.com/ready-race')).toMatchObject({
-      jsonldRaw: raw,
-      etag: '"ready"',
-    });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls[0]?.[1].method).toBe('GET');
   });
 
   it('does not POST when autoRegister is off (default)', async () => {
@@ -299,16 +271,14 @@ describe('autoRegister (self-populating connector)', () => {
     expect(fetchImpl.mock.calls[0]?.[1].method).toBe('POST');
     expect(entry?.jsonldRaw).toBeNull();
     expect(entry?.retryNotBefore).toBeGreaterThan(Date.now());
-    expect(entry?.registrationPending).toBeUndefined();
   });
 
-  it('extends a stale pending revalidation delay through a temporary upstream backoff', async () => {
+  it('extends a stale negative revalidation delay through a temporary upstream backoff', async () => {
     const cache = new MemoryCache();
     await cache.set('https://ex.com/p', {
       jsonldRaw: null,
       etag: null,
       storedAt: Date.now() - 2_000,
-      registrationPending: true,
     });
     const fetchImpl = vi.fn<Fetcher>(() =>
       Promise.resolve(new Response(null, { status: 429, headers: { 'retry-after': '30' } }))
@@ -322,7 +292,6 @@ describe('autoRegister (self-populating connector)', () => {
     expect(result.snippet).toBeNull();
     expect(result.revalidateInMs).toBeGreaterThan(29_000);
     expect(result.revalidateInMs).toBeLessThanOrEqual(30_000);
-    expect((await cache.get('https://ex.com/p'))?.registrationPending).toBe(true);
   });
 
   it('returns a downstream retry delay for a cold transient API failure', async () => {

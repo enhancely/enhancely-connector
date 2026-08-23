@@ -9,14 +9,18 @@ import {
   __resetAdapterConfigForTests,
   __setBakedConfigForTests,
   __setConfigOverridesForTests,
+  getConfigRetryInMs,
 } from '../src/config.js';
 import type { BakedConnectorConfig } from '../src/config.js';
 import { handler } from '../src/companion.js';
 import { makeEvent } from './fixtures.js';
 
 // Keep the missing-key path hermetic (never walk the AWS credential chain).
+const ssmSend = vi.hoisted(() => vi.fn());
 vi.mock('@aws-sdk/client-ssm', () => {
-  class SSMClient {}
+  class SSMClient {
+    send = ssmSend;
+  }
   class GetParameterCommand {}
   return { SSMClient, GetParameterCommand };
 });
@@ -47,6 +51,8 @@ function cacheControlOf(result: CloudFrontResultResponse): string | undefined {
 
 beforeEach(() => {
   __resetAdapterConfigForTests();
+  ssmSend.mockReset();
+  ssmSend.mockResolvedValue({ Parameter: { Value: 'sk-from-ssm' } });
   setUp();
 });
 
@@ -89,6 +95,7 @@ describe('companion — zero Enhancely calls', () => {
     const result = await invokeCompanion(makeEvent());
 
     expect(cacheControlOf(result)).toBe('max-age=0, s-maxage=30, must-revalidate');
+    expect(getConfigRetryInMs()).not.toBeNull();
     expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 });
@@ -189,6 +196,56 @@ describe('companion — cache-lifetime capping', () => {
     const event = makeEvent(options);
     const result = await invokeCompanion(event);
     expect(result).toBe(event.Records[0]?.cf.response);
+  });
+
+  it.each([
+    ['request Cookie', { requestHeaders: { cookie: 'session=abc' } }],
+    ['request Authorization', { requestHeaders: { authorization: 'Bearer test' } }],
+    [
+      'private response',
+      {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'private, max-age=3600',
+        },
+      },
+    ],
+    [
+      'no-store response',
+      {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store, max-age=3600',
+        },
+      },
+    ],
+    [
+      'Set-Cookie without the operator assertion',
+      {
+        responseHeaders: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'max-age=3600',
+          'set-cookie': 'session=abc; Path=/',
+        },
+      },
+    ],
+    ['a lifetime-less response without a DefaultTTL assertion', {}],
+  ] as const)('skips config/SSM resolution for %s', async (_name, options) => {
+    __resetAdapterConfigForTests();
+    __setBakedConfigForTests({
+      cacheTtlMs: 60_000,
+      nonPageMemoTtlMs: 60_000,
+      autoRegister: true,
+    });
+    __setConfigOverridesForTests({ fetchImpl: enhancelyFetch });
+    const event = makeEvent(options);
+
+    const result = await invokeCompanion(event);
+
+    expect(result).toBe(event.Records[0]?.cf.response);
+    expect(ssmSend).not.toHaveBeenCalled();
+    expect(getConfigRetryInMs()).toBeNull();
+    expect(enhancelyFetch).not.toHaveBeenCalled();
   });
 });
 

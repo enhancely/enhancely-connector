@@ -54,20 +54,19 @@ export const DEFAULT_SSM_REGION = 'us-east-1';
 export const CONFIG_FILE_NAME = 'connector-config.json';
 
 /**
- * Default timeout for the origin re-fetch. Deliberately higher than the core's
- * Enhancely-call timeout (800 ms): the origin already answered once (the
- * response we are decorating), so a slow-but-working origin should not make
- * injection impossible — while a hung origin must still fail open quickly.
+ * Default timeout for the direct origin fetch. Deliberately higher than the
+ * core Enhancely-call timeout (800 ms): page generation may legitimately take
+ * longer than a lookup, while a hung origin must still fail open quickly.
  */
 export const DEFAULT_ORIGIN_TIMEOUT_MS = 2000;
 
 /**
  * Default timeout for the SSM `GetParameter` call. Every network call this
  * adapter makes must be bounded (repo rule 3): a hung SSM otherwise runs into
- * the Lambda function timeout, and a timed-out origin-response function is a
+ * the Lambda function timeout, and a timed-out Lambda@Edge function is a
  * viewer-facing 502 — NOT fail-open.
  */
-export const DEFAULT_SSM_TIMEOUT_MS = 2000;
+const DEFAULT_SSM_TIMEOUT_MS = 2000;
 
 /**
  * Terraform deploys every entrypoint with a fixed 10-second Lambda timeout.
@@ -76,8 +75,8 @@ export const DEFAULT_SSM_TIMEOUT_MS = 2000;
  * two seconds entirely outside network deadlines for cold start, the dynamic
  * SSM SDK import, abort settlement and response serialization.
  */
-export const LAMBDA_HARD_TIMEOUT_MS = 10_000;
-export const FAIL_OPEN_SETTLEMENT_RESERVE_MS = 2_000;
+const LAMBDA_HARD_TIMEOUT_MS = 10_000;
+const FAIL_OPEN_SETTLEMENT_RESERVE_MS = 2_000;
 export const MAX_SEQUENTIAL_NETWORK_TIMEOUT_MS =
   LAMBDA_HARD_TIMEOUT_MS - FAIL_OPEN_SETTLEMENT_RESERVE_MS;
 
@@ -86,7 +85,7 @@ export const MAX_SEQUENTIAL_NETWORK_TIMEOUT_MS =
  * 30 minutes: long, because the verdict is stable, and being wrong is bounded
  * (see `nonPageMemoTtlMs` in BakedConnectorConfig).
  */
-export const DEFAULT_NON_PAGE_MEMO_TTL_MS = 1_800_000;
+const DEFAULT_NON_PAGE_MEMO_TTL_MS = 1_800_000;
 
 /**
  * Shape of the deploy-time generated `connector-config.json` (all optional).
@@ -108,7 +107,7 @@ export interface BakedConnectorConfig {
   cacheTtlMs?: number;
   /** Enable self-registration through the one-step register-or-revalidate POST. */
   autoRegister?: boolean;
-  /** Timeout for the origin re-fetch (default: 2000 ms). */
+  /** Timeout for the direct origin fetch (default: 2000 ms). */
   originTimeoutMs?: number;
   /** SSM parameter holding the API key (used only when `apiKey` is absent). */
   ssmParameterName?: string;
@@ -168,7 +167,7 @@ export interface BakedConnectorConfig {
   /**
    * Request paths the connector must not touch AT ALL (login/account areas,
    * robots.txt-disallowed or noindex-by-policy sections): no Enhancely
-   * lookup, no auto-registration, no cache-TTL rewriting, no origin re-fetch
+   * lookup, no auto-registration, no cache-TTL rewriting, no origin fetch
    * — the response passes through byte-identical with its normal caching.
    * CloudFront path-pattern wildcards (`*`), case-sensitive, matched against
    * the full request path. Checked before config/SSM resolution.
@@ -199,10 +198,6 @@ let resolvedConfig: InjectorConfig | null = null;
 let negativeUntil = 0;
 let inflight: Promise<InjectorConfig | null> | null = null;
 const NEGATIVE_TTL_MS = 30_000;
-let resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-let resolvedAssertedDefaultTtlSeconds = 0;
-let resolvedCapSetCookieResponses = false;
-let resolvedNonPageMemoTtlMs = DEFAULT_NON_PAGE_MEMO_TTL_MS;
 // The baked FILE read is memoized separately from key resolution: exclusion
 // checks must work synchronously before (and without) any SSM call.
 let bakedCache: BakedConnectorConfig | null | undefined;
@@ -371,14 +366,6 @@ function bakedConfig(): BakedConnectorConfig | null {
 async function resolveOnce(): Promise<InjectorConfig | null> {
   try {
     const baked = bakedConfig();
-    resolvedOriginTimeoutMs = baked?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
-    // Set alongside the origin timeout, BEFORE any key check: the cap must
-    // also govern the pass-through path taken while the key is missing or
-    // SSM is failing (getConfigRetryInMs) — that path caches uninjected
-    // responses too.
-    resolvedAssertedDefaultTtlSeconds = baked?.assertedDefaultTtlSeconds ?? 0;
-    resolvedCapSetCookieResponses = baked?.capSetCookieResponses ?? false;
-    resolvedNonPageMemoTtlMs = baked?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
 
     let apiKey = baked?.apiKey;
     if (apiKey === undefined) {
@@ -402,9 +389,8 @@ async function resolveOnce(): Promise<InjectorConfig | null> {
     // Guard against an unconfigured/placeholder key. Every Enhancely key is
     // `sk-…` (project) or `sk-org-…`; anything else (e.g. the SSM SecureString
     // placeholder `REPLACE_ME` before the real value is set) means the deployment
-    // is not configured yet. Return null → the handler passes through WITHOUT the
-    // expensive origin re-fetch, so we do not pay doubled origin load from the
-    // moment the stack applies until the key is actually installed.
+    // is not configured yet. Return null so the handler passes through without
+    // performing its direct origin fetch until the key is installed.
     if (!apiKey.startsWith('sk-')) {
       console.error(
         `[enhancely-lambda-edge] API KEY not configured (value does not look like an Enhancely ` +
@@ -467,12 +453,11 @@ export function getConfigRetryInMs(): number | null {
 }
 
 /**
- * Timeout for the origin re-fetch (`originTimeoutMs` from the baked config,
- * default 2000 ms). Only meaningful after `resolveAdapterConfig()` settled —
- * exactly the order the handler uses.
+ * Timeout for the direct origin fetch (`originTimeoutMs` from the baked config,
+ * default 2000 ms). The validated baked value is available synchronously.
  */
 export function getOriginTimeoutMs(): number {
-  return resolvedOriginTimeoutMs;
+  return bakedConfig()?.originTimeoutMs ?? DEFAULT_ORIGIN_TIMEOUT_MS;
 }
 
 /**
@@ -481,25 +466,24 @@ export function getOriginTimeoutMs(): number {
  * positive, uninjected pass-through responses WITHOUT an explicit origin
  * lifetime may receive the bounded retry Cache-Control capped at this value;
  * without the assertion the adapter cannot know the DefaultTTL and must not
- * add cacheability. Only meaningful after `resolveAdapterConfig()` settled —
- * exactly the order the handler uses.
+ * add cacheability. The validated baked value is available synchronously so
+ * the companion can avoid config/SSM work when no cap is possible.
  */
 export function getAssertedDefaultTtlSeconds(): number {
-  return resolvedAssertedDefaultTtlSeconds;
+  return bakedConfig()?.assertedDefaultTtlSeconds ?? 0;
 }
 
 /**
- * Operator assertion `capSetCookieResponses` (baked config; used pair-wide and
- * by standalone origin-response), default false. Only meaningful after
- * `resolveAdapterConfig()` settled — exactly the order every handler uses.
+ * Operator assertion `capSetCookieResponses` (baked config; used pair-wide),
+ * default false. Available synchronously for the companion's pre-config gate.
  */
 export function getCapSetCookieResponses(): boolean {
-  return resolvedCapSetCookieResponses;
+  return bakedConfig()?.capSetCookieResponses ?? false;
 }
 
 /** Lifetime of the origin-request non-page memo (baked `nonPageMemoTtlMs`). */
 export function getNonPageMemoTtlMs(): number {
-  return resolvedNonPageMemoTtlMs;
+  return bakedConfig()?.nonPageMemoTtlMs ?? DEFAULT_NON_PAGE_MEMO_TTL_MS;
 }
 
 /**
@@ -515,7 +499,7 @@ export function getExcludePaths(): readonly string[] {
 /**
  * Exact public page-host selector (baked `includeHosts`). Like exclude paths,
  * this is available synchronously before API-key/SSM resolution. Empty means
- * unrestricted for backwards compatibility.
+ * unrestricted.
  */
 export function getIncludeHosts(): readonly string[] {
   return bakedConfig()?.includeHosts ?? [];
@@ -530,10 +514,6 @@ function __resetMemoForTests(): void {
   resolvedConfig = null;
   negativeUntil = 0;
   inflight = null;
-  resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-  resolvedAssertedDefaultTtlSeconds = 0;
-  resolvedCapSetCookieResponses = false;
-  resolvedNonPageMemoTtlMs = DEFAULT_NON_PAGE_MEMO_TTL_MS;
 }
 
 /** TEST-ONLY: bypass the connector-config.json file read (`null` = no file). */
@@ -555,7 +535,5 @@ export function __resetAdapterConfigForTests(): void {
   bakedOverride = undefined;
   configOverrides = null;
   __resetMemoForTests();
-  resolvedOriginTimeoutMs = DEFAULT_ORIGIN_TIMEOUT_MS;
-  resolvedAssertedDefaultTtlSeconds = 0;
   bakedCache = undefined;
 }

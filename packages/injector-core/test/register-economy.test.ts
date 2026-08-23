@@ -226,7 +226,7 @@ describe('getJsonLdLookup — pending & terminal-negative economics', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it('terminal-negative NEVER triggers auto-registration', async () => {
+  it('stores a terminal-negative response for a full TTL', async () => {
     const { config, fetchImpl } = withMockFetch([
       new Response(RAW_JSONLD, { status: 200, headers: { 'X-JsonLd-Status': 'ignored' } }),
     ]);
@@ -236,7 +236,7 @@ describe('getJsonLdLookup — pending & terminal-negative economics', () => {
     const result = await getJsonLdLookup(PAGE_URL, cache, registerConfig);
     expect(result.snippet).toBeNull();
     expect(result.revalidateInMs).toBe(TTL_MS);
-    // Exactly one call (the GET) — no follow-up register POST.
+    // Exactly one conditional GET; the explicit read path never registers.
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 

@@ -1,9 +1,9 @@
 /**
- * Origin re-fetch for the Lambda@Edge adapter.
+ * Direct custom-origin fetch for the Lambda@Edge origin-request injector.
  *
  * Implemented with node:http/node:https instead of global fetch for one
  * load-bearing reason: undici's fetch treats `Host` as a forbidden header and
- * silently DROPS it, but the re-fetch must present the incoming viewer Host
+ * silently DROPS it, but the fetch must present the incoming viewer Host
  * so name-based virtual hosts on the origin resolve to the right site.
  * node:http honors `headers.host` verbatim.
  *
@@ -12,25 +12,22 @@
  *   cannot be injected into (and any Content-Encoding on the answer makes the
  *   caller fail open).
  * - The caller forwards the FULL request header set CloudFront sent to the
- *   origin via `extraHeaders` (minus Host, Accept-Encoding and hop-by-hop
- *   headers): origin-response also fires for non-cacheable responses, and
- *   any header left out would make the re-fetch return a DIFFERENT variant
- *   of a page whose body varies on it (User-Agent device detection,
+ *   origin via `extraHeaders` (minus Host, Accept-Encoding, conditional/range,
+ *   and hop-by-hop headers). Any representation-forming header left out would
+ *   make the direct fetch return a different variant (User-Agent detection,
  *   Accept negotiation, CloudFront geo/device headers, cookies, …).
  * - Bounded buffering: bodies larger than `maxBytes` abort the download and
- *   come back as `truncated: true` (Lambda@Edge caps generated origin-response
- *   bodies at ~1 MB anyway, so there is no point buffering more).
+ *   come back as `truncated: true` (Lambda@Edge caps generated responses at
+ *   about 1 MB, so there is no point buffering more).
  * - `AbortSignal.timeout` — a hung origin rejects and the caller fails open.
- * - No redirect following: a redirect is a non-200 and the caller fails open
- *   (the original response being decorated was a 200, so a re-fetch redirect
- *   means the origin disagrees with itself — not something to paper over).
+ * - No redirect following: the caller returns the origin's redirect verbatim.
  * - `agent: false` — one clean connection per request; frozen Lambda execution
  *   environments and kept-alive sockets are a flaky combination.
  */
 import * as http from 'node:http';
 import * as https from 'node:https';
 
-export type OriginFetchFailureScope = 'endpoint' | 'request';
+type OriginFetchFailureScope = 'endpoint' | 'request';
 
 /**
  * A failed origin fetch annotated with the widest scope it is safe to memoize.
@@ -38,7 +35,7 @@ export type OriginFetchFailureScope = 'endpoint' | 'request';
  * transport became usable; everything after that point is representation- or
  * request-specific and must not suppress healthy paths on the same origin.
  */
-export class OriginFetchError extends Error {
+class OriginFetchError extends Error {
   readonly scope: OriginFetchFailureScope;
 
   constructor(scope: OriginFetchFailureScope, cause: unknown) {
@@ -105,27 +102,9 @@ export interface OriginFetchResult {
   status: number;
   contentType: string | null;
   contentEncoding: string | null;
-  /** Cache-Control of the re-fetched answer (per-request gate in the caller). */
-  cacheControl: string | null;
-  /** Expires of the re-fetched answer, synchronized with its generated body. */
-  expires: string | null;
-  /** Convenience combined value; strict gates use the instances in allHeaders. */
-  contentDisposition: string | null;
-  /** True when the re-fetched answer carries any Set-Cookie header. */
-  hasSetCookie: boolean;
   /**
-   * Content-Security-Policy of the re-fetched answer. The injected body comes
-   * from THIS response, so if the origin mints a per-response CSP nonce the
-   * matching header is this one — not the first response's. The caller copies
-   * it onto the generated response so header and body stay consistent.
-   */
-  contentSecurityPolicy: string | null;
-  /** CSP report-only variant, copied for the same reason. */
-  contentSecurityPolicyReportOnly: string | null;
-  /**
-   * X-Robots-Tag of the re-fetched answer (all instances combined). The
-   * injected body comes from THIS response, so the noindex/none gate must
-   * hold for this representation too, not only for the first response.
+   * X-Robots-Tag of the fetched answer (all instances combined). Injection is
+   * vetoed when that exact representation blocks indexing.
    */
   xRobotsTag: string | null;
   body: Buffer;
@@ -135,11 +114,10 @@ export interface OriginFetchResult {
    * EVERY response header, lowercase-keyed, with each value preserved
    * separately (never comma-joined — `Set-Cookie` must not be folded).
    *
-   * The origin-response adapter does not need this: there CloudFront already
-   * holds the real response and this fetch only supplies a body. The
-   * origin-request adapter does — it GENERATES the whole viewer response, so
-   * dropping the origin's other headers (Vary, Link, Strict-Transport-Security,
-   * X-Frame-Options, …) would silently strip security and caching metadata.
+   * The origin-request injector generates the whole viewer response, so every
+   * origin header must remain available; dropping Vary, Link,
+   * Strict-Transport-Security, X-Frame-Options, or similar fields would strip
+   * security and caching metadata silently.
    */
   allHeaders: Record<string, string[]>;
 }
@@ -190,15 +168,15 @@ export function fetchOriginHtml(
         // `elb.amazonaws.com`) whose certificate is issued for the public
         // domain, and the origin selects the right cert by SNI. Node would
         // otherwise default SNI to the origin hostname, the cert fails
-        // verification, the re-fetch rejects and the handler fails open (no
+        // verification, the fetch rejects and the handler fails open (no
         // injection). Using the same value as the Host header is correct for
         // every name-based vhosted origin and needs no per-site configuration.
         // Ignored for plain-http origins.
         servername: hostHeader,
         headers: {
           // Fallback identity — a forwarded viewer User-Agent (in
-          // extraHeaders) overrides it, so the origin sees the same UA it
-          // already answered.
+          // extraHeaders) overrides it, so the origin receives the intended
+          // request variant signal.
           'user-agent': 'enhancely-connector-lambda-edge',
           // Full forwarded request header set from the caller.
           ...extraHeaders,
@@ -240,12 +218,6 @@ export function fetchOriginHtml(
         // rewriting rather than being hidden behind whichever value came first.
         const contentType = combinedHeader('content-type');
         const contentEncoding = combinedHeader('content-encoding');
-        const cacheControl = combinedHeader('cache-control');
-        const expires = combinedHeader('expires');
-        const contentDisposition = combinedHeader('content-disposition');
-        const hasSetCookie = allHeaders['set-cookie'] !== undefined;
-        const csp = combinedHeader('content-security-policy');
-        const cspReportOnly = combinedHeader('content-security-policy-report-only');
         const xRobotsTag = combinedHeader('x-robots-tag');
 
         const chunks: Buffer[] = [];
@@ -261,12 +233,6 @@ export function fetchOriginHtml(
               status,
               contentType,
               contentEncoding,
-              cacheControl,
-              expires,
-              contentDisposition,
-              hasSetCookie,
-              contentSecurityPolicy: csp,
-              contentSecurityPolicyReportOnly: cspReportOnly,
               xRobotsTag,
               body: Buffer.alloc(0),
               truncated: true,
@@ -285,12 +251,6 @@ export function fetchOriginHtml(
             status,
             contentType,
             contentEncoding,
-            cacheControl,
-            expires,
-            contentDisposition,
-            hasSetCookie,
-            contentSecurityPolicy: csp,
-            contentSecurityPolicyReportOnly: cspReportOnly,
             xRobotsTag,
             body: Buffer.concat(chunks),
             truncated: false,

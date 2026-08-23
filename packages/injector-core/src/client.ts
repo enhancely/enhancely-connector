@@ -280,9 +280,9 @@ export async function fetchJsonLd(
  * The endpoint is not merely "register": for a KNOWN url it answers like the
  * read path (200 + raw script-safe body + ETag, or 412 when the ETag still
  * matches), for an UNKNOWN url it creates the record and starts generation
- * (201), and for a record mid-generation it answers 202. One round-trip
- * replaces the GET→404→POST pair. Duplicate POSTs for the same new URL are
- * coalesced server-side; the call is treated as idempotent.
+ * (201), and for a record mid-generation it answers 202. Duplicate POSTs for
+ * the same new URL are coalesced server-side; the call is treated as
+ * idempotent.
  *
  * Status map (server verified 2026-08-21):
  * - 200 → ok / terminal-negative (`X-JsonLd-Status: ignored`, body `{}`)
@@ -366,33 +366,4 @@ export async function registerOrRevalidate(
   }
 
   return evaluateOkResponse(response, config.maxJsonLdBytes, signal);
-}
-
-/**
- * Register a page at Enhancely: `POST /api/v1/jsonld { url }` creates the
- * record and starts generation (201/202). Called at most once per URL per
- * cache TTL (guarded by the caller's negative cache). Fire-and-forget
- * semantics: the boolean result is informational, failures never propagate.
- */
-export async function registerJsonLd(config: InjectorConfig, pageUrl: string): Promise<boolean> {
-  const safePageUrl = normalizeForEnhancely(pageUrl);
-  if (safePageUrl === null) return false;
-
-  const fetchImpl = config.fetchImpl ?? globalThis.fetch;
-  try {
-    const response = await fetchImpl(`${config.enhancelyBase}/api/v1/jsonld`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ url: safePageUrl }),
-      signal: AbortSignal.timeout(config.timeoutMs),
-    });
-    const accepted = response.status === 201 || response.status === 200 || response.status === 202;
-    cancelResponseBody(response, accepted ? 'body-unused' : `http-${response.status}`);
-    return accepted;
-  } catch {
-    return false;
-  }
 }

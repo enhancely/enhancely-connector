@@ -1,116 +1,198 @@
 # Enhancely Connector — Architecture
 
 Date: 2026-07-27
+
 Status: BINDING — decisions below are settled unless explicitly revisited.
+
+The detailed current request flow, Mermaid diagrams, request counts, and every
+cache/retry duration are maintained in
+[`current-runtime-architecture.md`](current-runtime-architecture.md). This file
+records the binding architecture decisions.
 
 ## 1. Context
 
-Enhancely today is **pull-only**: it generates and stores JSON-LD for customer pages, and customers must integrate it themselves (fetch from the API, template it into their pages). That integration step is the biggest adoption hurdle.
+Enhancely stores JSON-LD for page URLs. This repository supplies the delivery
+layer: a connector in the server/edge HTTP path fetches the JSON-LD and injects
+it immediately before a parser-safe `</head>`. The API key stays server-side.
+If any prerequisite is uncertain, the connector serves the original response.
 
-This repository adds the missing **delivery layer**: a connector that sits in the customer's HTTP path (edge worker, CDN function, or reverse-proxy sidecar) and injects the JSON-LD into the HTML response automatically — the same deployment model as prerender.io or redirection.io. The customer installs a connector once; Enhancely structured data appears on every page without further site changes.
+## 2. API contract
 
-## 2. Hard API facts (verified against the main repo)
+- Read-only lookup: `GET {ENHANCELY_BASE}/api/v1/jsonld/{segment}`.
+- Register-or-revalidate: `POST {ENHANCELY_BASE}/api/v1/jsonld { url }`.
+- `getJsonLdLookup` is always read-only GET. `autoRegister` uses one direct
+  register-or-revalidate POST. There is no GET→404→POST fallback and no separate
+  `registerJsonLd` API.
+- The wire URL and logical cache key are the same query-stripped,
+  normalization-stable `normalizeLite(url)`. The server remains authoritative
+  for hashing.
+- Authentication is `Authorization: Bearer <sk-… | sk-org-…>`.
+- `Accept: application/ld+json` must be exact.
+- A successful body is already script-safe JSON-LD and is inserted verbatim;
+  never parse, serialize, or re-escape it.
+- The API sets `Cache-Control: no-store`; the connector owns its cache and uses
+  ETag conditional revalidation.
+- `429` uses `Retry-After`, falling back to `RateLimit-Reset`, and is the only
+  status that opens the shared API-key circuit. A registration `403` is
+  URL-local and must never suppress other URLs.
 
-These are contract facts, not choices. Implement against them; do not re-derive.
+The production default is `https://app.enhancely.ai`.
 
-- **Read endpoint:** `GET {ENHANCELY_BASE}/api/v1/jsonld/{segment}` where `segment` is the URL-encoded page URL. The connector sends the query-stripped, normalization-stable `normalizeLite(url)` (never a locally computed hash); the server normalizes and hashes authoritatively.
-- **`ENHANCELY_BASE`:** production default `https://app.enhancely.ai`; the [official Enhancely API endpoint definitions](https://docs.enhancely.ai/) list `https://app.enhancely.ai/api/v1/jsonld`.
-- **Auth required:** `Authorization: Bearer <sk-… | sk-org-…>`. The key must never reach the browser.
-- **`Accept: application/ld+json`** — the server performs an **exact string match** on this header. The response is the raw, already script-safe-escaped JSON-LD string (`<` pre-escaped as a unicode escape). It goes verbatim into `<script type="application/ld+json">…</script>`; the connector must never parse, re-serialize, or re-escape it.
-- **Caching:** the API sets `Cache-Control: no-store` but supports `ETag` + `If-None-Match` (304). The connector therefore brings its **own cache** and uses the ETag for cheap revalidation.
-- **Registration/read combination:** `POST /api/v1/jsonld` is register-or-revalidate. With `Accept: application/ld+json` it returns a known record in the same call, so high-level `autoRegister` must not spend a GET before it.
-- **Errors:** `404` = record missing; `429` = org rate limit with `Retry-After` or `RateLimit-Reset`. Both fail open. Only `429` opens the shared API-key circuit, always capped at 60 seconds. A register-path `403` with `Retry-After` is a URL-local registration backoff only; a `403` without `Retry-After` is a durable negative for one cache TTL.
-- **Server normalization** (mirrored as `normalizeLite` for the cache key and wire URL): force https, strip query, strip fragment, strip a single trailing slash. The legacy single-slash rule is not idempotent for two or more trailing slashes, so the strict connector boundary rejects those normalization-unstable inputs before cache/API work.
+## 3. One core, thin adapters
 
-## 3. Binding architecture decisions
+`packages/injector-core` is the single source of truth for:
 
-### 3.1 Monorepo with a single shared core
+- strict URL handling;
+- cache, ETag revalidation, single-flight, and write ordering;
+- API calls and rate-limit circuits;
+- HTML structural preflight and injection;
+- fail-open orchestration.
 
-One repo, one `packages/injector-core`, thin per-platform adapters.
+Cloudflare, Lambda@Edge, and the Node sidecar translate platform request and
+response shapes only. Shared behavior must move into core rather than being
+copied across adapters.
 
-Rationale: **one core = one source of truth, one CI, one conformance suite.** Every fail-open rule, cache behavior, and API-contract detail is implemented and tested exactly once. Heterogeneity exists only in the **built artifacts** (worker bundle, Lambda zip, container image) — never in the logic. An adapter that needs logic the core lacks contributes it to the core.
+TypeScript is the common implementation language because it covers all current
+targets, including Lambda@Edge's Node runtime. A possible Go sidecar remains a
+separate future distribution, not a rewrite of core.
 
-### 3.2 TypeScript for core and all current adapters
+## 4. Fail-open contract
 
-Rationale: CloudFront **Lambda@Edge supports only Node.js and Python** runtimes — Go is impossible there. TypeScript is the single language that natively covers Cloudflare Workers, Lambda@Edge, and a Node sidecar, so it maximizes code sharing through the core. A Go sidecar (`adapter-sidecar-go`) is reserved as a deliberate **later second distribution** (single static binary for customers who won't run Node/containers), not as a replacement for the core.
+Injection requires exact status `200`, exactly one unambiguous `text/html`
+media type, a safe charset, no blocking robots/transform/disposition metadata,
+a parser-safe head close, and sufficient platform body/header quota.
 
-### 3.3 Depth-first: core + Cloudflare adapter first
+Malformed or duplicate singleton headers, unexpected encodings, timeouts,
+oversized bodies, missing records, and every internal error leave the original
+response untouched. JSON-LD is streamed under a 256 KiB hard ceiling. The
+default Enhancely timeout is 800 ms.
 
-Build the core to production quality with one reference adapter (Cloudflare Workers) before spreading breadth-wise to Lambda@Edge and the sidecar. The reference adapter proves the core's API is sufficient; subsequent adapters are then mechanical.
+The query-stripped normalized URL is accepted at the network boundary only if
+it is an absolute HTTP(S) URL without credentials and normalization is a fixed
+point. Multi-trailing-slash inputs that violate that rule fail locally before
+cache or network access.
 
-### 3.4 URL, not hash — correctness principle
+## 5. CloudFront binding architecture
 
-The connector sends the query-stripped `normalizeLite(url)` (4 rules, §2) — the same value it caches under — never a locally computed hash; the server still owns hashing. Stripping the query at the edge keeps tokens/PII off the wire and matches the server (which strips the query before hashing anyway), so the resolved record is identical. **Correctness now depends on `normalizeLite` staying byte-for-byte identical to the server's `normalizeUrl`**: since the connector sends the already-normalized URL, the server cannot recover the original, so a divergence would serve the wrong record rather than merely cost a cache entry. The two are the exact same code today (verified 2026-07-27); they must be kept in lockstep. The stricter API boundary accepts only absolute HTTP(S) URLs without URL credentials whose normalized key is a fixed point (`normalizeLite(key) === key`) and rejects everything else before even reading the cache. This deliberately makes rare multi-trailing-slash URLs fail open: the current platform-wide rule removes one slash per pass, so accepting such a URL would let the cache key and the record URL diverge when the server or generation pipeline normalizes again. `normalizeLite` keeps its historical best-effort public behavior, but unsafe or unstable fallback values can never reach Enhancely. Making normalization fully idempotent remains a coordinated server-and-connector migration, not a connector-only release change.
+CloudFront has exactly one supported deployment shape:
 
-### 3.5 Fail-open everywhere
+| Event             | Function                 | Network work                                                                                                             |
+| ----------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `origin-request`  | Injector                 | Fetches the Custom Origin once; after a proven injectable response, performs zero or at most one Enhancely request.      |
+| `origin-response` | Cache-cap-only companion | Never fetches origin or Enhancely and never injects; it can only shorten an eligible handback response's cache lifetime. |
 
-Any error, timeout, oversized JSON-LD body, missing structural `</head>`, non-HTML content type, origin status other than exact 200, `Cache-Control: no-transform`, or a valid non-`inline` `Content-Disposition` → serve the original response untouched. Every production adapter proves a structural head insertion point before lookup: the shared core scanner requires a real `<head>…</head>` pair and ignores false closing tags in comments, quoted attribute values, raw-text elements, and `<plaintext>`. It also rejects a lexical head that the HTML tree builder would already have closed implicitly and validates head-level `noscript` content under both scripting-enabled and scripting-disabled parser modes. The scanner uses linear forward passes for raw-text and comment spans, including malformed end-tag prefixes and WHATWG comment closers. Cloudflare runs that same scanner over its bounded UTF-8 buffer before asking `HTMLRewriter` to reserve the slot. Every Enhancely call runs under `AbortSignal.timeout` (default 800 ms). Successful JSON-LD responses are streamed with a 256 KiB hard ceiling (configurable downward only) and cancelled immediately when they exceed it; unused error bodies are cancelled as well. The default in-process cache is bounded by 5000 entries and a conservative 16 MiB retained-string estimate. Plain upstream errors create a 10-second URL-local retry memo. Only an HTTP `429` opens a bounded execution-environment-local circuit for the same Enhancely base/API key/fetch scope, shared by conditional GET and register-or-revalidate: other URLs serve stale positives or a negative/missing `revalidateInMs` without another API call for at most 60 seconds. The register path may additionally retain its own URL-local `429` backoff or a `403` `Retry-After` for up to 24 hours; a registration-limit `403` never enters the shared circuit. Custom fetch implementations have isolated circuits, expired scopes are pruned, and each fetch context retains at most 128 live API-key scopes. Concurrent cold or stale requests for the same cache object, normalized URL, lookup mode, and execution environment share one upstream operation. Local writes are serialized: a newly successful 200/304/412 beats retry-only state, a successful 404 may retire stale data while inheriting the longest concurrent deadline, transient races preserve stale positive data plus that deadline, and a genuinely newer positive cannot be overwritten by an older negative/error. Distributed backends need their own CAS semantics for the same guarantee across isolates; Workers KV is eventually consistent, so this rare cross-isolate conflict is explicitly deferred to the later distributed-cache phase. The connector must never be the reason a customer page breaks or slows down materially; missing structured data on one view is an acceptable cost, a broken page is not.
+Both functions must be associated with the same cache behavior. A generated
+origin-request response does not invoke origin-response, so normal injected and
+safely reproducible responses cost one origin fetch. Only a hard handback lets
+CloudFront fetch the origin and subsequently invoke the companion.
 
-Where the platform exposes raw response-header instances, each is validated before
-list aggregation. A duplicate singleton `Content-Type`, top-level comma, Unicode
-pseudo-OWS, or unbalanced quoted string is therefore non-injectable. Cloudflare's
-Fetch API exposes only folded values, so that adapter additionally vetoes every comma
-inside a quoted gate value; legitimate quoted commas under-inject rather than letting
-malformed instances heal one another. Explicit `no-transform`, `noindex`, and standalone
-`none` directives remain vetoes even when a malformed origin separated them with
-whitespace or semicolons. Cache-policy capping likewise leaves ambiguous
-multi-instance fields untouched. Legacy stability checks case-fold directive names,
-preserve extension/robots argument bytes, and reject duplicate Cache-Control names.
-When the deliberately separate GET and register
-lookup modes race, successful positive revalidation wins retry-only state, a
-successful 404 can retire stale data while inheriting the longest concurrent
-deadline, and transient races preserve stale positive data plus that deadline.
+Version 0.10.0 deliberately removes the unused standalone origin-response
+injector, its double-origin-fetch path, deployment mode switch, compatibility
+output, tests, and artifacts. The only release assets are the injector and
+companion JavaScript/ZIP pairs plus `SHA256SUMS`.
 
-For Lambda@Edge, operator path exclusions are resolved before any config/API
-work. Matching canonicalizes the raw path in the same direction as the
-downstream URL layer: decode RFC 3986 unreserved octets once, convert literal
-backslashes to `/`, then collapse duplicate slashes and dot-segments. Reserved,
-non-ASCII, malformed, and double-encoded octets remain literal. The standalone
-origin-response injector checks both CloudFront's response and its identity
-re-fetch for `X-Robots-Tag: noindex|none`; either value vetoes injection, and
-other robots metadata must remain stable across those representations. The
-origin-request injector has only the one origin answer and applies the same
-blocking check there. All Lambda entrypoints also reject `no-transform` and
-every valid non-`inline` content disposition before lookup, registration,
-injection, or retry-cache rewriting.
+The direct fetch requires an externally reachable Custom Origin. S3 REST/OAC,
+private VPC, signature-protected, and otherwise inaccessible origins cannot be
+injected. Origin Group, Shield, and CloudFront retry semantics do not wrap the
+Lambda's direct fetch.
 
-The origin-request adapter also distinguishes origin transport failures by
-scope. A known DNS, TCP-connect, or TLS failure before transport readiness opens
-a bounded 10-second endpoint + virtual-host circuit. Post-connect timeouts,
-resets, malformed responses, and unknown failures are memoized for only the
-exact raw origin request. Repeats avoid a known-doomed connector fetch without
-allowing one bad path to suppress injection across a healthy origin.
+### Host and query prerequisites
 
-## 4. Target → artifact → install
+Lambda `includeHosts` / Terraform `include_hosts` is an exact public DNS-host
+selector. It runs before SSM, direct origin fetch, Enhancely, registration, and
+companion cache work. Empty means all hosts; malformed non-empty hand config
+matches nothing.
 
-| Target                 | Artifact                                                                                                                      | Install / operations                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Cloudflare Workers** | Bundled `worker.js` via wrangler                                                                                              | `wrangler deploy`; API key as a Worker secret; KV or Cache API for the JSON-LD cache; route on the customer zone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **CloudFront**         | Lambda@Edge pair in us-east-1: **origin-request + companion** (default), or standalone **origin-response** compatibility mode | The default origin-request injector performs the origin fetch itself and only contacts Enhancely after an exact 200 `text/html` representation has passed charset, robots, `no-transform`, non-inline disposition, real-head, and generated-response quota preflights. It generates injected and safe uninjected responses, so the normal path costs one origin hit; small status-200 veto bodies and non-2xx responses are reproduced from that same fetch. Unreproducible responses hand back to CloudFront. There is deliberately no private cross-trigger request marker: CloudFront would expose it to the customer's origin/WAF and it could change the representation. The paired origin-response companion is cache-cap-only: it repeats the cheap method, exclusion-path, non-HTML-extension, Range, exact-200 HTML, charset, indexing, transform, disposition, and syntactic custom-origin gates, then optionally resolves server-side config and safely shortens the pass-through response's existing cache lifetime. With config it uses `nonPageMemoTtlMs` (30 minutes by default); without config it uses the remaining config retry (30 seconds by default). It never injects, reads or fetches the body, fetches the origin, calls Enhancely, or owns a JSON-LD/upstream memo. `buildOriginUrl` rejects S3 and unsafe path escapes but cannot detect a VPC-only or signature-protected Custom Origin; if CloudFront still returns eligible HTML there, the companion can cap it, so the pair must not be associated with those behaviors (or their paths must be excluded). The recommended pair therefore makes at most one Enhancely call per viewer request, including a rare post-lookup quota handback, and that call can only come from the origin-request injector. `capSetCookieResponses` is a pairing-wide operator assertion used by both the origin-request injector's generated uninjected retry fallback and by the companion's safe cap path; credentialed requests and `private`/`no-store` responses never receive that cache-policy rewrite. Both functions share one artifact/config and must be associated with the same behavior. The Terraform module emits this pairing as one association map and preserves the old standalone origin-response re-fetch architecture only behind explicit `deployment_mode = "origin-response"`; its deprecated `qualified_arn` is null in default mode so legacy wiring cannot silently attach the wrong handler. Every module function has a fixed 10-second timeout; Terraform allows at most 6000 ms for API + origin after reserving 2000 ms each for SSM and fail-open settlement, while hand-written baked API/origin/SSM overrides are accepted atomically only when their total is at most 8000 ms. Generated responses enforce the 32 KiB header and 1 MiB combined quotas, and Node's origin client accepts the same 32 KiB header budget. The current request flow is documented in `current-runtime-architecture.md`. |
-| **Sidecar**            | Container image now; Go static binary later                                                                                   | Runs next to the origin; nginx `proxy_pass` / apache `ProxyPass` points at the sidecar, which proxies the origin and injects.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+When aliases share a behavior and host policy differs, viewer `Host` must be in
+the CloudFront **cache policy**, or aliases must use separate distributions. An
+origin request policy alone cannot partition cache hits. Terraform therefore
+requires the explicit `host_in_cache_key_asserted = true` operator assertion
+for a non-empty host list.
 
-Lambda's `includeHosts` / Terraform `include_hosts` is an exact public-host
-selector shared by all three Lambda entrypoints. Non-matching hosts leave before
-SSM, the connector's own origin fetch, Enhancely, registration, or companion cache
-rewriting. Empty preserves the all-host behavior. Since origin-facing triggers only
-run on cache misses, a multi-alias behavior with host-dependent policy must also put
-viewer `Host` in the CloudFront cache key (or use separate distributions); an origin
-request policy alone cannot isolate already-cached objects. Query-dependent origins
-must expose all query strings through the cache or origin request policy so the direct
-fetch reproduces CloudFront's request. The filter avoids connector work after the
-Lambda starts; behavior scoping or separate distributions are still required to avoid
-the Lambda@Edge invocation itself. Terraform consumers must additionally set
-`host_in_cache_key_asserted = true` for a non-empty list, because this Lambda module
-cannot inspect the associated distribution's external cache policy.
+Every query string that changes the origin representation must be exposed
+through the cache or origin request policy so the direct fetch can reproduce
+the viewer request. The URL sent to Enhancely remains queryless.
 
-Cloudflare's distributed and fallback caches are likewise isolated by Enhancely
-base/API-key identity. Persisted KV keys carry only a non-secret SHA-256 scope, so a
-namespace reused after key rotation cannot return another project's record. v0.9.6
-intentionally treats older unscoped KV records as cold.
+Path-scoped behaviors without Lambda associations are the preferred way to
+exclude assets and media. `excludePaths` and the extension gate avoid downstream
+work but cannot avoid an invocation after CloudFront selects an associated
+behavior.
 
-## 5. Future option: Proxy-Wasm for the Envoy family
+### Request counts
 
-A Rust→Wasm build of the injector (Proxy-Wasm ABI) would slot into Envoy, Nginx-with-Wasm, Kong, and APISIX with a single artifact.
+Per CloudFront viewer request:
 
-- It is a **portability play only**: one more artifact family, not a new core. It does **not** cover Lambda@Edge (Node/Python only) or classic Apache.
-- Explicitly: **Wasm is a portability win, not a performance win.** The workload is I/O-bound (one upstream fetch, one string splice). The speed levers are cache-hit ratio, ETag revalidation, and prefetch — not the execution language. Do not justify a Wasm build on latency grounds.
+| Case                                                              | Origin responses |                    Enhancely requests |
+| ----------------------------------------------------------------- | ---------------: | ------------------------------------: |
+| Cache hit                                                         |                0 |                                     0 |
+| Injectable HTML, fresh JSON-LD                                    |                1 |                                     0 |
+| Injectable HTML, stale/missing JSON-LD                            |                1 |                             at most 1 |
+| Reproducible redirect/error/non-HTML, no head, or safe local veto |                1 |                                     0 |
+| Hard handback, first classification                               |                2 | 0 or at most 1 before a quota verdict |
+| Hard handback while memoized                                      |                1 |                                     0 |
+
+The companion contributes no network requests in every case.
+
+## 6. Cache and concurrency decisions
+
+The JSON-LD cache is separate from the page/CDN cache. Its default freshness is
+5 minutes. Stale positives remain available for ETag revalidation and
+stale-on-error behavior. The default in-process cache is bounded to 5,000
+entries and a conservative 16 MiB retained-string estimate.
+
+Concurrent cold/stale lookups for the same normalized URL, cache object, lookup
+mode, and execution environment are single-flighted. GET and
+register-or-revalidate remain distinct lookup modes. Local writes are serialized
+so newer successful positive results cannot be overwritten by older transient
+or negative results. A distributed backend must supply its own CAS semantics;
+Workers KV is eventually consistent.
+
+Workers KV and Cloudflare's memory fallback are scoped by Enhancely base/API-key
+identity. Persisted keys contain only a non-secret SHA-256 scope, never the API
+key itself.
+
+Retry clocks are intentionally separate:
+
+- normal API failure: 10 seconds URL-local;
+- shared circuit: only `429`, at most 60 seconds;
+- register `429`/`403`: URL-local hint up to 24 hours;
+- Lambda origin failure circuits: 10 seconds;
+- hard-handback memo: 30 minutes by default;
+- missing Lambda config/SSM: 30 seconds.
+
+The companion may shorten only a proven existing cache lifetime. With no
+explicit safe lifetime and `assertedDefaultTtlSeconds = 0`, it changes nothing.
+Credentialed, `private`, `no-store`, ambiguous, and unapproved `Set-Cookie`
+responses are never rewritten.
+
+## 7. Platform artifacts
+
+| Target             | Artifact / deployment                                                                                 |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| Cloudflare Workers | Bundled Worker; secret key plus optional Workers KV.                                                  |
+| CloudFront         | Lambda@Edge origin-request injector + origin-response companion in `us-east-1`, on the same behavior. |
+| Node sidecar       | Reverse proxy process/container using the shared core.                                                |
+
+The Terraform module is the preferred CloudFront installation. It emits one
+pairing-safe association map and enforces the 10-second Lambda timeout budget.
+Manual consumers must deploy both versioned functions and verify release
+checksums.
+
+## 8. Security invariants
+
+- The API key never reaches the browser, response, or normal logs.
+- The cache key and Enhancely wire URL are byte-identical.
+- Queries and fragments never leave the connector toward Enhancely.
+- Only exact `200 text/html` is injectable.
+- JSON-LD remains verbatim script-safe data.
+- Generated Lambda responses enforce the 32 KiB header and 1 MiB combined
+  response limits and drop validators/digests describing the uninjected body.
+- `X-Enhancely-Injected` is a never-touch-injected-content invariant.
+- Any uncertainty produces under-injection, never a broken page or a wrong
+  cached record.
+
+## 9. Future option: Proxy-Wasm
+
+A Rust-to-Wasm build could cover Envoy-family platforms. It is a portability
+option only, not a performance argument and not a replacement for the shared
+core. It does not cover Lambda@Edge.

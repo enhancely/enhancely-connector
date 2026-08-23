@@ -4,7 +4,6 @@ import {
   DEFAULT_MAX_JSONLD_BYTES,
   defineConfig,
   fetchJsonLd,
-  registerJsonLd,
   registerOrRevalidate,
 } from '../src/index.js';
 import type { Fetcher } from '../src/index.js';
@@ -116,25 +115,19 @@ describe('fetchJsonLd — request shape', () => {
       status: 'error',
       reason: 'invalid-page-url',
     });
-    await expect(registerJsonLd(config, pageUrl)).resolves.toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('strips query PII from both registration client bodies', async () => {
-    const fetchImpl = vi
-      .fn<Fetcher>()
-      .mockResolvedValueOnce(new Response(null, { status: 201 }))
-      .mockResolvedValueOnce(new Response(null, { status: 201 }));
+  it('strips query PII from the registration client body', async () => {
+    const fetchImpl = vi.fn<Fetcher>().mockResolvedValueOnce(new Response(null, { status: 201 }));
     const config = defineConfig({ apiKey: 'sk-test-key', fetchImpl });
     const raw = 'http://example.com/pricing/?token=secret#fragment';
 
     await registerOrRevalidate(config, raw);
-    await registerJsonLd(config, raw);
 
-    for (const [, init] of fetchImpl.mock.calls) {
-      expect(JSON.parse(String(init.body))).toEqual({ url: 'https://example.com/pricing' });
-      expect(String(init.body)).not.toContain('secret');
-    }
+    const { init } = lastRequest(fetchImpl);
+    expect(JSON.parse(String(init.body))).toEqual({ url: 'https://example.com/pricing' });
+    expect(String(init.body)).not.toContain('secret');
   });
 
   it('sends Authorization: Bearer <apiKey>', async () => {
@@ -389,22 +382,5 @@ describe('fetchJsonLd — response handling', () => {
       reason: 'http-500',
     });
     expect(cancel).toHaveBeenCalledWith('http-500');
-  });
-});
-
-describe('registerJsonLd — response body cleanup', () => {
-  it('cancels the unused response body for both accepted and rejected registrations', async () => {
-    const accepted = streamingResponse([new Uint8Array([1])], { status: 201 });
-    const rejected = streamingResponse([new Uint8Array([2])], { status: 500 });
-    const fetchImpl = vi
-      .fn<Fetcher>()
-      .mockResolvedValueOnce(accepted.response)
-      .mockResolvedValueOnce(rejected.response);
-    const config = defineConfig({ apiKey: 'sk-test-key', fetchImpl });
-
-    expect(await registerJsonLd(config, PAGE_URL)).toBe(true);
-    expect(await registerJsonLd(config, PAGE_URL)).toBe(false);
-    expect(accepted.cancel).toHaveBeenCalledWith('body-unused');
-    expect(rejected.cancel).toHaveBeenCalledWith('http-500');
   });
 });

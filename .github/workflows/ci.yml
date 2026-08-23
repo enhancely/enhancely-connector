@@ -31,9 +31,9 @@ jobs:
 
       - name: Verify Terraform module bundles are current
         run: |
-          diff -q packages/adapter-lambda-edge/dist/index.js infra/modules/lambda-edge-injector/dist/index.js
           diff -q packages/adapter-lambda-edge/dist/origin-request.js infra/modules/lambda-edge-injector/dist/origin-request.js
           diff -q packages/adapter-lambda-edge/dist/companion.js infra/modules/lambda-edge-injector/dist/companion.js
+          pnpm verify:lambda-bundles
 
       - name: Typecheck
         run: pnpm -r typecheck

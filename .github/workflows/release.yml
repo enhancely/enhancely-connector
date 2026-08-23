@@ -1,7 +1,7 @@
 name: release
 
 # Cut a versioned release from a tag: build, test, package the Lambda@Edge
-# bundle and attach it (plus checksums) as release assets. Integrators vendor
+# bundles and attach them (plus checksums) as release assets. Integrators vendor
 # the artifact by version + SHA256 — see README "Consuming releases".
 on:
   push:
@@ -40,6 +40,7 @@ jobs:
           pnpm -r test
           pnpm lint
           pnpm format:check
+          pnpm verify:lambda-bundles
 
       - name: Terraform module gate
         working-directory: infra/modules/lambda-edge-injector
@@ -53,12 +54,7 @@ jobs:
         run: |
           pnpm --filter @enhancely/adapter-lambda-edge package
           mkdir -p release-assets
-          # index.js: the self-contained bundle integrators vendor directly.
-          cp packages/adapter-lambda-edge/dist/index.js release-assets/lambda-edge-index.js
-          # lambda.zip without any connector-config.json (config is deploy-specific).
-          cd packages/adapter-lambda-edge/dist && rm -f release.zip && zip -q -X release.zip index.js && cd -
-          cp packages/adapter-lambda-edge/dist/release.zip release-assets/lambda-edge-bundle.zip
-          # origin-request entrypoint (recommended trigger). Shipped as
+          # Origin-request injector. Shipped as
           # index.js inside its zip so the Lambda handler stays index.handler.
           cp packages/adapter-lambda-edge/dist/origin-request.js \
              release-assets/lambda-edge-origin-request-index.js
@@ -84,10 +80,9 @@ jobs:
 
       - name: Verify Terraform module bundles are in sync
         run: |
-          if ! diff -q packages/adapter-lambda-edge/dist/index.js infra/modules/lambda-edge-injector/dist/index.js \
-            || ! diff -q packages/adapter-lambda-edge/dist/origin-request.js infra/modules/lambda-edge-injector/dist/origin-request.js \
+          if ! diff -q packages/adapter-lambda-edge/dist/origin-request.js infra/modules/lambda-edge-injector/dist/origin-request.js \
             || ! diff -q packages/adapter-lambda-edge/dist/companion.js infra/modules/lambda-edge-injector/dist/companion.js; then
-            echo "::error::A Terraform module bundle is stale — run 'pnpm sync:module' and commit all three module entrypoints before tagging."
+            echo "::error::A Terraform module bundle is stale — run 'pnpm sync:module' and commit both module entrypoints before tagging."
             exit 1
           fi
 
@@ -97,8 +92,7 @@ jobs:
           sha256sum lambda-edge-origin-request-index.js \
                     lambda-edge-origin-request-bundle.zip \
                     lambda-edge-companion-index.js \
-                    lambda-edge-companion-bundle.zip \
-                    lambda-edge-index.js lambda-edge-bundle.zip > SHA256SUMS
+                    lambda-edge-companion-bundle.zip > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
@@ -112,6 +106,4 @@ jobs:
             release-assets/lambda-edge-origin-request-bundle.zip \
             release-assets/lambda-edge-companion-index.js \
             release-assets/lambda-edge-companion-bundle.zip \
-            release-assets/lambda-edge-index.js \
-            release-assets/lambda-edge-bundle.zip \
             release-assets/SHA256SUMS

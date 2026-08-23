@@ -1,13 +1,5 @@
-/**
- * Typed CloudFront origin-response event fixtures for the adapter tests.
- */
-import type {
-  CloudFrontHeaders,
-  CloudFrontResponseEvent,
-  CloudFrontResponseResult,
-  Context,
-} from 'aws-lambda';
-import { handler } from '../src/index.js';
+/** Typed CloudFront origin-response fixtures for the cache-cap companion tests. */
+import type { CloudFrontHeaders, CloudFrontResponseEvent } from 'aws-lambda';
 
 /** Build CloudFront's header map (lowercase keys, array-of-values shape). */
 export function cfHeaders(headers: Record<string, string | string[]>): CloudFrontHeaders {
@@ -100,10 +92,4 @@ export function makeEvent(options: EventOptions = {}): CloudFrontResponseEvent {
       },
     ],
   };
-}
-
-/** Invoke the handler the way Lambda does (context/callback are unused). */
-export async function invoke(event: CloudFrontResponseEvent): Promise<CloudFrontResponseResult> {
-  const result = await handler(event, {} as Context, () => undefined);
-  return result as CloudFrontResponseResult;
 }

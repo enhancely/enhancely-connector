@@ -27,49 +27,29 @@ mock_provider "aws" {
   }
 }
 
-run "default_origin_request_pair" {
+run "origin_request_pair" {
   command = plan
-
-  assert {
-    condition     = output.deployment_mode == "origin-request"
-    error_message = "origin-request must remain the default deployment mode."
-  }
-
-  assert {
-    condition     = length(aws_lambda_function.companion) == 1
-    error_message = "Default mode must create exactly one companion."
-  }
 
   assert {
     condition = (
       aws_lambda_function.injector.handler == "index.handler" &&
-      aws_lambda_function.companion[0].handler == "companion.handler" &&
+      aws_lambda_function.companion.handler == "companion.handler" &&
       aws_lambda_function.injector.filename == data.archive_file.origin_request_pair.output_path &&
-      aws_lambda_function.companion[0].filename == data.archive_file.origin_request_pair.output_path &&
+      aws_lambda_function.companion.filename == data.archive_file.origin_request_pair.output_path &&
       strcontains(data.archive_file.origin_request_pair.output_path, "123456789012")
     )
-    error_message = "The default pair must use one shared, account-scoped artifact."
+    error_message = "The pair must use the correct handlers in one shared, account-scoped artifact."
   }
 
   assert {
     condition = (
       length(output.lambda_function_associations) == 2 &&
-      contains(keys(output.lambda_function_associations), "origin-request") &&
-      contains(keys(output.lambda_function_associations), "origin-response") &&
+      output.lambda_function_associations["origin-request"].lambda_arn == aws_lambda_function.injector.qualified_arn &&
+      output.lambda_function_associations["origin-response"].lambda_arn == aws_lambda_function.companion.qualified_arn &&
       !output.lambda_function_associations["origin-request"].include_body &&
       !output.lambda_function_associations["origin-response"].include_body
     )
-    error_message = "Default association output must pair origin-request with its origin-response companion."
-  }
-
-  assert {
-    condition = (
-      output.qualified_arn == null &&
-      output.origin_response_qualified_arn == null &&
-      output.origin_request_qualified_arn != null &&
-      output.companion_qualified_arn != null
-    )
-    error_message = "Legacy origin-response outputs must stay null in default mode."
+    error_message = "The association output must pair the origin-request injector with its origin-response companion."
   }
 
   assert {
@@ -81,8 +61,8 @@ run "default_origin_request_pair" {
       jsondecode(one([
         for source in data.archive_file.origin_request_pair.source :
         source.content if source.filename == "connector-config.json"
-      ])).originTimeoutMs == 2000
-      && jsondecode(one([
+      ])).originTimeoutMs == 2000 &&
+      jsondecode(one([
         for source in data.archive_file.origin_request_pair.source :
         source.content if source.filename == "connector-config.json"
       ])).includeHosts == []
@@ -91,7 +71,7 @@ run "default_origin_request_pair" {
   }
 }
 
-run "include_hosts_baked_into_default_pair" {
+run "include_hosts_baked_into_pair" {
   command = plan
 
   variables {
@@ -104,96 +84,7 @@ run "include_hosts_baked_into_default_pair" {
       for source in data.archive_file.origin_request_pair.source :
       source.content if source.filename == "connector-config.json"
     ])).includeHosts == ["www.example.com", "shop.example.com"]
-    error_message = "The default pair must receive the exact include_hosts policy in its shared artifact."
-  }
-}
-
-run "standalone_origin_response_compatibility" {
-  command = plan
-
-  variables {
-    deployment_mode = "origin-response"
-  }
-
-  assert {
-    condition     = length(aws_lambda_function.companion) == 0
-    error_message = "Compatibility mode must not create a companion."
-  }
-
-  assert {
-    condition = (
-      aws_lambda_function.injector.handler == "index.handler" &&
-      aws_lambda_function.injector.filename == data.archive_file.origin_response.output_path
-    )
-    error_message = "Compatibility mode must deploy the standalone origin-response artifact."
-  }
-
-  assert {
-    condition = (
-      length(output.lambda_function_associations) == 1 &&
-      contains(keys(output.lambda_function_associations), "origin-response") &&
-      !contains(keys(output.lambda_function_associations), "origin-request")
-    )
-    error_message = "Compatibility association output must contain only origin-response."
-  }
-
-  assert {
-    condition = (
-      output.qualified_arn != null &&
-      output.qualified_arn == output.origin_response_qualified_arn &&
-      output.origin_request_qualified_arn == null &&
-      output.companion_qualified_arn == null
-    )
-    error_message = "qualified_arn must retain its legacy origin-response meaning."
-  }
-
-  assert {
-    condition = (
-      jsondecode(one([
-        for source in data.archive_file.origin_response.source :
-        source.content if source.filename == "connector-config.json"
-      ])).timeoutMs == 2000 &&
-      jsondecode(one([
-        for source in data.archive_file.origin_response.source :
-        source.content if source.filename == "connector-config.json"
-      ])).originTimeoutMs == 2000
-    )
-    error_message = "Compatibility mode must retain its historical 2000 ms Enhancely timeout when timeout_ms is omitted."
-  }
-}
-
-run "standalone_origin_response_explicit_timeout_override" {
-  command = plan
-
-  variables {
-    deployment_mode = "origin-response"
-    timeout_ms      = 800
-  }
-
-  assert {
-    condition = jsondecode(one([
-      for source in data.archive_file.origin_response.source :
-      source.content if source.filename == "connector-config.json"
-    ])).timeoutMs == 800
-    error_message = "An explicit timeout_ms must override the compatibility mode's historical default."
-  }
-}
-
-run "include_hosts_baked_into_standalone_compatibility" {
-  command = plan
-
-  variables {
-    deployment_mode            = "origin-response"
-    include_hosts              = ["www.example.com"]
-    host_in_cache_key_asserted = true
-  }
-
-  assert {
-    condition = jsondecode(one([
-      for source in data.archive_file.origin_response.source :
-      source.content if source.filename == "connector-config.json"
-    ])).includeHosts == ["www.example.com"]
-    error_message = "Standalone origin-response must receive the same include_hosts policy."
+    error_message = "The pair must receive the exact include_hosts policy in its shared artifact."
   }
 }
 
@@ -252,18 +143,6 @@ run "reject_include_hosts_without_cache_key_assertion" {
   ]
 }
 
-run "reject_unknown_deployment_mode" {
-  command = plan
-
-  variables {
-    deployment_mode = "both-injectors"
-  }
-
-  expect_failures = [
-    var.deployment_mode,
-  ]
-}
-
 run "reject_name_that_cannot_fit_companion_suffix" {
   command = plan
 
@@ -272,22 +151,8 @@ run "reject_name_that_cannot_fit_companion_suffix" {
   }
 
   expect_failures = [
-    aws_lambda_function.companion,
+    var.name,
   ]
-}
-
-run "allow_long_legacy_name_in_compatibility_mode" {
-  command = plan
-
-  variables {
-    deployment_mode = "origin-response"
-    name            = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  }
-
-  assert {
-    condition     = aws_lambda_function.injector.function_name == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    error_message = "Compatibility mode must retain legacy names up to 59 characters."
-  }
 }
 
 run "allow_timeout_budget_boundary" {
@@ -301,7 +166,7 @@ run "allow_timeout_budget_boundary" {
   assert {
     condition = (
       aws_lambda_function.injector.timeout == 10 &&
-      aws_lambda_function.companion[0].timeout == 10 &&
+      aws_lambda_function.companion.timeout == 10 &&
       jsondecode(one([
         for source in data.archive_file.origin_request_pair.source :
         source.content if source.filename == "connector-config.json"

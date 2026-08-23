@@ -14,7 +14,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "sync:module": "pnpm -r build && pnpm --filter @enhancely/adapter-lambda-edge package && cp packages/adapter-lambda-edge/dist/index.js infra/modules/lambda-edge-injector/dist/index.js && cp packages/adapter-lambda-edge/dist/origin-request.js infra/modules/lambda-edge-injector/dist/origin-request.js && cp packages/adapter-lambda-edge/dist/companion.js infra/modules/lambda-edge-injector/dist/companion.js",
+    "sync:module": "pnpm --filter @enhancely/adapter-lambda-edge package && cp packages/adapter-lambda-edge/dist/origin-request.js infra/modules/lambda-edge-injector/dist/origin-request.js && cp packages/adapter-lambda-edge/dist/companion.js infra/modules/lambda-edge-injector/dist/companion.js && pnpm verify:lambda-bundles",
+    "verify:lambda-bundles": "node scripts/assert-lambda-bundle-exports.mjs",
     "asset-paths": "node scripts/asset-paths.mjs",
     "conformance": "node scripts/edge-conformance.mjs"
   },

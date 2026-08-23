@@ -54,13 +54,13 @@ record; ordinary trailing slashes and query strings remain supported.
 
 ## Packages
 
-| Package                                                           | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/injector-core` (`@enhancely/injector-core`)             | **Implemented + tested.** Shared core: strict URL boundary, single-flight cache + ETag revalidation, API-key-wide rate-limit circuit, structural HTML preflight, API client, injection, and fail-open orchestration.                                                                                                                                                                                                                                                                                     |
-| `packages/adapter-cloudflare` (`@enhancely/adapter-cloudflare`)   | **Reference adapter.** Cloudflare Worker wrapping the core.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `packages/adapter-lambda-edge` (`@enhancely/adapter-lambda-edge`) | **Implemented + tested.** CloudFront Lambda@Edge, three entrypoints sharing one core. **`origin-request` (recommended)** fetches the origin once, proves exact-200 injectable HTML before Enhancely, and generates the response; safe vetoes are reproduced from that same fetch. The paired **companion** is cache-cap-only: it never calls Enhancely, injects, or fetches the origin. `origin-response` (standalone compatibility mode) retains the double-fetch pattern. Key via baked config or SSM. |
-| `packages/adapter-sidecar` (`@enhancely/adapter-sidecar`)         | **Functional skeleton.** Node HTTP reverse proxy for nginx/apache setups.                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `packages/adapter-sidecar-go`                                     | **Reserved.** Planned Go single-binary distribution of the sidecar.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Package                                                           | Status                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/injector-core` (`@enhancely/injector-core`)             | **Implemented + tested.** Shared core: strict URL boundary, single-flight cache + ETag revalidation, API-key-wide rate-limit circuit, structural HTML preflight, API client, injection, and fail-open orchestration.                                                                                                                                                                                          |
+| `packages/adapter-cloudflare` (`@enhancely/adapter-cloudflare`)   | **Reference adapter.** Cloudflare Worker wrapping the core.                                                                                                                                                                                                                                                                                                                                                   |
+| `packages/adapter-lambda-edge` (`@enhancely/adapter-lambda-edge`) | **Implemented + tested.** CloudFront Lambda@Edge with one supported pairing: the `origin-request` injector fetches the origin once, proves exact-200 injectable HTML before Enhancely, and generates the response; safe vetoes are reproduced from that same fetch. The `origin-response` companion is cache-cap-only: it never calls Enhancely, injects, or fetches the origin. Key via baked config or SSM. |
+| `packages/adapter-sidecar` (`@enhancely/adapter-sidecar`)         | **Functional skeleton.** Node HTTP reverse proxy for nginx/apache setups.                                                                                                                                                                                                                                                                                                                                     |
+| `packages/adapter-sidecar-go`                                     | **Reserved.** Planned Go single-binary distribution of the sidecar.                                                                                                                                                                                                                                                                                                                                           |
 
 All adapters are thin wrappers — connector logic lives exclusively in `injector-core`.
 
@@ -92,29 +92,32 @@ The API key is a secret — it must never be exposed client-side or committed. `
 
 ## Configuration
 
-| Setting                     | Default                    | Notes                                                                                                                                                                                                                                                          |
-| --------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ENHANCELY_API_KEY`         | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.                                                                                                                                                                                             |
-| `ENHANCELY_BASE`            | `https://app.enhancely.ai` | The [official Enhancely API endpoint definitions](https://docs.enhancely.ai/) list `https://app.enhancely.ai/api/v1/jsonld`; override only for an explicitly selected environment.                                                                             |
-| `timeoutMs`                 | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call. In the Lambda module, omitted `timeout_ms` means 800 ms for the default pair and the historical 2000 ms for standalone origin-response; its effective sum with `originTimeoutMs` must be ≤ 6000 ms. |
-| `originTimeoutMs`           | `2000`                     | Lambda@Edge-only origin fetch/re-fetch timeout. Together with `timeoutMs`, limited to 6000 ms by the Terraform module.                                                                                                                                         |
-| `ssmTimeoutMs`              | `2000`                     | Lambda@Edge-only SSM config timeout. The module's API + origin + SSM budget is at most 8000 ms under Lambda's fixed 10-second limit, leaving at least 2000 ms for fail-open settlement.                                                                        |
-| `cacheTtlMs`                | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry.                                                                                                                                                                                        |
-| `maxJsonLdBytes`            | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                                                                                                                                                                                                        |
-| `autoRegister`              | `false`                    | `false`: one conditional GET without registration. `true`: exactly one register-or-revalidate POST for lookup or registration. Only the explicit low-level compatibility API can still use GET→404→POST.                                                       |
-| `excludePaths`              | `[]`                       | Lambda@Edge-only path exclusions, checked before config/API work.                                                                                                                                                                                              |
-| `includeHosts`              | `[]`                       | Lambda@Edge-only exact public-host selector (TF: `include_hosts`). A non-matching host skips SSM, connector-origin fetch, Enhancely, registration, and companion cache rewriting. Empty keeps the historical all-host behavior.                                |
-| `assertedDefaultTtlSeconds` | `0` (off)                  | Asserted minimum DefaultTTL for bounded retry caching. Applied by origin-request-generated misses, standalone origin-response, and the companion's safe handback cap.                                                                                          |
-| `nonPageMemoTtlMs`          | `1800000` (30 min)         | origin-request only: how long a hard-veto verdict is remembered, so repeats skip its classification fetch.                                                                                                                                                     |
-| `capSetCookieResponses`     | `false`                    | Lambda pair-wide and standalone origin-response: extend the retry cap to `Set-Cookie` responses (credential-less requests only). Never enable on origins minting session cookies for anonymous requests.                                                       |
+| Setting                     | Default                    | Notes                                                                                                                                                                                                      |
+| --------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENHANCELY_API_KEY`         | — (required)               | `sk-…` or `sk-org-…`. Server-side only, never reaches the browser.                                                                                                                                         |
+| `ENHANCELY_BASE`            | `https://app.enhancely.ai` | The [official Enhancely API endpoint definitions](https://docs.enhancely.ai/) list `https://app.enhancely.ai/api/v1/jsonld`; override only for an explicitly selected environment.                         |
+| `timeoutMs`                 | `800`                      | `AbortSignal.timeout` applied to every Enhancely API call. Its effective sum with `originTimeoutMs` must be ≤ 6000 ms in the Lambda module.                                                                |
+| `originTimeoutMs`           | `2000`                     | Lambda@Edge-only direct origin-fetch timeout. Together with `timeoutMs`, limited to 6000 ms by the Terraform module.                                                                                       |
+| `ssmTimeoutMs`              | `2000`                     | Lambda@Edge-only SSM config timeout. The module's API + origin + SSM budget is at most 8000 ms under Lambda's fixed 10-second limit, leaving at least 2000 ms for fail-open settlement.                    |
+| `cacheTtlMs`                | `300000` (5 min)           | Connector-side cache TTL; configurable. ETag revalidation after expiry.                                                                                                                                    |
+| `maxJsonLdBytes`            | `262144` (256 KiB)         | Streamed response limit; may be lowered but not raised.                                                                                                                                                    |
+| `autoRegister`              | `false`                    | `false`: one read-only conditional GET. `true`: exactly one direct register-or-revalidate POST for lookup or registration. There is no GET→404→POST fallback.                                              |
+| `excludePaths`              | `[]`                       | Lambda@Edge-only path exclusions, checked before config/API work.                                                                                                                                          |
+| `includeHosts`              | `[]`                       | Lambda@Edge-only exact public-host selector (TF: `include_hosts`). A non-matching host skips SSM, connector-origin fetch, Enhancely, registration, and companion cache rewriting. Empty enables all hosts. |
+| `assertedDefaultTtlSeconds` | `0` (off)                  | Asserted minimum DefaultTTL for bounded retry caching. Applied by origin-request-generated misses and the companion's safe handback cap.                                                                   |
+| `nonPageMemoTtlMs`          | `1800000` (30 min)         | origin-request only: how long a hard-veto verdict is remembered, so repeats skip its classification fetch.                                                                                                 |
+| `capSetCookieResponses`     | `false`                    | Lambda pair-wide: extend the retry cap to `Set-Cookie` responses (credential-less requests only). Never enable on origins minting session cookies for anonymous requests.                                  |
+
+The companion checks credential, per-request-cache, Set-Cookie-policy,
+cache-field, and available-lifetime vetoes before resolving config. A response
+that cannot be capped therefore performs no SSM request.
 
 Lambda@Edge path exclusions use CloudFront-style `*`/`?` patterns. Before
 matching, the raw path is canonicalized once: RFC 3986 unreserved escapes are
 decoded, literal backslashes become `/`, and duplicate slashes/dot-segments
 collapse. Reserved, non-ASCII, malformed, and double-encoded octets stay
 literal, so configure patterns in canonical literal form. A response carrying
-`X-Robots-Tag: noindex` or `none` is never injected; the same veto is applied
-to the identity re-fetch that supplies the replacement body.
+`X-Robots-Tag: noindex` or `none` is never injected.
 
 `includeHosts` accepts exact hostnames only: no wildcard, scheme, path,
 credentials, or port. Matching is case-insensitive after IDNA/Punycode
@@ -150,7 +153,7 @@ module "enhancely_injector" {
 }
 ```
 
-The default creates the recommended pair: an `origin-request` injector and its
+The module creates the only supported pair: an `origin-request` injector and its
 non-injecting `origin-response` companion. Attach both to the same cache
 behavior through the pairing-safe output:
 
@@ -159,13 +162,9 @@ behavior through the pairing-safe output:
 lambda_function_association = module.enhancely_injector.lambda_function_associations
 ```
 
-Existing users of the legacy `qualified_arn` output should add
-`deployment_mode = "origin-response"` in the same configuration change as the
-module-ref upgrade. That output keeps its original origin-response-only meaning
-and is deliberately `null` in the new default mode, so an old association
-cannot silently receive the wrong handler.
-See the [module README](infra/modules/lambda-edge-injector/README.md) for plain
-Terraform wiring, migration steps, and architecture trade-offs.
+Version 0.10.0 deliberately removes the unused standalone origin-response
+injector. See the [module README](infra/modules/lambda-edge-injector/README.md)
+for plain Terraform wiring and the complete pairing contract.
 
 Upgrades are a `?ref=` bump. Environments without egress to GitHub can fall
 back to vendoring the release assets below.
@@ -176,18 +175,16 @@ Every tag `vX.Y.Z` publishes a [GitHub Release](https://github.com/enhancely/enh
 
 | Asset                                   | Purpose                                                                                                                                                                                                                         |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lambda-edge-origin-request-index.js`   | **Recommended.** Self-contained Lambda@Edge bundle for the `origin-request` trigger (CommonJS, Node 22). One origin hit per injected cache miss, and it also injects pages that set cookies.                                    |
+| `lambda-edge-origin-request-index.js`   | Self-contained Lambda@Edge injector for the `origin-request` trigger (CommonJS, Node 22). One origin hit per injected cache miss, and it also injects pages that set cookies.                                                   |
 | `lambda-edge-origin-request-bundle.zip` | The same bundle pre-zipped, as `index.js` (no config inside).                                                                                                                                                                   |
 | `lambda-edge-companion-index.js`        | Cache-cap-only companion for the `origin-request` trigger: associate on **origin-response of the SAME behavior**. It safely bounds eligible handback cache lifetimes and never calls Enhancely, injects, or fetches the origin. |
 | `lambda-edge-companion-bundle.zip`      | The same companion bundle pre-zipped, as `index.js` (no config inside).                                                                                                                                                         |
-| `lambda-edge-index.js`                  | Bundle for the `origin-response` trigger (origin re-fetch pattern). Two origin hits per injected cache miss; skips pages that set cookies.                                                                                      |
-| `lambda-edge-bundle.zip`                | The same bundle pre-zipped (no config inside).                                                                                                                                                                                  |
 | `SHA256SUMS`                            | Checksums for all assets — verify after download.                                                                                                                                                                               |
 
 Every bundle exposes `index.handler`; the CloudFront `EventType` (and the zip you
 deploy) is what selects the trigger. See
-[`packages/adapter-lambda-edge/README.md`](packages/adapter-lambda-edge/README.md#which-trigger)
-for the trade-off.
+[`packages/adapter-lambda-edge/README.md`](packages/adapter-lambda-edge/README.md#runtime-architecture)
+for the deployment contract.
 
 Recommended manual vendoring flow when the reusable module cannot be consumed
 directly:
