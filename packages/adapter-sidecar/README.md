@@ -69,9 +69,9 @@ docker run --rm -p 8080:8080 \
   identity request), `no-transform`, valid non-`inline` disposition/noindex
   responses, oversized
   bodies, any Enhancely API failure/timeout (fail-open), and everything when
-  `ENHANCELY_API_KEY` is missing. An unsafe or normalization-unstable page URL
-  (notably multiple literal trailing slashes) also skips cache/API work so the
-  cache key can never refer to a different upstream record URL.
+  `ENHANCELY_API_KEY` is missing. An unsafe (relative, non-HTTP(S),
+  credential-bearing) or normalization-unstable page URL also skips cache/API
+  work so the cache key can never refer to a different upstream record URL.
 
 ## Fronting proxy examples
 

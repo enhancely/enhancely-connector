@@ -134,7 +134,6 @@ describe('getJsonLdSnippet', () => {
     ['malformed', 'not a url?token=malformed-secret'],
     ['non-http', 'mailto:person@example.com?token=mail-secret'],
     ['credentials', 'https://person:password@example.com/pricing?token=query-secret'],
-    ['non-fixed normalization', 'https://example.com/pricing//?token=query-secret'],
   ])('rejects a %s page URL locally without cache or network I/O', async (_label, rawUrl) => {
     const cache = {
       get: vi.fn(() => Promise.reject(new Error('must not read cache'))),
@@ -148,25 +147,53 @@ describe('getJsonLdSnippet', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['conditional GET', getJsonLdLookup],
-    ['register-or-revalidate', getJsonLdRegisterLookup],
-  ])('rejects an unstable URL before cache access in %s mode', async (_label, lookup) => {
-    const cache = {
-      get: vi.fn(() => Promise.reject(new Error('must not read cache'))),
-      set: vi.fn(() => Promise.reject(new Error('must not write cache'))),
-    };
-    const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('must not fetch')));
-    const result = await lookup(
-      'https://example.com/pricing//?token=secret',
-      cache,
-      makeConfig(fetchImpl)
-    );
+  it('lookup and register address a doubled-slash URL with byte-identical canonical URLs', async () => {
+    // enhancely #279: the GET path segment and the POST body must carry the
+    // exact same string, or the two calls address different records.
+    const raw = 'https://example.com//pricing//?token=secret#frag';
+    const canonical = 'https://example.com/pricing';
 
-    expect(result).toEqual({ snippet: null, revalidateInMs: null });
-    expect(cache.get).not.toHaveBeenCalled();
-    expect(cache.set).not.toHaveBeenCalled();
-    expect(fetchImpl).not.toHaveBeenCalled();
+    const seen: string[] = [];
+    const fetchImpl = vi.fn<Fetcher>((url, init) => {
+      const target = String(url);
+      if (init?.method === 'POST') {
+        seen.push((JSON.parse(String(init.body)) as { url: string }).url);
+      } else {
+        seen.push(decodeURIComponent(target.slice(target.lastIndexOf('/') + 1)));
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    });
+
+    await getJsonLdLookup(raw, new MemoryCache(), makeConfig(fetchImpl));
+    await getJsonLdRegisterLookup(raw, new MemoryCache(), makeConfig(fetchImpl));
+
+    expect(seen).toEqual([canonical, canonical]);
+    // No token, no fragment, no doubled slash ever reaches the network.
+    for (const sent of seen) {
+      expect(sent).not.toContain('token');
+      expect(sent).not.toContain('#');
+      expect(sent.slice('https://'.length)).not.toContain('//');
+    }
+  });
+
+  it('a doubled-slash URL and its canonical form share ONE cache entry', async () => {
+    const cache = new MemoryCache();
+    const fetchImpl = vi.fn<Fetcher>(() =>
+      Promise.resolve(
+        new Response(RAW_JSONLD, {
+          status: 200,
+          headers: { etag: '"v1"', 'content-type': 'application/ld+json' },
+        })
+      )
+    );
+    const config = makeConfig(fetchImpl);
+
+    expect(await getJsonLdSnippet('https://example.com//pricing', cache, config)).toBe(SNIPPET);
+    expect(await getJsonLdSnippet('https://example.com/pricing', cache, config)).toBe(SNIPPET);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(await cache.get('https://example.com/pricing')).toMatchObject({
+      jsonldRaw: RAW_JSONLD,
+    });
   });
 
   it('auto-registration uses ONE POST with the QUERY-STRIPPED URL', async () => {

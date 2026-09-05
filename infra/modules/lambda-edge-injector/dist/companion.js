@@ -74,6 +74,9 @@ function defineConfig(input) {
 // ../injector-core/dist/cache.js
 var DEFAULT_MEMORY_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
+// ../injector-core/dist/client.js
+var MAX_PROBLEM_JSON_BYTES = 8 * 1024;
+
 // ../injector-core/dist/header-value.js
 function splitHttpQuotedValue(value, delimiter) {
   const parts = [];

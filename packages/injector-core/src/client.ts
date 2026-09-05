@@ -21,6 +21,36 @@ function declaredContentLength(response: Response): number | null {
   return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
 }
 
+/** Largest Problem-JSON body we will read to recover a `detail` string. */
+const MAX_PROBLEM_JSON_BYTES = 8 * 1024;
+
+/**
+ * Best-effort `detail` from an RFC 9457 Problem-JSON error body.
+ *
+ * Diagnostic only, so every failure path returns `undefined` and the caller
+ * proceeds exactly as it would without a body: an oversized or absent
+ * Content-Length, a non-JSON body, a stalled stream (the fetch's own timeout
+ * signal still applies), or a missing/blank `detail`. The body is consumed
+ * either way, so no caller needs to cancel it afterwards.
+ */
+async function readProblemDetail(response: Response): Promise<string | undefined> {
+  const declared = declaredContentLength(response);
+  if (declared !== null && declared > MAX_PROBLEM_JSON_BYTES) {
+    cancelResponseBody(response, 'problem-detail-too-large');
+    return undefined;
+  }
+  try {
+    const text = await response.text();
+    if (text.length > MAX_PROBLEM_JSON_BYTES) return undefined;
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null || !('detail' in parsed)) return undefined;
+    const detail = (parsed as { detail: unknown }).detail;
+    return typeof detail === 'string' && detail.trim() !== '' ? detail : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function errorName(error: unknown, fallback: string): string {
   if (
     typeof error === 'object' &&
@@ -337,8 +367,14 @@ export async function registerOrRevalidate(
     return { status: 'pending', retryAfterSeconds };
   }
   if (response.status === 400) {
-    cancelResponseBody(response, 'rejected');
-    return { status: 'terminal-negative', reason: 'rejected' };
+    // A rejected registration is permanent for this URL (bad hostname,
+    // denylist, a URL the store refuses). It is already cached as a negative
+    // entry for a full TTL, so it is never re-POSTed on the next run; the
+    // Problem-JSON `detail` is recovered only so an adapter can say why.
+    const detail = await readProblemDetail(response);
+    return detail === undefined
+      ? { status: 'terminal-negative', reason: 'rejected' }
+      : { status: 'terminal-negative', reason: 'rejected', detail };
   }
   if (response.status === 429) {
     const retryAfterSeconds = rateLimitBackoffSeconds(response);

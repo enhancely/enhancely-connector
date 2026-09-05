@@ -29,8 +29,8 @@ The origin response is returned **untouched** whenever any of these holds:
 - the body exceeds 2 MiB or its bytes cannot be proven safe to decode/re-emit
   as UTF-8
 - `ENHANCELY_API_KEY` is not configured
-- the page URL is unsafe or not a normalization fixed point (notably two or
-  more literal trailing slashes), so cache key and upstream record cannot be
+- the page URL is unsafe (relative, non-HTTP(S), or credential-bearing) or not
+  a normalization fixed point, so cache key and upstream record cannot be
   proven identical
 - the Enhancely API times out (default 800 ms `AbortSignal.timeout`), errors,
   answers 404 (no record) or 429 (rate limit)

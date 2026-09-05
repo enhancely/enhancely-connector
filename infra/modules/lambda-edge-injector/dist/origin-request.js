@@ -84,6 +84,7 @@ function normalizeParsedUrl(parsed) {
   parsed.protocol = "https:";
   parsed.search = "";
   parsed.hash = "";
+  parsed.pathname = parsed.pathname.replace(/\/{2,}/g, "/");
   const clean = parsed.toString();
   return clean.endsWith("/") ? clean.slice(0, -1) : clean;
 }
@@ -166,6 +167,26 @@ function declaredContentLength(response) {
     return null;
   const length = Number(raw);
   return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
+}
+var MAX_PROBLEM_JSON_BYTES = 8 * 1024;
+async function readProblemDetail(response) {
+  const declared = declaredContentLength(response);
+  if (declared !== null && declared > MAX_PROBLEM_JSON_BYTES) {
+    cancelResponseBody(response, "problem-detail-too-large");
+    return void 0;
+  }
+  try {
+    const text = await response.text();
+    if (text.length > MAX_PROBLEM_JSON_BYTES)
+      return void 0;
+    const parsed = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null || !("detail" in parsed))
+      return void 0;
+    const detail = parsed.detail;
+    return typeof detail === "string" && detail.trim() !== "" ? detail : void 0;
+  } catch {
+    return void 0;
+  }
 }
 function errorName(error, fallback) {
   if (typeof error === "object" && error !== null && "name" in error && typeof error.name === "string" && error.name !== "") {
@@ -370,8 +391,8 @@ async function registerOrRevalidate(config, pageUrl, etag) {
     return { status: "pending", retryAfterSeconds };
   }
   if (response.status === 400) {
-    cancelResponseBody(response, "rejected");
-    return { status: "terminal-negative", reason: "rejected" };
+    const detail = await readProblemDetail(response);
+    return detail === void 0 ? { status: "terminal-negative", reason: "rejected" } : { status: "terminal-negative", reason: "rejected", detail };
   }
   if (response.status === 429) {
     const retryAfterSeconds = rateLimitBackoffSeconds(response);

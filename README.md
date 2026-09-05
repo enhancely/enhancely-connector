@@ -48,9 +48,12 @@ injection on healthy pages while repeated failures still avoid a wasted fetch.
 The query-stripped normalized page URL is both the cache key and the exact URL
 sent to Enhancely. The API boundary accepts only absolute HTTP(S) URLs without
 credentials whose normalized form is stable when normalization runs again.
-Rare URLs ending in multiple literal slashes therefore pass through locally
-without a cache read or Enhancely request instead of risking a mismatched
-record; ordinary trailing slashes and query strings remain supported.
+Normalization forces `https`, drops query and fragment, collapses runs of `/`
+inside the path, and strips one trailing slash — so a CMS-emitted
+`//section/page.html` addresses the same record and the same cache entry as
+`/section/page.html`. A URL whose normalized form would still change on a
+second pass passes through locally without a cache read or Enhancely request
+instead of risking a mismatched record.
 
 ## Packages
 

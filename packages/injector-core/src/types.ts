@@ -103,7 +103,18 @@ export type JsonLdFetchResult =
   | { status: 'not-modified' }
   | { status: 'not-found' }
   | { status: 'pending'; retryAfterSeconds: number | null }
-  | { status: 'terminal-negative'; reason: 'ignored' | 'empty-record' | 'rejected' }
+  | {
+      status: 'terminal-negative';
+      reason: 'ignored' | 'empty-record' | 'rejected';
+      /**
+       * The Problem-JSON `detail` of a rejected registration (HTTP 400), when
+       * the server sent a readable one. Purely diagnostic: core never logs, so
+       * an adapter can surface WHY a URL was refused (bad hostname, denylist,
+       * malformed URL) instead of leaving an operator with a bare `rejected`.
+       * Never injected, never cached, never sent anywhere.
+       */
+      detail?: string;
+    }
   | { status: 'rate-limited'; retryAfterSeconds: number | null }
   | { status: 'registration-limited'; retryAfterSeconds: number }
   | { status: 'error'; reason: string };

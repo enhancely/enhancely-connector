@@ -7,21 +7,29 @@
  * using this function's backwards-compatible raw fallback. It is NOT a hash —
  * the server still hashes authoritatively.
  *
- * The four rules — MUST stay byte-for-byte identical to the server's
+ * The five rules — MUST stay byte-for-byte identical to the server's
  * `normalizeUrl` (amplify/functions/shared/url-hash.ts), in this order:
  *   1. force https:
  *   2. strip query string
  *   3. strip fragment
- *   4. strip a single trailing slash
+ *   4. collapse runs of `/` inside the path to a single `/`
+ *   5. strip a single trailing slash
  *
  * SYNC REQUIREMENT (load-bearing): because the connector now sends this
  * normalized URL rather than the raw one, the server can no longer recover the
  * original — so any divergence between this function and the server's
  * normalizeUrl would become a CORRECTNESS bug (wrong record served), not just a
- * cache miss. Today the two are the exact same code (verified 2026-07-27:
- * identical `new URL()` handling, same trailing-slash strip), so they agree on
- * every input including `new URL()` side effects (host lowercasing, default
- * ports, dot-segment collapse like `/a/../b` → `/b`). Keep them in lockstep.
+ * cache miss. Today the two are the exact same code (re-verified 2026-08-24
+ * when the server added the path-slash collapse: identical `new URL()`
+ * handling, same collapse, same trailing-slash strip), so they agree on every
+ * input including `new URL()` side effects (host lowercasing, default ports,
+ * dot-segment collapse like `/a/../b` → `/b`). Keep them in lockstep.
+ *
+ * Rule 4 exists because CMSes emit hrefs like `//section/page.html`, which
+ * `new URL()` preserves verbatim in the path. The server stores the URL in a
+ * column that rejects `//` inside a path (RFC 1738), so forwarding it produced
+ * a permanently failing registration for such a page. Collapsing here also
+ * makes `//a` and `/a` share one cache entry.
  */
 export function normalizeLite(url: string): string {
   try {
@@ -37,6 +45,10 @@ function normalizeParsedUrl(parsed: URL): string {
   parsed.protocol = 'https:';
   parsed.search = '';
   parsed.hash = '';
+  // Operating on `pathname` cannot reach the `//` after the scheme, and query
+  // and fragment are already gone, so a `//` inside either can never be
+  // rewritten here.
+  parsed.pathname = parsed.pathname.replace(/\/{2,}/g, '/');
   const clean = parsed.toString();
   return clean.endsWith('/') ? clean.slice(0, -1) : clean;
 }
@@ -54,14 +66,15 @@ function normalizeParsedUrl(parsed: URL): string {
  * of a normal browser page URL and may contain secrets, so they fail closed as
  * well.
  *
- * The server and generation pipeline may normalize the received URL again.
- * Because the mirrored legacy rule removes exactly one trailing slash, an
- * input ending in two or more literal slashes is not a normalization fixed
- * point: /page// becomes /page/ locally and then /page upstream. Using the
- * first value as our cache key would associate it with the second value's
- * record. Until normalization is made idempotent across the whole platform,
- * reject those rare unstable inputs before cache or network access. `null`
- * always means "serve without Enhancely".
+ * The server and generation pipeline may normalize the received URL again, so
+ * whatever we send must survive that second pass unchanged. Collapsing path
+ * slashes (rule 4) made the mirrored normalization idempotent — `/page//` now
+ * reaches `/page` in one pass instead of drifting to `/page/` locally and
+ * `/page` upstream — so the fixed-point check below no longer rejects that
+ * shape. It is kept as a standing guard: it is the invariant itself, not the
+ * list of rules that currently satisfy it, and it fails closed if a future
+ * rule change reintroduces drift. `null` always means "serve without
+ * Enhancely".
  */
 export function normalizeForEnhancely(url: string): string | null {
   try {

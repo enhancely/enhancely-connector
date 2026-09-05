@@ -102,7 +102,6 @@ describe('fetchJsonLd — request shape', () => {
     'not a url?token=secret',
     'ftp://example.com/page?token=secret',
     'https://user:password@example.com/page?token=secret',
-    'https://example.com/page//?token=secret',
   ])('rejects unsafe page URL %s without calling fetch', async (pageUrl) => {
     const fetchImpl = vi.fn<Fetcher>(() => Promise.reject(new Error('must not fetch')));
     const config = defineConfig({ apiKey: 'sk-test-key', fetchImpl });
@@ -382,5 +381,64 @@ describe('fetchJsonLd — response handling', () => {
       reason: 'http-500',
     });
     expect(cancel).toHaveBeenCalledWith('http-500');
+  });
+});
+
+describe('registerOrRevalidate — 400 rejected registration (enhancely #279)', () => {
+  const config = () =>
+    defineConfig({
+      apiKey: 'sk-test-key',
+      fetchImpl: vi.fn<Fetcher>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              type: 'about:blank',
+              title: 'Bad Request',
+              detail: 'hostname is not registered for this organisation',
+            }),
+            { status: 400, headers: { 'content-type': 'application/problem+json' } }
+          )
+        )
+      ),
+    });
+
+  it('is terminal-negative and carries the Problem-JSON detail', async () => {
+    await expect(registerOrRevalidate(config(), 'https://example.com/page')).resolves.toEqual({
+      status: 'terminal-negative',
+      reason: 'rejected',
+      detail: 'hostname is not registered for this organisation',
+    });
+  });
+
+  it('stays terminal-negative when the body has no usable detail', async () => {
+    for (const body of ['{}', 'not json at all', '{"detail":""}', '{"detail":123}']) {
+      const cfg = defineConfig({
+        apiKey: 'sk-test-key',
+        fetchImpl: vi.fn<Fetcher>(() => Promise.resolve(new Response(body, { status: 400 }))),
+      });
+      await expect(registerOrRevalidate(cfg, 'https://example.com/page')).resolves.toEqual({
+        status: 'terminal-negative',
+        reason: 'rejected',
+      });
+    }
+  });
+
+  it('refuses to buffer an oversized error body', async () => {
+    const huge = JSON.stringify({ detail: 'x'.repeat(64 * 1024) });
+    const cfg = defineConfig({
+      apiKey: 'sk-test-key',
+      fetchImpl: vi.fn<Fetcher>(() =>
+        Promise.resolve(
+          new Response(huge, {
+            status: 400,
+            headers: { 'content-length': String(huge.length) },
+          })
+        )
+      ),
+    });
+    await expect(registerOrRevalidate(cfg, 'https://example.com/page')).resolves.toEqual({
+      status: 'terminal-negative',
+      reason: 'rejected',
+    });
   });
 });
