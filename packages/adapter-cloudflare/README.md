@@ -86,14 +86,14 @@ entries and 429 retry backoff instead of silently failing every KV read/write.
 
 ## Env vars & bindings
 
-| Name                      | Kind           | Default                    | Notes                                                                                                                               |
-| ------------------------- | -------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `ENHANCELY_API_KEY`       | **secret**     | — (required)               | `sk-…` / `sk-org-…`. `wrangler secret put` — never in wrangler.toml, never client-side.                                             |
-| `ENHANCELY_BASE`          | var (optional) | `https://app.enhancely.ai` | Listed by the [official Enhancely API endpoints](https://docs.enhancely.ai/); override only for an explicitly selected environment. |
-| `ENHANCELY_TIMEOUT_MS`    | var (optional) | `800`                      | Per-call `AbortSignal.timeout`; strict positive decimal milliseconds, at most `2147483647`.                                         |
-| `ENHANCELY_CACHE_TTL_MS`  | var (optional) | `300000` (5 min)           | Cache freshness window; strict positive decimal milliseconds, at most `2147483647`; ETag revalidation afterwards.                   |
-| `ENHANCELY_AUTO_REGISTER` | var (optional) | `false`                    | Exact string `"true"` enables the one-step register-or-revalidate POST; every other value keeps conditional GET lookup-only mode.   |
-| `JSONLD_CACHE`            | KV (optional)  | — (memory fallback)        | Distributed JSON-LD cache; strongly recommended in production.                                                                      |
+| Name                      | Kind           | Default                    | Notes                                                                                                                             |
+| ------------------------- | -------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `ENHANCELY_API_KEY`       | **secret**     | — (required)               | `sk-…` / `sk-org-…`. `wrangler secret put` — never in wrangler.toml, never client-side.                                           |
+| `ENHANCELY_BASE`          | var (optional) | `https://api.enhancely.ai` | Core API production host; staging is `https://api.staging.enhancely.ai`. Override only for an explicitly selected environment.    |
+| `ENHANCELY_TIMEOUT_MS`    | var (optional) | `800`                      | Per-call `AbortSignal.timeout`; strict positive decimal milliseconds, at most `2147483647`.                                       |
+| `ENHANCELY_CACHE_TTL_MS`  | var (optional) | `300000` (5 min)           | Cache freshness window; strict positive decimal milliseconds, at most `2147483647`; ETag revalidation afterwards.                 |
+| `ENHANCELY_AUTO_REGISTER` | var (optional) | `false`                    | Exact string `"true"` enables the one-step register-or-revalidate POST; every other value keeps conditional GET lookup-only mode. |
+| `JSONLD_CACHE`            | KV (optional)  | — (memory fallback)        | Distributed JSON-LD cache; strongly recommended in production.                                                                    |
 
 ## Deploy
 

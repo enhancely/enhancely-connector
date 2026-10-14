@@ -815,7 +815,7 @@ describe('origin-request — registration is precise on this trigger (v0.9.0)', 
     }));
     expect(calls).toHaveLength(1);
     expect(calls[0]?.method).toBe('POST');
-    expect(calls[0]?.url).toMatch(/\/api\/v1\/jsonld$/);
+    expect(calls[0]?.url).toMatch(/^https:\/\/[^/]+\/v1\/jsonld$/);
   });
 
   it('never registers a non-HTML body — gated before any API call', async () => {

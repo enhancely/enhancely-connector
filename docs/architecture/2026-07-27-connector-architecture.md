@@ -18,8 +18,8 @@ If any prerequisite is uncertain, the connector serves the original response.
 
 ## 2. API contract
 
-- Read-only lookup: `GET {ENHANCELY_BASE}/api/v1/jsonld/{segment}`.
-- Register-or-revalidate: `POST {ENHANCELY_BASE}/api/v1/jsonld { url }`.
+- Read-only lookup: `GET {ENHANCELY_BASE}/v1/jsonld/{segment}`.
+- Register-or-revalidate: `POST {ENHANCELY_BASE}/v1/jsonld { url }`.
 - `getJsonLdLookup` is always read-only GET. `autoRegister` uses one direct
   register-or-revalidate POST. There is no GET→404→POST fallback and no separate
   `registerJsonLd` API.
@@ -36,7 +36,7 @@ If any prerequisite is uncertain, the connector serves the original response.
   status that opens the shared API-key circuit. A registration `403` is
   URL-local and must never suppress other URLs.
 
-The production default is `https://app.enhancely.ai`.
+The production default is `https://api.enhancely.ai`.
 
 ## 3. One core, thin adapters
 

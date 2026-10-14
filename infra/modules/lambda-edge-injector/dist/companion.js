@@ -35,7 +35,7 @@ __export(companion_exports, {
 module.exports = __toCommonJS(companion_exports);
 
 // ../injector-core/dist/config.js
-var DEFAULT_ENHANCELY_BASE = "https://app.enhancely.ai";
+var DEFAULT_ENHANCELY_BASE = "https://api.enhancely.ai";
 var DEFAULT_TIMEOUT_MS = 800;
 var DEFAULT_CACHE_TTL_MS = 3e5;
 var DEFAULT_MAX_JSONLD_BYTES = 256 * 1024;

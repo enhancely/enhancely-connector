@@ -99,7 +99,7 @@ describe('getJsonLdSnippet', () => {
     // The API endpoint carries the query-stripped URL (= the cache key), NOT
     // the raw request URL — no querystring leaves the edge.
     const requestedUrl = fetchImpl.mock.calls[0]?.[0];
-    expect(requestedUrl).toBe(`${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(key)}`);
+    expect(requestedUrl).toBe(`${config.enhancelyBase}/v1/jsonld/${encodeURIComponent(key)}`);
     expect(requestedUrl).not.toContain('utm_source');
     expect(requestedUrl).not.toContain(encodeURIComponent('?'));
 
@@ -220,7 +220,7 @@ describe('getJsonLdSnippet', () => {
     expect(calls).toHaveLength(1);
     const post = calls[0];
     expect(post?.method).toBe('POST');
-    expect(post?.url).toBe(`${config.enhancelyBase}/api/v1/jsonld`);
+    expect(post?.url).toBe(`${config.enhancelyBase}/v1/jsonld`);
     expect(JSON.parse(String(post?.body))).toEqual({ url: key });
     expect(String(post?.body)).not.toContain('token');
   });

@@ -549,7 +549,7 @@ export async function getJsonLdLookup(
 /**
  * Register-or-revalidate lookup for body-aware adapters that both discover
  * pages and consume snippets in one place. A single
- * `POST /api/v1/jsonld { url }` with `If-None-Match` registers unknown URLs and
+ * `POST /v1/jsonld { url }` with `If-None-Match` registers unknown URLs and
  * revalidates (412) or fetches (200) known ones in the same round-trip. The
  * entry this stores makes the
  * NEXT miss inject. `autoRegister` is irrelevant here: the call itself is the

@@ -146,7 +146,7 @@ fail-open cooldown before retry.
 | Key                         |                        Default | Meaning                                                                                     |
 | --------------------------- | -----------------------------: | ------------------------------------------------------------------------------------------- |
 | `apiKey`                    |                   SSM fallback | Server-side `sk-…` / `sk-org-…`; never returned or logged.                                  |
-| `enhancelyBase`             |     `https://app.enhancely.ai` | Enhancely API base.                                                                         |
+| `enhancelyBase`             |     `https://api.enhancely.ai` | Enhancely API base.                                                                         |
 | `timeoutMs`                 |                         800 ms | Timeout for each Enhancely call.                                                            |
 | `originTimeoutMs`           |                       2,000 ms | Direct custom-origin fetch timeout.                                                         |
 | `ssmTimeoutMs`              |                       2,000 ms | SSM config timeout.                                                                         |

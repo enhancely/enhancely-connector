@@ -9,7 +9,7 @@
 export type Fetcher = (input: string, init: RequestInit) => Promise<Response>;
 
 export interface InjectorConfig {
-  /** Enhancely API base; production defaults to https://app.enhancely.ai. */
+  /** Enhancely API base; production defaults to https://api.enhancely.ai. */
   enhancelyBase: string;
   /** Project (`sk-…`) or organization (`sk-org-…`) API key. NEVER expose client-side. */
   apiKey: string;
@@ -24,7 +24,7 @@ export interface InjectorConfig {
   maxJsonLdBytes: number;
   /**
    * When true, snippet lookup uses ONE register-or-revalidate
-   * `POST /api/v1/jsonld {url}`: known pages return their snippet in that same
+   * `POST /v1/jsonld {url}`: known pages return their snippet in that same
    * call, while unknown pages are registered and start generation. The
    * negative cache still suppresses repeats until the next retry deadline.
    * Default false.

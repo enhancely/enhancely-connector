@@ -109,7 +109,7 @@ before(async () => {
 
   enhancelyStub = http.createServer((req, res) => {
     enhancelyHits += 1;
-    // GET /api/v1/jsonld/{encodeURIComponent(rawPageUrl)}
+    // GET /v1/jsonld/{encodeURIComponent(rawPageUrl)}
     const segment = decodeURIComponent(req.url ?? '');
     if (segment.includes('/utf8')) {
       res.writeHead(200, { 'content-type': 'application/ld+json', etag: '"v1"' });

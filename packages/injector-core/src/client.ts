@@ -158,7 +158,7 @@ async function readJsonLdBody(
 }
 
 /**
- * One conditional GET against `GET {base}/api/v1/jsonld/{url}`.
+ * One conditional GET against `GET {base}/v1/jsonld/{url}`.
  *
  * Contract notes (verified against the Enhancely main repo):
  * - We send a URL, never a locally computed hash — the server normalizes and
@@ -249,7 +249,7 @@ export async function fetchJsonLd(
   if (safePageUrl === null) return { status: 'error', reason: 'invalid-page-url' };
 
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
-  const endpoint = `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(safePageUrl)}`;
+  const endpoint = `${config.enhancelyBase}/v1/jsonld/${encodeURIComponent(safePageUrl)}`;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${config.apiKey}`,
@@ -304,7 +304,7 @@ export async function fetchJsonLd(
 }
 
 /**
- * One register-or-revalidate POST: `POST {base}/api/v1/jsonld { url }` with
+ * One register-or-revalidate POST: `POST {base}/v1/jsonld { url }` with
  * `If-None-Match` when we hold an ETag and `Accept: application/ld+json`.
  *
  * The endpoint is not merely "register": for a KNOWN url it answers like the
@@ -347,7 +347,7 @@ export async function registerOrRevalidate(
   let signal: AbortSignal;
   try {
     signal = AbortSignal.timeout(config.timeoutMs);
-    response = await fetchImpl(`${config.enhancelyBase}/api/v1/jsonld`, {
+    response = await fetchImpl(`${config.enhancelyBase}/v1/jsonld`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ url: safePageUrl }),

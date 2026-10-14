@@ -105,7 +105,7 @@ describe('registerOrRevalidate — request shape', () => {
     expect(headers['Accept']).toBe('application/ld+json');
     expect(headers['Content-Type']).toBe('application/json');
     expect(headers['If-None-Match']).toBe('"abc123"');
-    expect(fetchImpl.mock.calls[0]?.[0]).toBe('https://app.enhancely.ai/api/v1/jsonld');
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe('https://api.enhancely.ai/v1/jsonld');
   });
 
   it('omits If-None-Match without an ETag', async () => {

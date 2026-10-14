@@ -124,10 +124,10 @@ describe('kvKeyFor', () => {
 
 describe('kvCacheScopeFor', () => {
   it('is stable, project-specific, and never contains the API key', async () => {
-    const first = await kvCacheScopeFor('https://app.enhancely.ai', 'sk-project-a');
+    const first = await kvCacheScopeFor('https://api.enhancely.ai', 'sk-project-a');
     expect(first).toMatch(/^[0-9a-f]{64}$/);
-    await expect(kvCacheScopeFor('https://app.enhancely.ai', 'sk-project-a')).resolves.toBe(first);
-    await expect(kvCacheScopeFor('https://app.enhancely.ai', 'sk-project-b')).resolves.not.toBe(
+    await expect(kvCacheScopeFor('https://api.enhancely.ai', 'sk-project-a')).resolves.toBe(first);
+    await expect(kvCacheScopeFor('https://api.enhancely.ai', 'sk-project-b')).resolves.not.toBe(
       first
     );
     expect(first).not.toContain('sk-project-a');

@@ -37,7 +37,7 @@ export type { KVNamespaceLike } from './kv-cache.js';
 export interface Env {
   /** Required. Set via `wrangler secret put ENHANCELY_API_KEY` — never in wrangler.toml. */
   ENHANCELY_API_KEY?: string;
-  /** Optional API base override (official API default: https://app.enhancely.ai). */
+  /** Optional API base override (official API default: https://api.enhancely.ai). */
   ENHANCELY_BASE?: string;
   /** Optional numeric override for the per-call AbortSignal timeout (default 800). */
   ENHANCELY_TIMEOUT_MS?: string;

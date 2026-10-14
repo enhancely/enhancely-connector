@@ -1,6 +1,6 @@
 {
   "apiKey": "sk-REPLACE-ME-or-delete-this-line-to-use-SSM",
-  "enhancelyBase": "https://app.enhancely.ai",
+  "enhancelyBase": "https://api.enhancely.ai",
   "timeoutMs": 800,
   "cacheTtlMs": 300000,
   "nonPageMemoTtlMs": 1800000,

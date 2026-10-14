@@ -26,7 +26,7 @@ visitor → nginx/Apache (TLS) → enhancely sidecar :8080 → your origin
 | ------------------- | -------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `UPSTREAM_ORIGIN`   | yes      | —                          | Base URL of your origin, e.g. `http://origin:3000`. Missing → the sidecar refuses to start.                                                                          |
 | `ENHANCELY_API_KEY` | yes\*    | —                          | `sk-…` / `sk-org-…` key. \*Missing → loud startup error, sidecar runs as a plain pass-through proxy (fail-open, no injection). Never expose this key to the browser. |
-| `ENHANCELY_BASE`    | no       | `https://app.enhancely.ai` | Enhancely API base URL override (e.g. for staging).                                                                                                                  |
+| `ENHANCELY_BASE`    | no       | `https://api.enhancely.ai` | Enhancely API base URL override (e.g. for staging).                                                                                                                  |
 | `PORT`              | no       | `8080`                     | Listen port.                                                                                                                                                         |
 
 ## Run it

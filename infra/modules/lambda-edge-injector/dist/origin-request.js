@@ -35,7 +35,7 @@ __export(origin_request_entry_exports, {
 module.exports = __toCommonJS(origin_request_entry_exports);
 
 // ../injector-core/dist/config.js
-var DEFAULT_ENHANCELY_BASE = "https://app.enhancely.ai";
+var DEFAULT_ENHANCELY_BASE = "https://api.enhancely.ai";
 var DEFAULT_TIMEOUT_MS = 800;
 var DEFAULT_CACHE_TTL_MS = 3e5;
 var DEFAULT_MAX_JSONLD_BYTES = 256 * 1024;
@@ -310,7 +310,7 @@ async function fetchJsonLd(config, pageUrl, etag) {
   if (safePageUrl === null)
     return { status: "error", reason: "invalid-page-url" };
   const fetchImpl = config.fetchImpl ?? globalThis.fetch;
-  const endpoint = `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(safePageUrl)}`;
+  const endpoint = `${config.enhancelyBase}/v1/jsonld/${encodeURIComponent(safePageUrl)}`;
   const headers = {
     Authorization: `Bearer ${config.apiKey}`,
     Accept: "application/ld+json"
@@ -372,7 +372,7 @@ async function registerOrRevalidate(config, pageUrl, etag) {
   let signal;
   try {
     signal = AbortSignal.timeout(config.timeoutMs);
-    response = await fetchImpl(`${config.enhancelyBase}/api/v1/jsonld`, {
+    response = await fetchImpl(`${config.enhancelyBase}/v1/jsonld`, {
       method: "POST",
       headers,
       body: JSON.stringify({ url: safePageUrl }),

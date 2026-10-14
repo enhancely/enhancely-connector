@@ -11,7 +11,7 @@ variable "name" {
 
 variable "enhancely_base" {
   type        = string
-  default     = "https://app.enhancely.ai"
+  default     = "https://api.enhancely.ai"
   description = "Enhancely API base URL. Override only for an explicitly configured non-production environment."
 
   validation {

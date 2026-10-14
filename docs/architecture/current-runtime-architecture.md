@@ -510,10 +510,10 @@ Im unterstützten CloudFront-Paar kann ausschließlich der body-prüfende
 keinen API-Pfad; damit bleibt das Paar auch bei einem Post-Lookup-Handback bei insgesamt
 höchstens einem Enhancely-Request pro Viewer-Request.
 
-| Konfiguration          | Netzwerkaufruf bei stale/miss                                              | Wirkung                                                                                                              |
-| ---------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `autoRegister = false` | `GET /api/v1/jsonld/{url}` mit `If-None-Match`, wenn ein ETag existiert    | Reines Lesen/Revalidieren. Ein `404` bleibt während der negativen TTL lokal.                                         |
-| `autoRegister = true`  | Genau ein `POST /api/v1/jsonld` mit `{ url }` und optional `If-None-Match` | Bekannte URL: Lesen/Revalidieren; unbekannte URL: Registrierung und Start der Generierung. Kein vorgeschaltetes GET. |
+| Konfiguration          | Netzwerkaufruf bei stale/miss                                          | Wirkung                                                                                                              |
+| ---------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `autoRegister = false` | `GET /v1/jsonld/{url}` mit `If-None-Match`, wenn ein ETag existiert    | Reines Lesen/Revalidieren. Ein `404` bleibt während der negativen TTL lokal.                                         |
+| `autoRegister = true`  | Genau ein `POST /v1/jsonld` mit `{ url }` und optional `If-None-Match` | Bekannte URL: Lesen/Revalidieren; unbekannte URL: Registrierung und Start der Generierung. Kein vorgeschaltetes GET. |
 
 `getJsonLdLookup` ist immer ein read-only GET. Bei aktiviertem `autoRegister` verwendet
 der Injector stattdessen direkt `getJsonLdRegisterLookup`; es gibt weder eine separate

@@ -74,13 +74,13 @@ describe('defineConfig — JSON-LD body limit', () => {
 });
 
 describe('fetchJsonLd — request shape', () => {
-  it('calls GET {base}/api/v1/jsonld/{encodeURIComponent(url)}', async () => {
+  it('calls GET {base}/v1/jsonld/{encodeURIComponent(url)}', async () => {
     const { config, fetchImpl } = withMockFetch(new Response(RAW_JSONLD, { status: 200 }));
     await fetchJsonLd(config, PAGE_URL);
 
     const { input, init } = lastRequest(fetchImpl);
     expect(init.method).toBe('GET');
-    expect(input).toBe(`${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent(PAGE_URL)}`);
+    expect(input).toBe(`${config.enhancelyBase}/v1/jsonld/${encodeURIComponent(PAGE_URL)}`);
     // The raw URL is sent encoded — never a locally computed hash.
     expect(input).toContain('https%3A%2F%2Fexample.com%2Fpricing');
   });
@@ -91,7 +91,7 @@ describe('fetchJsonLd — request shape', () => {
 
     const { input } = lastRequest(fetchImpl);
     expect(input).toBe(
-      `${config.enhancelyBase}/api/v1/jsonld/${encodeURIComponent('https://example.com/pricing')}`
+      `${config.enhancelyBase}/v1/jsonld/${encodeURIComponent('https://example.com/pricing')}`
     );
     expect(input).not.toContain('secret');
     expect(input).not.toContain('fragment');
