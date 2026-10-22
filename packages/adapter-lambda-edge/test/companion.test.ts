@@ -4,6 +4,7 @@
  */
 import type { CloudFrontResponseEvent, CloudFrontResultResponse } from 'aws-lambda';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Fetcher } from '@enhancely/injector-core';
 
 import {
   __resetAdapterConfigForTests,
@@ -25,10 +26,10 @@ vi.mock('@aws-sdk/client-ssm', () => {
   return { SSMClient, GetParameterCommand };
 });
 
-let enhancelyFetch: ReturnType<typeof vi.fn>;
+let enhancelyFetch: ReturnType<typeof vi.fn<Fetcher>>;
 
 function setUp(baked: Partial<BakedConnectorConfig> = {}): void {
-  enhancelyFetch = vi.fn(async () => {
+  enhancelyFetch = vi.fn<Fetcher>(async () => {
     throw new Error('the cache-cap-only companion must never call Enhancely');
   });
   __setBakedConfigForTests({
