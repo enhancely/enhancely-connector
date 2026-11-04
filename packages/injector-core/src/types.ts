@@ -90,8 +90,9 @@ export interface CacheBackend {
  *   `retryAfterSeconds` carries the server's Retry-After hint when present.
  * - `terminal-negative`: the server answered definitively "there is no
  *   snippet for this URL and asking again will not change that soon" —
- *   an `ignored` record, a record whose generation never succeeded (body
- *   `{}`), or a rejected registration (denylist / unregistered hostname).
+ *   an `ignored` or explicitly withdrawn record, a record whose generation
+ *   never succeeded (body `{}`), or a rejected registration (denylist /
+ *   unregistered hostname).
  *   Stored as a negative entry for a full TTL; the server already knows the
  *   URL, so another registration attempt would only add load.
  * - `registration-limited`: the register endpoint refused this URL because a
@@ -105,7 +106,7 @@ export type JsonLdFetchResult =
   | { status: 'pending'; retryAfterSeconds: number | null }
   | {
       status: 'terminal-negative';
-      reason: 'ignored' | 'empty-record' | 'rejected';
+      reason: 'ignored' | 'withdrawn' | 'empty-record' | 'rejected';
       /**
        * The Problem-JSON `detail` of a rejected registration (HTTP 400), when
        * the server sent a readable one. Purely diagnostic: core never logs, so

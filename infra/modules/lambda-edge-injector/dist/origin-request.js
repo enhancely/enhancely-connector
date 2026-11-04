@@ -169,24 +169,39 @@ function declaredContentLength(response) {
   return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
 }
 var MAX_PROBLEM_JSON_BYTES = 8 * 1024;
-async function readProblemDetail(response) {
-  const declared = declaredContentLength(response);
-  if (declared !== null && declared > MAX_PROBLEM_JSON_BYTES) {
-    cancelResponseBody(response, "problem-detail-too-large");
-    return void 0;
-  }
+async function readProblem(response, signal) {
   try {
-    const text = await response.text();
-    if (text.length > MAX_PROBLEM_JSON_BYTES)
+    const body = await readBoundedBody(response, MAX_PROBLEM_JSON_BYTES, signal);
+    if (body.status !== "ok")
       return void 0;
-    const parsed = JSON.parse(text);
-    if (typeof parsed !== "object" || parsed === null || !("detail" in parsed))
-      return void 0;
-    const detail = parsed.detail;
-    return typeof detail === "string" && detail.trim() !== "" ? detail : void 0;
+    const parsed = JSON.parse(body.text);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : void 0;
   } catch {
     return void 0;
   }
+}
+async function evaluatePublicationState(response, signal, conditionalStatus) {
+  if (response.status === 200 || response.status === conditionalStatus) {
+    if (response.headers.get("x-jsonld-status")?.trim().toLowerCase() === "ignored") {
+      cancelResponseBody(response, "ignored-record");
+      return { status: "terminal-negative", reason: "ignored" };
+    }
+    if (response.status === conditionalStatus) {
+      cancelResponseBody(response, "not-modified");
+      return { status: "not-modified" };
+    }
+  }
+  if (response.status === 404 || response.status === 409) {
+    const mediaType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    if (mediaType !== "application/json" && mediaType !== "application/problem+json")
+      return null;
+    const problem = await readProblem(response, signal);
+    const type = response.status === 404 ? "jsonld-withdrawn" : "page-retired";
+    if (problem?.status === response.status && problem.type === `https://api.enhancely.ai/problems/${type}`) {
+      return { status: "terminal-negative", reason: "withdrawn" };
+    }
+  }
+  return null;
 }
 function errorName(error, fallback) {
   if (typeof error === "object" && error !== null && "name" in error && typeof error.name === "string" && error.name !== "") {
@@ -194,7 +209,7 @@ function errorName(error, fallback) {
   }
   return fallback;
 }
-async function readJsonLdBody(response, maxBytes, signal) {
+async function readBoundedBody(response, maxBytes, signal) {
   const contentLength = declaredContentLength(response);
   if (contentLength !== null && contentLength > maxBytes) {
     cancelResponseBody(response, "body-too-large");
@@ -286,13 +301,9 @@ function rateLimitBackoffSeconds(response) {
   return null;
 }
 async function evaluateOkResponse(response, maxBytes, signal) {
-  if (response.headers.get("x-jsonld-status")?.trim().toLowerCase() === "ignored") {
-    cancelResponseBody(response, "ignored-record");
-    return { status: "terminal-negative", reason: "ignored" };
-  }
   let body;
   try {
-    body = await readJsonLdBody(response, maxBytes, signal);
+    body = await readBoundedBody(response, maxBytes, signal);
   } catch {
     return { status: "error", reason: "body-read-failed" };
   }
@@ -329,10 +340,9 @@ async function fetchJsonLd(config, pageUrl, etag) {
   } catch (error) {
     return { status: "error", reason: error instanceof Error ? error.name : "fetch-failed" };
   }
-  if (response.status === 304) {
-    cancelResponseBody(response, "not-modified");
-    return { status: "not-modified" };
-  }
+  const publication = await evaluatePublicationState(response, signal, 304);
+  if (publication !== null)
+    return publication;
   if (response.status === 404) {
     cancelResponseBody(response, "not-found");
     return { status: "not-found" };
@@ -381,17 +391,17 @@ async function registerOrRevalidate(config, pageUrl, etag) {
   } catch (error) {
     return { status: "error", reason: error instanceof Error ? error.name : "fetch-failed" };
   }
-  if (response.status === 412) {
-    cancelResponseBody(response, "not-modified");
-    return { status: "not-modified" };
-  }
+  const publication = await evaluatePublicationState(response, signal, 412);
+  if (publication !== null)
+    return publication;
   if (response.status === 201 || response.status === 202) {
     const retryAfterSeconds = parseRetryAfter(response.headers.get("retry-after"));
     cancelResponseBody(response, "pending");
     return { status: "pending", retryAfterSeconds };
   }
   if (response.status === 400) {
-    const detail = await readProblemDetail(response);
+    const problem = await readProblem(response, signal);
+    const detail = typeof problem?.detail === "string" && problem.detail.trim() !== "" ? problem.detail : void 0;
     return detail === void 0 ? { status: "terminal-negative", reason: "rejected" } : { status: "terminal-negative", reason: "rejected", detail };
   }
   if (response.status === 429) {
