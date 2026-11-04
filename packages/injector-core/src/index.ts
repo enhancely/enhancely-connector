@@ -377,12 +377,12 @@ function lookupDuringRateLimit(
  *   path, register-or-revalidate POST for the discovery path; both send
  *   If-None-Match when we hold an ETag):
  *   - 200 → store + inject
- *   - 304/412 → refresh the stored entry's storedAt, serve from cache
- *   - 404 → store a NEGATIVE entry (stops dead-URL polling), inject nothing
+ *   - 304/412 without ignored metadata → refresh storedAt, serve from cache
+ *   - GET 404 → store a NEGATIVE entry (stops dead-URL polling), inject nothing
  *   - 202 pending → negative entry re-polling at the server's Retry-After
  *     (capped at cacheTtlMs), or resting a full TTL without a hint
- *   - terminal-negative (ignored / empty record / rejected) → negative entry
- *     for a full TTL, never re-registered
+ *   - terminal-negative (ignored / withdrawn / empty record / rejected) → negative entry
+ *     for a full TTL, rechecked only once that TTL expires
  *   - 429/403/error/timeout → serve the stale entry as-is if we have one
  *     (without touching storedAt) and record a retryNotBefore memo:
  *     min(Retry-After, maxBackoffMs) when sent, 10 s otherwise. Only 429
@@ -480,7 +480,7 @@ async function resolveLookup(
           return lookupFromEntry(entry, config.cacheTtlMs);
         }
         case 'terminal-negative': {
-          // Ignored record, never-succeeded generation, or rejected
+          // Ignored/withdrawn record, never-succeeded generation, or rejected
           // registration. The server knows the URL; cache that answer for a
           // full TTL because another registration attempt would be pure load.
           const entry = await storeIfSnapshotUnchanged(cache, key, cached, {

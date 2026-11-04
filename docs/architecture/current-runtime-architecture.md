@@ -528,19 +528,34 @@ oder unbrauchbar sind, verwendet er den 10-Sekunden-Fallback. Ein langer Hinweis
 bleibt auf dem Register-Pfad URL-lokal; der URL-übergreifende Circuit ist davon
 getrennt und immer auf 60 Sekunden begrenzt.
 
-| Enhancely-Antwort                                   | Connector-Verhalten                                                                                                                                          |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `200` mit JSON-LD                                   | Positiv speichern. Der jeweilige Injector versucht danach seine restlichen Body-/Quota-Gates.                                                                |
-| `304` beim GET                                      | Vorhandenen Cache-Eintrag behalten und seine Freshness-TTL neu starten.                                                                                      |
-| `412` beim Register-or-Revalidate POST              | Wie `304`: vorhandenen Eintrag behalten und Freshness neu starten.                                                                                           |
-| `201` oder `202`                                    | Pending-negativ speichern; Originalseite unverändert ausliefern.                                                                                             |
-| `200` mit `X-JsonLd-Status: ignored` oder Body `{}` | Terminal-negativ für eine volle Cache-TTL; nie als JSON-LD injizieren.                                                                                       |
-| GET `404`                                           | Negativ für eine volle Cache-TTL. Bei `autoRegister=true` tritt im empfohlenen Pfad stattdessen der direkte POST auf.                                        |
-| POST `400` oder `403` ohne `Retry-After`            | Terminal-negativ für eine volle Cache-TTL.                                                                                                                   |
-| `429`                                               | Stale positive Daten weiterverwenden, sonst Originalseite; URL-lokalen Retry setzen und den gemeinsamen Circuit separat auf höchstens 60 Sekunden begrenzen. |
-| POST-`403` mit `Retry-After`                        | Stale positive Daten weiterverwenden, sonst Originalseite; ausschließlich URL-lokal bis höchstens 24 Stunden warten. Kein gemeinsamer Circuit.               |
-| Fehler oder Timeout                                 | Stale positive Daten weiterverwenden, sonst Originalseite; 10 Sekunden ausschließlich URL-lokal warten.                                                      |
-| JSON-LD größer als 256 KiB                          | Stream abbrechen; einen stale positiven Eintrag weiterverwenden, sonst Originalseite.                                                                        |
+| Enhancely-Antwort                                                                   | Connector-Verhalten                                                                                                                                          |
+| ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `200` mit JSON-LD                                                                   | Positiv speichern. Der jeweilige Injector versucht danach seine restlichen Body-/Quota-Gates.                                                                |
+| `304` beim GET                                                                      | Ohne `ignored`-Metadaten vorhandenen Cache-Eintrag behalten und seine Freshness-TTL neu starten.                                                             |
+| `412` beim Register-or-Revalidate POST                                              | Wie `304`: ohne `ignored`-Metadaten vorhandenen Eintrag behalten und Freshness neu starten.                                                                  |
+| `201` oder `202`                                                                    | Pending-negativ speichern; Originalseite unverändert ausliefern.                                                                                             |
+| `200`/GET `304`/POST `412` mit `X-JsonLd-Status: ignored`, oder `200` mit Body `{}` | Terminal-negativ für eine volle Cache-TTL; nie als JSON-LD injizieren.                                                                                       |
+| GET `404`                                                                           | Negativ für eine volle Cache-TTL. Bei `autoRegister=true` tritt im empfohlenen Pfad stattdessen der direkte POST auf.                                        |
+| POST `400` oder `403` ohne `Retry-After`                                            | Terminal-negativ für eine volle Cache-TTL.                                                                                                                   |
+| `429`                                                                               | Stale positive Daten weiterverwenden, sonst Originalseite; URL-lokalen Retry setzen und den gemeinsamen Circuit separat auf höchstens 60 Sekunden begrenzen. |
+| POST-`403` mit `Retry-After`                                                        | Stale positive Daten weiterverwenden, sonst Originalseite; ausschließlich URL-lokal bis höchstens 24 Stunden warten. Kein gemeinsamer Circuit.               |
+| Fehler oder Timeout                                                                 | Stale positive Daten weiterverwenden, sonst Originalseite; 10 Sekunden ausschließlich URL-lokal warten.                                                      |
+| JSON-LD größer als 256 KiB                                                          | Stream abbrechen; einen stale positiven Eintrag weiterverwenden, sonst Originalseite.                                                                        |
+
+Explizite Publikationsrücknahmen entfernen stale JSON-LD und ETag in beiden
+Lookup-Modi: HTTP `409` mit Problem-Typ
+`https://api.enhancely.ai/problems/page-retired` oder HTTP `404` mit
+`https://api.enhancely.ai/problems/jsonld-withdrawn`. Voraussetzung sind
+`application/json` oder `application/problem+json`, der exakte Typ und ein
+numerischer Problem-`status`, der dem HTTP-Status entspricht. Der gemeinsame
+Client liest höchstens 8 KiB als Stream unter dem ursprünglichen Request-Timeout.
+Details und IDs gelangen nicht in das Rücknahme-Ergebnis oder HTML. Die negative
+Antwort gilt eine volle Cache-TTL und wird danach erneut geprüft. Andere `409`
+und unerkannte POST-`404` bleiben transient; normale GET-`404` bleiben negativ.
+`ignored` hat auch bei unverändertem ETag Vorrang vor `304`/`412`. Alle diese
+Entscheidungen nutzen denselben API-Request; keine zusätzliche Abfrage und keine
+Reaktivierung. Ein paralleles neueres positives Ergebnis bleibt geschützt;
+eine Rücknahme übernimmt die längste parallele reine Retry-Frist.
 
 ## Cache- und Zeitmodell
 

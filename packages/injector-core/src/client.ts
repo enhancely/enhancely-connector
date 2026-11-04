@@ -21,34 +21,61 @@ function declaredContentLength(response: Response): number | null {
   return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
 }
 
-/** Largest Problem-JSON body we will read to recover a `detail` string. */
+/** Hard byte ceiling for Problem JSON, including chunked and stalled responses. */
 const MAX_PROBLEM_JSON_BYTES = 8 * 1024;
 
-/**
- * Best-effort `detail` from an RFC 9457 Problem-JSON error body.
- *
- * Diagnostic only, so every failure path returns `undefined` and the caller
- * proceeds exactly as it would without a body: an oversized or absent
- * Content-Length, a non-JSON body, a stalled stream (the fetch's own timeout
- * signal still applies), or a missing/blank `detail`. The body is consumed
- * either way, so no caller needs to cancel it afterwards.
- */
-async function readProblemDetail(response: Response): Promise<string | undefined> {
-  const declared = declaredContentLength(response);
-  if (declared !== null && declared > MAX_PROBLEM_JSON_BYTES) {
-    cancelResponseBody(response, 'problem-detail-too-large');
-    return undefined;
-  }
+async function readProblem(
+  response: Response,
+  signal: AbortSignal
+): Promise<Record<string, unknown> | undefined> {
   try {
-    const text = await response.text();
-    if (text.length > MAX_PROBLEM_JSON_BYTES) return undefined;
-    const parsed: unknown = JSON.parse(text);
-    if (typeof parsed !== 'object' || parsed === null || !('detail' in parsed)) return undefined;
-    const detail = (parsed as { detail: unknown }).detail;
-    return typeof detail === 'string' && detail.trim() !== '' ? detail : undefined;
+    const body = await readBoundedBody(response, MAX_PROBLEM_JSON_BYTES, signal);
+    if (body.status !== 'ok') return undefined;
+    const parsed: unknown = JSON.parse(body.text);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Publication state takes precedence over an unchanged content ETag. Explicit
+ * lifecycle Problems also revoke cached content; unrelated HTTP errors do not.
+ * Both lookup modes use this seam, without a second request. Never propagate
+ * Problem details, identifiers or other metadata into the result or HTML.
+ */
+async function evaluatePublicationState(
+  response: Response,
+  signal: AbortSignal,
+  conditionalStatus: 304 | 412
+): Promise<JsonLdFetchResult | null> {
+  if (response.status === 200 || response.status === conditionalStatus) {
+    if (response.headers.get('x-jsonld-status')?.trim().toLowerCase() === 'ignored') {
+      cancelResponseBody(response, 'ignored-record');
+      return { status: 'terminal-negative', reason: 'ignored' };
+    }
+    if (response.status === conditionalStatus) {
+      cancelResponseBody(response, 'not-modified');
+      return { status: 'not-modified' };
+    }
+  }
+  if (response.status === 404 || response.status === 409) {
+    // Core's c.json responses use application/json; RFC 9457's media type is
+    // accepted too. A title/detail substring or a foreign type URI is not proof.
+    const mediaType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
+    if (mediaType !== 'application/json' && mediaType !== 'application/problem+json') return null;
+    const problem = await readProblem(response, signal);
+    const type = response.status === 404 ? 'jsonld-withdrawn' : 'page-retired';
+    if (
+      problem?.status === response.status &&
+      problem.type === `https://api.enhancely.ai/problems/${type}`
+    ) {
+      return { status: 'terminal-negative', reason: 'withdrawn' };
+    }
+  }
+  return null;
 }
 
 function errorName(error: unknown, fallback: string): string {
@@ -65,14 +92,14 @@ function errorName(error: unknown, fallback: string): string {
 }
 
 /**
- * Read a successful JSON-LD body with a hard byte cap.
+ * Read a response body with a hard byte cap and the original request deadline.
  *
  * `response.text()` would buffer an attacker-controlled body before we could
  * inspect its size. Reading the stream lets us stop and cancel immediately
  * after the configured byte limit. The same timeout signal passed to fetch
  * remains active for the complete body read, including a stalled stream.
  */
-async function readJsonLdBody(
+async function readBoundedBody(
   response: Response,
   maxBytes: number,
   signal: AbortSignal
@@ -204,11 +231,11 @@ function rateLimitBackoffSeconds(response: Response): number | null {
 }
 
 /**
- * Evaluate a 200 response into ok / terminal-negative / error.
+ * Evaluate a 200 body after the shared publication-state gate.
  *
  * Shared by the GET and the register POST because the server serializes both
  * identically. Two 200 shapes are NOT snippets (P0 fixes, 2026-08-21):
- * - `X-JsonLd-Status: ignored` — the operator ignored this record;
+ * - `X-JsonLd-Status: ignored` — handled by the shared publication gate;
  * - body `{}` — a record whose generation never succeeded (fresh `failed`
  *   or limit-reached records serialize as an empty object).
  * Both previously passed the "any 2xx with a body" check and were injected
@@ -219,14 +246,9 @@ async function evaluateOkResponse(
   maxBytes: number,
   signal: AbortSignal
 ): Promise<JsonLdFetchResult> {
-  if (response.headers.get('x-jsonld-status')?.trim().toLowerCase() === 'ignored') {
-    cancelResponseBody(response, 'ignored-record');
-    return { status: 'terminal-negative', reason: 'ignored' };
-  }
-
   let body: BodyReadResult;
   try {
-    body = await readJsonLdBody(response, maxBytes, signal);
+    body = await readBoundedBody(response, maxBytes, signal);
   } catch {
     // A non-standard/locked response stream may throw while acquiring its
     // reader. Callers receive the same fail-open result as the orchestrator
@@ -270,10 +292,8 @@ export async function fetchJsonLd(
     return { status: 'error', reason: error instanceof Error ? error.name : 'fetch-failed' };
   }
 
-  if (response.status === 304) {
-    cancelResponseBody(response, 'not-modified');
-    return { status: 'not-modified' };
-  }
+  const publication = await evaluatePublicationState(response, signal, 304);
+  if (publication !== null) return publication;
   if (response.status === 404) {
     cancelResponseBody(response, 'not-found');
     return { status: 'not-found' };
@@ -310,13 +330,15 @@ export async function fetchJsonLd(
  * The endpoint is not merely "register": for a KNOWN url it answers like the
  * read path (200 + raw script-safe body + ETag, or 412 when the ETag still
  * matches), for an UNKNOWN url it creates the record and starts generation
- * (201), and for a record mid-generation it answers 202. Duplicate POSTs for
- * the same new URL are coalesced server-side; the call is treated as
+ * (202; legacy 201), and for a record mid-generation it answers 202. Duplicate
+ * POSTs for the same new URL are coalesced server-side; the call is treated as
  * idempotent.
  *
- * Status map (server verified 2026-08-21):
+ * Status map:
  * - 200 → ok / terminal-negative (`X-JsonLd-Status: ignored`, body `{}`)
- * - 412 → not-modified (ETag still current — same semantics as the GET's 304)
+ * - 412 → not-modified, unless X-JsonLd-Status is ignored (terminal-negative)
+ * - Explicit 409 page-retired / 404 jsonld-withdrawn → terminal-negative
+ *   (exact canonical Problem type and matching status; other errors stay transient)
  * - 201/202 → pending (Retry-After honored when present)
  * - 400 → terminal-negative `rejected` (denylist or unregistered hostname;
  *   self-heals after a TTL once the operator fixes the domain registration)
@@ -357,10 +379,8 @@ export async function registerOrRevalidate(
     return { status: 'error', reason: error instanceof Error ? error.name : 'fetch-failed' };
   }
 
-  if (response.status === 412) {
-    cancelResponseBody(response, 'not-modified');
-    return { status: 'not-modified' };
-  }
+  const publication = await evaluatePublicationState(response, signal, 412);
+  if (publication !== null) return publication;
   if (response.status === 201 || response.status === 202) {
     const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after'));
     cancelResponseBody(response, 'pending');
@@ -371,7 +391,11 @@ export async function registerOrRevalidate(
     // denylist, a URL the store refuses). It is already cached as a negative
     // entry for a full TTL, so it is never re-POSTed on the next run; the
     // Problem-JSON `detail` is recovered only so an adapter can say why.
-    const detail = await readProblemDetail(response);
+    const problem = await readProblem(response, signal);
+    const detail =
+      typeof problem?.detail === 'string' && problem.detail.trim() !== ''
+        ? problem.detail
+        : undefined;
     return detail === undefined
       ? { status: 'terminal-negative', reason: 'rejected' }
       : { status: 'terminal-negative', reason: 'rejected', detail };

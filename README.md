@@ -35,6 +35,18 @@ When separate GET and register lookups race for one URL, a newly successful
 stale positive while inheriting the longest concurrent retry deadline; racing
 transient results retain stale positive data and that longest deadline. Thus a
 day-scale `Retry-After` cannot be shortened to the normal cache TTL.
+Publication state is checked on the same revalidation response. An
+`X-JsonLd-Status: ignored` header on `200`, GET `304`, or POST `412` removes
+cached JSON-LD and its ETag, even when the content ETag has not changed.
+Explicit `409 page-retired` and `404 jsonld-withdrawn` Problems do the same
+in both lookup modes. The connector requires the exact
+`https://api.enhancely.ai/problems/` type URI and matching numeric status in
+a JSON response, reads at most 8 KiB under the request timeout, and never
+exposes withdrawal details in HTML. These negative entries rest for the
+configured cache TTL before rechecking. Unrelated conflicts remain transient
+and preserve stale content; no additional API request or page reactivation
+is performed. Concurrent newer positive results remain protected.
+
 The in-process cache is bounded by entry count and a conservative 16 MiB
 retained-string budget, so large valid JSON-LD records cannot exhaust an edge
 runtime before fail-open handling can run.
